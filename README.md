@@ -6,13 +6,13 @@ the way to a preemptively scheduled, higher-half, paged kernel running an
 interactive shell and a separate user-space program in ring 3.
 
 [![CI](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml/badge.svg)](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml)
-![language](https://img.shields.io/badge/C11%20%2B%20NASM-15.3k%20lines-blue)
+![language](https://img.shields.io/badge/C11%20%2B%20NASM-16.2k%20lines-blue)
 ![arch](https://img.shields.io/badge/arch-x86%20(i686)-lightgrey)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 The same kernel binary boots two ways — through a bootloader written for this
-project, and through GRUB via Multiboot2 — and every push runs 361 assertions
-across 92 host unit tests, 14 in-kernel suites, and four QEMU boot scenarios.
+project, and through GRUB via Multiboot2 — and every push runs 385 assertions
+across 92 host unit tests, 15 in-kernel suites, and seven QEMU boot scenarios.
 
 ```
 BIOS ─► stage 1 (512 B MBR) ─► stage 2 ─► 32-bit protected mode ─► kernel ─► ring 3
@@ -73,6 +73,11 @@ Concretely, from power-on:
 7. **The shell** runs as a scheduled task, reachable from the VGA console or
    over a serial line, with line editing and command history.
 
+Along the way the kernel narrows its own permissions: its `.text` and
+`.rodata` become read-only, SMEP and SMAP are enabled where the CPU has them,
+and every task stack gets an unmapped guard page below it. `harden` reports
+what is actually switched on, read back from CR4 and the page tables.
+
 Every subsystem listed above is implemented and tested rather than announced.
 
 ---
@@ -125,7 +130,7 @@ StratumOS stage2
   [->] entering protected mode
 
   .-----------------------------------------------------.
-  | StratumOS 0.5.0  -  x86 kernel: real mode to ring 3 |
+  | StratumOS 0.6.0  -  x86 kernel: real mode to ring 3 |
   '-----------------------------------------------------'
 [    0.000] INFO  boot: serial COM1        [ok] 115200 8N1
 [    0.000] INFO  boot: CPU detect         [ok] GenuineIntel
@@ -135,13 +140,17 @@ StratumOS stage2
 [    0.000] INFO  boot: PIC remap          [ok] IRQ 0-15 -> vector 32-47
 [    0.000] INFO  timer: PIT at 100 Hz requested, 99.998 Hz actual (divisor 11932)
 [    0.010] INFO  boot: interrupts         [ok] enabled
-[    0.010] INFO  pmm: 32736 frames total (127 MiB), 32419 free (126 MiB), metadata 35 KiB at phys 0x00134000
-[    0.020] INFO  vmm: paging: kernel at 0xc0000000, linear map 16 MiB, identity map dropped
+[    0.010] INFO  pmm: 32736 frames total (127 MiB), 32417 free (126 MiB), metadata 35 KiB at phys 0x00136000
+[    0.030] INFO  vmm: paging: kernel at 0xc0000000, linear map 16 MiB, identity map dropped
+[    0.030] INFO  vmm: kernel half fully backed: 255 page tables (1020 KiB), so every address space sees identical kernel mappings
 [    0.030] INFO  heap: kernel heap at 0xd0000000, 1024 KiB committed, 64 MiB maximum
-[    0.040] INFO  pci: 6 PCI devices found
-[    0.040] INFO  sched: scheduler ready; boot context adopted as pid 0 (idle)
+[    0.040] INFO  vmm: kernel .text and .rodata mapped read-only (36 pages); CR0.WP makes that binding on ring 0 too
+[    0.040] INFO  harden: SMEP enabled, SMAP enabled
+[    0.040] INFO  boot: hardening          [ok] W^X, guard pages, SMEP + SMAP
+[    0.050] INFO  pci: 6 PCI devices found
+[    0.050] INFO  sched: scheduler ready; boot context adopted as pid 0 (idle)
 [    0.050] INFO  syscall: syscall gate installed at int 0x80 (11 calls available)
-[    0.050] INFO  boot: StratumOS 0.5.0 is up: 127 MiB RAM, 6 PCI devices, 14 test suites
+[    0.060] INFO  boot: StratumOS 0.6.0 is up: 127 MiB RAM, 6 PCI devices, 15 test suites
 ```
 
 Ring 3, exercising the syscall boundary from the untrusted side, then
@@ -221,6 +230,20 @@ Programs embedded in the kernel image (exec's namespace):
   hello
   1 exec() calls so far this boot
 
+stratum> harden
+Kernel/user separation
+  null page       : unmapped
+  CR0.WP          : set - ring 0 honours read-only pages
+  kernel .text    : read-only
+  kernel .rodata  : read-only
+  SMEP (CR4.20)   : enabled - ring 0 cannot execute user pages
+  SMAP (CR4.21)   : enabled - ring 0 cannot touch user pages without EFLAGS.AC
+Stacks
+  task stacks at  : 0xe0000000, 16 KiB each
+  guard pages     : one unmapped page below every stack
+  canaries        : checked on every context switch (0 failures)
+  this task's guard page at 0xe000a000 is unmapped, as it should be
+
 stratum> irq
   IRQ  HANDLER               COUNT
     0  pit                     161
@@ -298,10 +321,14 @@ Everything marked ✅ is implemented and covered by a test.
 | ✅ | Ring 3 via a forged IRET frame; `int 0x80` with pointer validation |
 | ✅ | Two real user programs: separate ELFs, linked for user space, own pages |
 | ✅ | Defensive ELF32 loader — no segment may reach into kernel space |
+| ✅ | **W^X for the kernel's own image** — `.text`/`.rodata` read-only, enforced by `CR0.WP` |
+| ✅ | **SMEP and SMAP**, detected and read back from CR4, with `stac`/`clac` around every deliberate kernel access to user memory |
+| ✅ | **Guard pages** below every kernel stack, plus a canary checked on every switch |
+| ✅ | Every address space sees identical kernel mappings, by construction |
 | ✅ | Drivers: 16550 (in and out), VGA text, PIT, PS/2 keyboard, CMOS RTC, PCI |
 | ✅ | `kprintf` with width/precision/64-bit support, levelled logging |
 | ✅ | 64-bit division helpers — the kernel links against nothing at all |
-| ✅ | 24-command shell with line editing, history, and fault injection |
+| ✅ | 25-command shell with line editing, history, and fault injection |
 | ✅ | Embedded symbol table: panics print `function+0x1c`, no addr2line needed |
 | ✅ | 11 TSC-calibrated microbenchmarks, overhead-subtracted, median of 24 |
 | ✅ | Timer-driven sampling profiler with symbol attribution |
@@ -413,8 +440,9 @@ QEMU.
 | --- | --- | --- |
 | **Host unit tests** | the kernel's real `printf`/`string`/`div64` sources, compiled for the host, diffed against glibc | 92 checks |
 | **Pre-boot validation** | Multiboot2 header and checksum, ELF type, entry point inside a load segment, load address, `.bss` alignment, the higher-half split, every embedded ring-3 program, absence of SSE | 20 failure conditions, every link |
-| **In-kernel suites** | allocator, paging, address spaces, copy-on-write, heap coalescing, interrupts, scheduler, processes, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 269 checks in 14 suites |
-| **Boot scenarios** | custom bootloader unattended, GRUB/Multiboot2 unattended, 27 shell commands typed over serial, benchmarks + profile | 4 scenarios |
+| **In-kernel suites** | allocator, paging, address spaces, copy-on-write, heap coalescing, interrupts, scheduler, processes, hardening, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 293 checks in 15 suites |
+| **Boot scenarios** | custom bootloader unattended, the same image on a CPU with SMEP and SMAP, GRUB/Multiboot2 unattended, 29 shell commands typed over serial, benchmarks + profile | 5 scenarios |
+| **Deliberate faults** | a write to the kernel's own `.text`, and a write below a task's stack — each must panic, naming the address, the reason and the region, and exit with the panic code | 2 scenarios |
 
 ```
 $ make test
@@ -484,7 +512,7 @@ kernel/
     ksyms.c                the embedded symbol table
     printf.c log.c panic.c string.c div64.c spinlock.c ktest.c kmain.c
   drivers/                 serial, vga, timer, keyboard, rtc, pci
-  shell/shell.c            24 commands, line editing, history
+  shell/shell.c            25 commands, line editing, history
   include/                 headers, grouped by subsystem
 
 user/                      ring-3 programs, built as separate ELFs
@@ -600,10 +628,12 @@ Being clear about scope is more useful than a longer feature list.
 - **No demand paging.** A program's image is mapped eagerly; copy-on-write
   is the only laziness in the memory manager, and every other page fault is
   a bug and is reported as one.
-- **No NX.** Without PAE, x86 cannot mark a page non-executable, so a user
-  image's read-only segments are enforced and its non-executable ones are
-  not. PAE and the rest of the hardening work are next in
-  [docs/ROADMAP.md](docs/ROADMAP.md).
+- **No NX, so W^X is only half.** A 32-bit page table entry has no
+  execute-disable bit, so the kernel's text is read-only but its data is
+  still executable as far as the hardware is concerned. Getting NX means PAE:
+  64-bit entries and a three-level walk. That and KASLR are the two largest
+  pieces of hardening still outstanding — see
+  [docs/SECURITY.md](docs/SECURITY.md#what-is-missing).
 - **`exec`'s namespace is a table, not a filesystem.** The programs a
   process can `exec` into are the ones embedded in the kernel image. A path
   lookup is the only change the rest of the call needs.
@@ -624,6 +654,7 @@ Being clear about scope is more useful than a longer feature list.
 | [docs/MEMORY.md](docs/MEMORY.md) | address-space layout, the higher-half transition, the three allocators |
 | [docs/USERSPACE.md](docs/USERSPACE.md) | the user programs, the ELF loader, and the privilege boundary |
 | [docs/PROCESSES.md](docs/PROCESSES.md) | address spaces, `fork`, copy-on-write, `exec`, `wait` |
+| [docs/SECURITY.md](docs/SECURITY.md) | W^X, SMEP/SMAP, guard pages, and what is deliberately missing |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | benchmark methodology, results with analysis, the profiler and its limits |
 | [docs/TESTING.md](docs/TESTING.md) | the four test layers and how to add to each |
 | [docs/DEBUGGING.md](docs/DEBUGGING.md) | GDB against QEMU, reading a panic, common symptoms |

@@ -25,26 +25,51 @@ What it still lacks: `argv`, file descriptors, signals, and loading the
 image from a file rather than the embedded table — the last of which is
 item 5 below.
 
+### Hardening
+
+Landed in v0.6.0. The kernel's own `.text` and `.rodata` are mapped
+read-only and `CR0.WP` makes that binding on ring 0; SMEP and SMAP are
+detected, enabled and read back from CR4, with `stac`/`clac` around each of
+the five places the kernel deliberately touches user memory; every task
+stack moved out of the heap into a region where each one sits above an
+unmapped guard page, with a canary checked on every context switch.
+
+Enabling SMAP found an undeclared user access in the `vmspace` suite on its
+first boot, which is the feature working.
+
+It also fixed a latent bug that had nothing to do with security: a kernel
+page table created after the first `fork` would have been missing from every
+existing address space, which the growing heap would eventually have hit.
+All 255 kernel directory slots are now backed at `vmm_init()`, and creating
+one later is a panic.
+
+A new `harden` suite (24 checks) asserts the configuration, and two CI
+scenarios assert the enforcement by requiring a panic — the half of a
+mitigation that a passing test cannot check. Documented in
+[SECURITY.md](SECURITY.md).
+
 ---
 
 ## Next
 
-### 1. Security hardening
+### 1. NX, and therefore real W^X
 
-The parts a reviewer looks for and this kernel does not have yet:
+The one piece of hardening that is a project rather than a patch. A 32-bit
+page table entry has no execute-disable bit, so the kernel's text is
+read-only but its data is still executable as far as the hardware is
+concerned.
 
-- **Guard pages** below each kernel stack, so an overflow faults instead
-  of quietly eating the neighbouring allocation. `kmalloc_aligned` would
-  become a mapped-with-a-hole allocation.
-- **W^X for user images.** The ELF loader already applies `PF_W` in a
-  second pass; without PAE there is no NX bit, so "writable" and
-  "executable" cannot both be enforced. PAE is the price.
-- **SMEP/SMAP** (`CR4` bits 20 and 21) so a kernel bug cannot execute or
-  read user memory by accident. Both need a CPUID check and a fallback.
-- **Stack canaries** on task stacks, checked on every switch.
-- **KASLR**, which on a higher-half kernel means relocating at load time —
-  the loader already parses ELF program headers, so the hard part is
-  relocations rather than the mechanics.
+Getting NX means PAE: 64-bit page table entries, a three-level walk through
+a page-directory-pointer table, and every function in `mm/vmm.c` rewritten
+around a different entry format. The recursive-window trick survives, the
+software bits move from 9-11 to 9-11 and 52-62, and `CR4.PAE` has to go on
+before `CR0.PG` - which means `_start` changes too.
+
+Worth doing because it is the difference between claiming W^X and having it,
+and because it is the natural rehearsal for the 4-level paging that long mode
+needs. Everything else in [SECURITY.md](SECURITY.md#what-is-missing) is
+smaller: UMIP is a CR4 bit, KASLR is relocations, and `-fstack-protector`
+wants the per-CPU area the SMP work brings.
 
 ### 2. Interrupt-driven serial transmit
 
@@ -116,10 +141,10 @@ calls (`ps`, `meminfo`, `irq`) belongs behind readable files instead.
 | ANSI colour over serial | the console layer would need per-sink escape handling |
 | `kmalloc` call-site tracking | a `__builtin_return_address(0)` in the block header would make leaks attributable |
 | A watchdog on the NMI | `nmi_handler` currently only warns |
+| UMIP (CR4 bit 11) | stops ring 3 reading descriptor-table bases with `sgdt`/`sidt`; one bit and a CPUID check |
 | Framebuffer support | the Multiboot2 framebuffer tag is already requested but ignored |
 | PS/2 mouse | IRQ 12, and the 8042 is already driven for A20 |
 | `cpuid` leaf 4 cache topology | `cpu.c` reports only the line size |
-| Stack canaries for task stacks | a magic at the low end of each, checked on switch, would catch overflow before it corrupts the heap |
 
 ---
 

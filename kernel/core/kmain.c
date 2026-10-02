@@ -21,6 +21,7 @@
 
 #include <arch/cpu.h>
 #include <arch/gdt.h>
+#include <arch/harden.h>
 #include <arch/idt.h>
 #include <arch/io.h>
 #include <arch/irq.h>
@@ -327,6 +328,22 @@ void kmain(u32 magic, u32 info_addr)
 
     heap_init();
     log_boot_step("kernel heap", true, "first-fit, guarded, growable");
+
+    /* Hardening goes on now, after paging and the heap and before any user
+     * program or second address space exists. Turning SMAP on later would
+     * fault inside code that had already been written without the stac/clac
+     * discipline, and narrowing the kernel's own text has to happen while
+     * there is one address space to narrow it in. */
+    vmm_protect_kernel_text();
+    harden_init();
+    {
+        const struct harden_state *h = harden_get_state();
+        log_boot_step("hardening", h->kernel_text_ro,
+                      h->smap_enabled ? "W^X, guard pages, SMEP + SMAP"
+                      : h->smep_enabled
+                          ? "W^X, guard pages, SMEP (no SMAP on this CPU)"
+                          : "W^X, guard pages (no SMEP/SMAP on this CPU)");
+    }
 
     /* 10. Non-essential hardware. A failure here is worth reporting but not
      *     worth refusing to boot over. */

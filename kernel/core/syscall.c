@@ -13,6 +13,7 @@
 #define LOG_TAG "syscall"
 
 #include <arch/gdt.h>
+#include <arch/harden.h>
 #include <arch/idt.h>
 
 #include <drivers/keyboard.h>
@@ -76,7 +77,13 @@ static i32 sys_write(u32 ptr, u32 len)
         return SYS_EFAULT;
     }
 
+    /* The buffer is user memory and this is ring 0, so the access has to be
+     * declared. console_write() copies it straight out to the sinks, so the
+     * window is as short as the write itself. */
+    user_access_begin();
     console_write((const char *)ptr, len);
+    user_access_end();
+
     return (i32)len;
 }
 
@@ -98,7 +105,9 @@ static bool user_copy_string(u32 ptr, char *dst, size_t max)
             return false;
         }
 
+        user_access_begin();
         dst[i] = *(const char *)(ptr + i);
+        user_access_end();
 
         if (dst[i] == '\0')
             return true;
@@ -171,7 +180,9 @@ static void syscall_handler(struct regs *r)
                 ret = SYS_EFAULT;
                 break;
             }
+            user_access_begin();
             *(int *)r->ebx = status;
+            user_access_end();
         }
 
         ret = pid;

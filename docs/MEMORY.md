@@ -38,6 +38,7 @@ in. See [PROCESSES.md](PROCESSES.md) for what that buys.
   0xC012E000              the frame-allocator bitmap
 0xCF000000 - 0xCF001FFF   two temporary frame-mapping slots (see below)
 0xD0000000 - 0xD4000000   kernel heap window, backed on demand, 64 MiB max
+0xE0000000 - 0xE0400000   kernel task stacks, each behind a guard page
 ...
 0xFFC00000 - 0xFFFFEFFF   recursive window: every page table
 0xFFFFF000 - 0xFFFFFFFF   recursive window: the page directory itself
@@ -308,6 +309,42 @@ The fault handler, the `refs <= 1` shortcut that makes forking in a loop
 cheap, and the 42 assertions that check all of it are in
 [PROCESSES.md](PROCESSES.md#copy-on-write).
 
+### The kernel half is fully backed, always
+
+An address space copies the kernel's page directory entries once, when it is
+created. A kernel page table created *afterwards* exists only in whichever
+address space happened to be current — so the mapping works for one process
+and faults for every other, and the bug waits for the wrong process to be
+scheduled.
+
+This was live. The heap window spans directory slots 832 to 847, and
+`heap_init()` maps 1 MiB, so only slot 832 existed at boot. Growing past
+4 MiB creates slot 833, which a process forked before the growth would never
+see.
+
+So `vmm_init()` claims a page table for every slot in the kernel half:
+
+```
+vmm: kernel half fully backed: 255 page tables (1020 KiB), so every address
+     space sees identical kernel mappings
+```
+
+and `ensure_table()` panics if anything creates a kernel page table later.
+1 MiB on a 127 MiB machine, in exchange for the removal of a whole category
+of bug. See [SECURITY.md](SECURITY.md#every-address-space-sees-the-same-kernel).
+
+### Kernel stacks live outside the heap
+
+Task stacks used to come from `kmalloc`, which put them in the heap with the
+next allocation's header immediately below. An overflowing stack silently ate
+a heap block's metadata, and the complaint surfaced in some unrelated `kfree`
+much later.
+
+They now occupy fixed slots at `KSTACK_BASE`, each preceded by a page that is
+deliberately never mapped, so an overflow is a page fault that names the guard
+page and the function that overran. Details in
+[SECURITY.md](SECURITY.md#stack-guard-pages).
+
 ### Temporary mapping slots
 
 The recursive window reaches the *current* address space's tables only, and
@@ -477,6 +514,9 @@ elsewhere has every string literal pointing where ring 3 cannot read. See
 - **No demand paging.** Every fault is a bug, or a copy-on-write fault.
 - **No swap, no page replacement, no memory pressure handling.** `kmalloc`
   returns `NULL` when the heap cannot grow, and callers are expected to check.
+- **The kernel half costs 1 MiB of page tables** at boot, because all 255
+  directory slots are backed up front. Reserving only the regions in use
+  would cost 84 KiB and leave a list to keep in step with the layout.
 - **The heap is a single arena**, so a long-lived small allocation can keep a
   large region from coalescing. Slab caches are the usual answer.
 - **64 MiB heap ceiling** (`KHEAP_MAX_SIZE`), chosen to keep the window well

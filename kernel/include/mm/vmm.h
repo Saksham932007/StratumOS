@@ -80,6 +80,22 @@
  * was running. */
 #define KERNEL_PDE_FIRST (KERNEL_VIRT_BASE >> 22)
 
+/* Where kernel task stacks live, one slot each, every slot preceded by an
+ * unmapped guard page.
+ *
+ * Task stacks used to come from kmalloc, which put them in the heap with the
+ * next allocation's header immediately below: an overflowing stack would
+ * silently eat a heap block's metadata and the damage would surface somewhere
+ * else entirely. A page-granular region is what makes a guard page possible,
+ * and a guard page turns a stack overflow into a page fault with the
+ * offending EIP still in the frame.
+ *
+ * One slot is a guard page plus the stack, so slot i's guard sits immediately
+ * above slot i-1's top and both directions are covered. 4 MiB is one page
+ * directory entry and holds far more slots than TASK_MAX. */
+#define KSTACK_BASE      0xE0000000u
+#define KSTACK_REGION    (4 * MIB)
+
 /* Two kernel pages reserved for temporarily mapping an arbitrary frame.
  *
  * The recursive window can only reach the *current* address space's tables,
@@ -124,6 +140,22 @@ void vmm_clear_user_space(void);
 /* Switch the active address space. */
 void vmm_switch_address_space(paddr_t pd_phys);
 
+/* Reserve the page tables for a kernel-half region now, while there is still
+ * exactly one address space.
+ *
+ * Address spaces copy the kernel's page directory entries when they are
+ * created, so a kernel page table created *afterwards* exists only in
+ * whichever address space happened to be current - and a kernel mapping that
+ * is not in every address space is a fault waiting for the wrong process to
+ * be scheduled. Every kernel region therefore claims its directory entries
+ * during vmm_init(), and ensure_table() panics if one is created later. */
+void vmm_reserve_kernel_tables(vaddr_t base, size_t bytes);
+
+/* Remove write permission from the kernel's own .text and .rodata. Called
+ * once, after the heap exists, because a failure here should be reportable
+ * rather than a boot-time panic. */
+void vmm_protect_kernel_text(void);
+
 /* How many pages are mapped in the user half of the current address space. */
 u32 vmm_count_user_pages(void);
 
@@ -143,6 +175,10 @@ bool vmm_protect_range(vaddr_t va, size_t bytes, u32 flags);
 bool vmm_translate(vaddr_t va, paddr_t *out);
 /* Raw PTE for inspection/debugging. */
 u32 vmm_pte(vaddr_t va);
+/* Raw page *directory* entry for slot `pdi`, for inspection. Separate from
+ * vmm_pte() because a directory entry's USER and WRITE bits gate a whole
+ * 4 MiB range, so they are worth being able to assert on directly. */
+u32 vmm_pde_raw(u32 pdi);
 
 bool vmm_map_range(vaddr_t va, paddr_t pa, size_t bytes, u32 flags);
 void vmm_unmap_range(vaddr_t va, size_t bytes);

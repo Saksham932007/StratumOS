@@ -28,6 +28,7 @@
  */
 #define LOG_TAG "vmm"
 
+#include <arch/harden.h>
 #include <arch/idt.h>
 #include <arch/io.h>
 
@@ -140,6 +141,22 @@ static bool ensure_table(u32 pdi, u32 flags)
             pd[pdi] |= PTE_USER;
         return true;
     }
+
+    /* A kernel page table created now would be missing from every address
+     * space already cloned from the kernel's, because a clone copies the
+     * kernel's directory entries once, at creation. The mapping would then
+     * work in whichever address space was current and fault in the others -
+     * a bug that appears only when the wrong process is scheduled.
+     *
+     * So every kernel region claims its tables in vmm_init(), and arriving
+     * here afterwards means one was missed. That is a bug in the kernel's
+     * own layout, not a runtime condition to recover from. */
+    if (initialised && pdi >= KERNEL_PDE_FIRST)
+        panic("a kernel page table for directory slot %u (covering %p) is "
+              "being created after vmm_init(); it would be missing from "
+              "every existing address space - add the region to "
+              "vmm_reserve_kernel_tables()",
+              pdi, (void *)(pdi << 22));
 
     paddr_t frame = pmm_alloc_frame();
     if (frame == PMM_NO_FRAME) {
@@ -290,6 +307,11 @@ void vmm_unmap_range(vaddr_t va, size_t bytes)
 
     for (size_t i = 0; i < pages; i++)
         vmm_unmap(va + i * PAGE_SIZE);
+}
+
+u32 vmm_pde_raw(u32 pdi)
+{
+    return pdi < 1024 ? pd_entries()[pdi] : 0;
 }
 
 u32 vmm_pte(vaddr_t va)
@@ -490,6 +512,69 @@ void vmm_clear_user_space(void)
     irq_restore(irqs);
 }
 
+/* Drop PTE_WRITE from the kernel's own code and constants.
+ *
+ * CR0.WP is already set, so a ring-0 write to a read-only page faults rather
+ * than being quietly allowed - that is what makes this worth doing at all.
+ * Without it, a wild kernel pointer can rewrite an instruction, and the
+ * consequence shows up later as a machine executing something nobody wrote.
+ *
+ * .text and .rodata only. .data and .bss are writable by definition, and
+ * .boot is left alone because it holds the page directory _start built, which
+ * the VMM edits - through the recursive window rather than through here, but
+ * there is no reason to narrow a mapping the kernel has a use for.
+ *
+ * Both ends are rounded outward to a page, which is safe because the linker
+ * aligns the following section to 4 KiB: the rounding can only cover padding.
+ */
+void vmm_protect_kernel_text(void)
+{
+    struct {
+        const char *what;
+        vaddr_t start, end;
+    } ranges[] = {
+        {"text", (vaddr_t)__text_start, (vaddr_t)__text_end},
+        {"rodata", (vaddr_t)__rodata_start, (vaddr_t)__rodata_end},
+    };
+
+    u32 pages = 0;
+
+    for (size_t i = 0; i < ARRAY_SIZE(ranges); i++) {
+        vaddr_t start = PAGE_TRUNC(ranges[i].start);
+        vaddr_t end = PAGE_ALIGN(ranges[i].end);
+
+        for (vaddr_t va = start; va < end; va += PAGE_SIZE) {
+            if (!vmm_protect(va, PTE_PRESENT)) {
+                pr_err("kernel .%s is not mapped at %p", ranges[i].what,
+                       (void *)va);
+                return;
+            }
+            pages++;
+        }
+    }
+
+    harden_note_text_ro();
+    pr_info("kernel .text and .rodata mapped read-only (%u pages); CR0.WP "
+            "makes that binding on ring 0 too",
+            pages);
+}
+
+void vmm_reserve_kernel_tables(vaddr_t base, size_t bytes)
+{
+    ASSERT(base >= KERNEL_VIRT_BASE);
+
+    u32 first = PDE_INDEX(base);
+    u32 last = PDE_INDEX(base + bytes - 1);
+
+    for (u32 pdi = first; pdi <= last; pdi++)
+        if (!ensure_table(pdi, PTE_PRESENT | PTE_WRITE))
+            panic("cannot reserve the kernel page table for %p",
+                  (void *)(pdi << 22));
+
+    pr_debug("reserved directory slots %u-%u for %p+%u KiB", first, last,
+             (void *)base, (unsigned)(bytes / KIB));
+}
+
 void vmm_switch_address_space(paddr_t pd_phys)
 {
     if (pd_phys && pd_phys != read_cr3())
@@ -528,13 +613,23 @@ static const char *fault_region(u32 addr)
         return "low user space (unmapped by design)";
     if (addr < KERNEL_VIRT_BASE)
         return "user space";
-    if (addr >= KERNEL_VIRT_BASE && addr < KERNEL_VIRT_BASE + VMM_LINEAR_SIZE)
-        return "the kernel's linear map of low physical memory";
+    /* Most specific first: the kernel image lives *inside* the linear map,
+     * so testing the window first would report every fault in the kernel's
+     * own text as a stray physical access. */
+    if (addr >= PAGE_TRUNC((u32)__text_start) &&
+        addr < PAGE_ALIGN((u32)__rodata_end))
+        return "the kernel's own code or constants, which are read-only";
     if (addr >= (u32)__kernel_start && addr < (u32)__kernel_end)
         return "the kernel image";
+    if (addr >= KERNEL_VIRT_BASE && addr < KERNEL_VIRT_BASE + VMM_LINEAR_SIZE)
+        return "the kernel's linear map of low physical memory";
     if (addr >= KHEAP_BASE && addr < KHEAP_BASE + KHEAP_MAX_SIZE)
-        return "the kernel heap window - a bad heap pointer, or a task stack "
-               "overflow";
+        return "the kernel heap window - a bad heap pointer";
+    if (addr >= VMM_TEMP_BASE &&
+        addr < VMM_TEMP_BASE + VMM_TEMP_SLOTS * PAGE_SIZE)
+        return "a temporary frame-mapping slot that is not currently mapped";
+    if (addr >= KSTACK_BASE && addr < KSTACK_BASE + KSTACK_REGION)
+        return "a kernel-stack guard page - a task overran its stack";
     if (addr >= 0xFFC00000u)
         return "the recursive page-table window";
     return "no region the kernel maps - a wild pointer";
@@ -586,7 +681,13 @@ static bool cow_fault(struct regs *r, u32 addr)
      * own (read-only) mapping, which is why no second temp slot is needed. */
     bool irqs = irq_save();
     void *dst = temp_map(0, fresh);
+
+    /* The source is the user page being broken, read from ring 0 - so SMAP
+     * applies, even though the destination is a kernel temporary slot. */
+    user_access_begin();
     memcpy(dst, (const void *)page, PAGE_SIZE);
+    user_access_end();
+
     temp_unmap(0);
     irq_restore(irqs);
 
@@ -656,11 +757,25 @@ void vmm_init(void)
         panic("cannot extend the kernel's linear map to %u MiB",
               (unsigned)(VMM_LINEAR_SIZE / MIB));
 
-    /* Reserve a page table for the temporary-mapping slots now, while there
-     * is exactly one address space. Created later, it would be missing from
-     * every address space already cloned from the kernel's. */
-    if (!ensure_table(PDE_INDEX(VMM_TEMP_BASE), PTE_PRESENT | PTE_WRITE))
-        panic("cannot reserve the temporary-mapping page table");
+    /* Claim a page table for every slot in the kernel half, now, while there
+     * is exactly one address space to put them in.
+     *
+     * An address space copies the kernel's directory entries once, when it is
+     * created. A kernel page table created *after* that exists only in
+     * whichever address space happened to be current, so the mapping works
+     * for one process and faults for every other - a bug that waits for the
+     * wrong process to be scheduled before it appears. The heap was the live
+     * example: growing past 4 MiB creates a new directory entry, and a
+     * process forked before the growth would never have seen it.
+     *
+     * Reserving only the regions the kernel currently uses would work and
+     * would be cheaper, but it leaves a list to keep in step with the layout,
+     * and the failure mode for forgetting an entry is the bug above. Claiming
+     * all 255 slots costs 1020 KiB of page tables once and removes the
+     * category. ensure_table() then panics if anything tries to create a
+     * kernel table later, which can now only mean a bug in this function. */
+    vmm_reserve_kernel_tables(
+        KERNEL_VIRT_BASE, (size_t)(RECURSIVE_SLOT - KERNEL_PDE_FIRST) << 22);
 
     /* Drop the identity mapping of the first 4 MiB. It existed only to keep
      * the handful of instructions between `mov cr0` and the higher-half jump
@@ -680,6 +795,9 @@ void vmm_init(void)
 
     pr_info("paging: kernel at %p, linear map %u MiB, identity map dropped",
             (void *)KERNEL_VIRT_BASE, (unsigned)(VMM_LINEAR_SIZE / MIB));
+    pr_info("kernel half fully backed: %u page tables (%u KiB), so every "
+            "address space sees identical kernel mappings",
+            stat_page_tables, stat_page_tables * 4);
     pr_debug("page directory at phys %p, %u page tables",
              (void *)kernel_pd_phys, stat_page_tables);
 }

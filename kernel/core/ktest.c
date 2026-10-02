@@ -17,6 +17,7 @@
 #define LOG_TAG "ktest"
 
 #include <arch/cpu.h>
+#include <arch/harden.h>
 #include <arch/io.h>
 #include <arch/irq.h>
 
@@ -707,6 +708,32 @@ static void test_elf(struct ktest_result *r)
  * obvious reason that a test which clones the kernel's address space and then
  * writes to the result is not a test anybody should run twice.
  */
+/* Read and write a *user* page from ring 0.
+ *
+ * Both have to declare the access, because with SMAP enabled the CPU refuses
+ * an undeclared one - which is the entire point of the feature, and which it
+ * demonstrated by faulting this test the first time SMAP was switched on.
+ * The kernel's own user accesses are wrapped the same way; see
+ * arch/harden.h.
+ *
+ * The write may fault, if the page is copy-on-write. That nests a window
+ * inside a window, which is fine: AC is part of EFLAGS, so the fault pushes
+ * it and the IRET at the end of the handler restores it. */
+static u32 upeek(const volatile u32 *p)
+{
+    user_access_begin();
+    u32 v = *p;
+    user_access_end();
+    return v;
+}
+
+static void upoke(volatile u32 *p, u32 v)
+{
+    user_access_begin();
+    *p = v;
+    user_access_end();
+}
+
 static void test_address_spaces(struct ktest_result *r)
 {
     struct task *self = task_current();
@@ -752,7 +779,7 @@ static void test_address_spaces(struct ktest_result *r)
     /* --- one user page, with something recognisable in it ---------------- */
     KT_ASSERT(r, vmm_alloc_at(up, PTE_PRESENT | PTE_WRITE | PTE_USER));
     volatile u32 *probe = (volatile u32 *)up;
-    *probe = 0x00C0FFEEu;
+    upoke(probe, 0x00C0FFEEu);
     KT_EQ(r, vmm_count_user_pages(), 1u);
 
     paddr_t shared = 0;
@@ -779,10 +806,10 @@ static void test_address_spaces(struct ktest_result *r)
 
         /* Two address spaces hold the frame, and it is still readable. */
         KT_EQ(r, pmm_frame_refs(shared), 2);
-        KT_EQ(r, *probe, 0x00C0FFEEu);
+        KT_EQ(r, upeek(probe), 0x00C0FFEEu);
 
         /* --- the write that forces the copy ----------------------------- */
-        *probe = 0x0BADC0DEu;
+        upoke(probe, 0x0BADC0DEu);
 
         vmm_get_stats(&vs_after);
         KT_ASSERT(r, vs_after.cow_faults > vs_before.cow_faults);
@@ -792,7 +819,7 @@ static void test_address_spaces(struct ktest_result *r)
         paddr_t private_frame = 0;
         KT_ASSERT(r, vmm_translate(up, &private_frame));
         KT_ASSERT(r, private_frame != shared);
-        KT_EQ(r, *probe, 0x0BADC0DEu);
+        KT_EQ(r, upeek(probe), 0x0BADC0DEu);
 
         /* The copy is ours outright now: writable, no longer COW, and the
          * only reference to its frame. The old frame belongs to the child
@@ -808,16 +835,16 @@ static void test_address_spaces(struct ktest_result *r)
          * forgets to clear the bit or to flush the TLB entry copies the page
          * on every single write, which is correct and useless. */
         vmm_get_stats(&vs_before);
-        *probe = 0x0BADC0DEu + 1;
+        upoke(probe, 0x0BADC0DEu + 1);
         vmm_get_stats(&vs_after);
         KT_EQ(r, vs_after.cow_faults, vs_before.cow_faults);
-        KT_EQ(r, *probe, 0x0BADC0DEu + 1);
+        KT_EQ(r, upeek(probe), 0x0BADC0DEu + 1);
 
         /* Tearing the child down releases the last reference to the frame
          * the parent used to share. */
         vmm_destroy_address_space(child);
         KT_EQ(r, pmm_frame_refs(shared), 0);
-        KT_EQ(r, *probe, 0x0BADC0DEu + 1);
+        KT_EQ(r, upeek(probe), 0x0BADC0DEu + 1);
     }
 
     /* --- exec's half: clear the user half, keep the kernel's ------------- */
@@ -917,6 +944,143 @@ static void test_processes(struct ktest_result *r)
     KT_ASSERT(r, usermode_program_name(n) == NULL);
 }
 
+/* ---- the hardening switches -------------------------------------------
+ *
+ * Each of these is a property that is easy to claim and easy to lose. A
+ * refactor that maps the kernel's text writable again, or widens a kernel
+ * page directory entry to USER, or allocates a task stack from the heap,
+ * breaks a mitigation without breaking anything a functional test would
+ * notice - so the mitigation itself has to be an assertion.
+ *
+ * The negative side of these properties - that a write to the kernel's text
+ * really does fault, that a stack overflow really does hit the guard page -
+ * cannot be checked from inside a passing test, because the correct outcome
+ * is a panic. Those are driven from the shell by `fault text` and
+ * `fault stackguard`, and CI boots a kernel for each and asserts on the
+ * panic.
+ */
+static void test_hardening(struct ktest_result *r)
+{
+    const struct harden_state *h = harden_get_state();
+
+    /* CR0.WP is what makes a read-only kernel page mean anything at all. The
+     * x86 default is that ring 0 may write any present page regardless of
+     * its write bit, which would make the rest of this suite decorative. */
+    KT_ASSERT(r, (read_cr0() & (1u << 16)) != 0);
+    KT_ASSERT(r, h->wp_enabled);
+
+    /* --- W^X for the kernel's own image -------------------------------- */
+    KT_ASSERT(r, h->kernel_text_ro);
+
+    /* Counted rather than asserted per page: one failing page is one broken
+     * property, and 35 passing ones are not 35 pieces of evidence. The count
+     * keeps the suite's totals meaningful. */
+    u32 text_pages = 0, text_writable = 0, text_user = 0, text_absent = 0;
+
+    for (vaddr_t va = PAGE_TRUNC((vaddr_t)__text_start);
+         va < PAGE_ALIGN((vaddr_t)__rodata_end); va += PAGE_SIZE) {
+        u32 pte = vmm_pte(va);
+
+        text_pages++;
+        if (!(pte & PTE_PRESENT))
+            text_absent++;
+        if (pte & PTE_WRITE)
+            text_writable++;
+        if (pte & PTE_USER)
+            text_user++;
+    }
+
+    KT_ASSERT(r, text_pages > 16); /* the kernel is bigger than 64 KiB */
+    KT_EQ(r, text_absent, 0u);
+    KT_EQ(r, text_writable, 0u);
+    KT_EQ(r, text_user, 0u);
+
+    /* .data must still be writable, or the kernel could not run. Checking it
+     * is how this suite proves it narrowed the right ranges rather than
+     * everything. */
+    KT_ASSERT(r, (vmm_pte((vaddr_t)__data_start) & PTE_WRITE) != 0);
+
+    /* --- the kernel half is unreachable from ring 3 --------------------- */
+    /* A directory entry's USER bit gates its whole 4 MiB, and ensure_table()
+     * widens one when a page inside becomes user-accessible. That must never
+     * have happened to a kernel slot: it would expose 4 MiB of kernel space
+     * to ring 3 in one bit. */
+    u32 kernel_slots = 0, slots_absent = 0, slots_user = 0;
+
+    for (u32 pdi = KERNEL_PDE_FIRST; pdi < 1023; pdi++) {
+        u32 pde = vmm_pde_raw(pdi);
+
+        kernel_slots++;
+        /* Every kernel slot must be backed, so that no address space can be
+         * missing one. See vmm_reserve_kernel_tables(). */
+        if (!(pde & PTE_PRESENT))
+            slots_absent++;
+        if (pde & PTE_USER)
+            slots_user++;
+    }
+
+    KT_EQ(r, kernel_slots, 1023u - KERNEL_PDE_FIRST);
+    KT_EQ(r, slots_absent, 0u);
+    KT_EQ(r, slots_user, 0u);
+
+    /* --- stack guard pages --------------------------------------------- */
+    KT_ASSERT(r, h->stack_guard_pages);
+    KT_ASSERT(r, h->stack_canaries);
+
+    /* This task's own stack is in the guarded region, and the page below it
+     * is not mapped. */
+    struct task *self = task_current();
+
+    KT_ASSERT(r, (vaddr_t)self->stack_base >= KSTACK_BASE);
+    KT_ASSERT(r, (vaddr_t)self->stack_base < KSTACK_BASE + KSTACK_REGION);
+    KT_ASSERT(r, vmm_translate((vaddr_t)self->stack_base, NULL));
+    KT_ASSERT(r, !vmm_translate((vaddr_t)self->stack_base - PAGE_SIZE, NULL));
+
+    /* And the page above its top, which is the next slot's guard. */
+    KT_ASSERT(r, !vmm_translate(self->kernel_esp0, NULL));
+
+    /* No task has broken its canary; the check panics, so a non-zero count
+     * here would mean the counter is being incremented without the panic. */
+    KT_EQ(r, sched_canary_failures(), 0u);
+
+    /* --- SMEP and SMAP -------------------------------------------------- */
+    /* Availability depends on the CPU, so what is asserted is consistency:
+     * a feature the CPU has must be switched on, and one it does not have
+     * must not be claimed. Under an emulator without them, this is the
+     * branch that gets tested - which is worth having, since the fallback is
+     * what runs on any pre-2012 machine. */
+    if (h->smep_available)
+        KT_ASSERT(r, h->smep_enabled && (read_cr4() & CR4_SMEP));
+    else
+        KT_ASSERT(r, !h->smep_enabled);
+
+    if (h->smap_available)
+        KT_ASSERT(r, h->smap_enabled && (read_cr4() & CR4_SMAP));
+    else
+        KT_ASSERT(r, !h->smap_enabled);
+
+    /* A declared access to user memory works. There is nothing mapped in
+     * user space in this address space, so what is actually checked is that
+     * the window opens and closes and the counter moves - the refusal of an
+     * *undeclared* access is what faulted this suite's sibling the first
+     * time SMAP was enabled, and cannot be asserted without panicking. */
+    u32 windows = h->user_access_windows;
+
+    user_access_begin();
+    user_access_end();
+
+    if (h->smap_enabled)
+        KT_ASSERT(r, h->user_access_windows == windows + 1);
+    else
+        KT_ASSERT(r, h->user_access_windows == windows);
+
+    /* --- the null page, one more time ---------------------------------- */
+    /* Belongs here as much as in the vmm suite: an unmapped page zero is a
+     * mitigation, not an implementation detail. */
+    KT_ASSERT(r, !vmm_translate(0, NULL));
+    KT_ASSERT(r, (vmm_pde_raw(0) & PTE_PRESENT) == 0);
+}
+
 static const struct ktest tests[] = {
     {"string", "string and formatting primitives", test_string},
     {"boot", "boot protocol normalisation", test_boot},
@@ -930,6 +1094,8 @@ static const struct ktest tests[] = {
     {"elf", "user ELF validation and rejection", test_elf},
     {"vmspace", "address spaces and copy-on-write", test_address_spaces},
     {"proc", "process table, fork guards, exec namespace", test_processes},
+    {"harden", "W^X, guard pages, SMEP/SMAP, kernel/user split",
+     test_hardening},
     {"ksyms", "embedded symbol table lookup", test_ksyms},
     {"profile", "sampling profiler attribution", test_profile},
 };

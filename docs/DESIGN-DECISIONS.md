@@ -414,3 +414,149 @@ function. The function has to refuse to act on `current`.
 **Why.** The two lifetimes are genuinely different: memory should come back as
 soon as anyone notices, and an exit status is owed to a specific process until
 it asks. Trying to serve both with one trigger is what produced the bug.
+
+---
+
+## 18. All 255 kernel page tables, up front
+
+**Decision.** `vmm_init()` allocates a page table for every page directory
+slot in the kernel half — 255 of them, 1020 KiB — before the first address
+space other than the kernel's can exist. `ensure_table()` panics if a kernel
+table is created later.
+
+**Rejected: reserving only the regions in use.** The linear map, the heap's
+maximum window, the temporary slots and the stack region come to 21 slots and
+84 KiB: twelve times cheaper, and it works. What it leaves behind is a list
+that has to be kept in step with the address-space layout, and the failure
+mode for forgetting an entry is this bug: a kernel mapping that exists in
+whichever address space happened to be current when it was made, and faults
+in every other. It appears when the wrong process is scheduled, somewhere
+unrelated to the code that caused it.
+
+That is not hypothetical. The heap window spans slots 832 to 847 and
+`heap_init()` maps 1 MiB, so only slot 832 existed at boot; growing the heap
+past 4 MiB creates slot 833, and a process forked before the growth would
+never have seen it. Finding it required writing the assertion.
+
+**Rejected: propagating a new kernel directory entry to every live address
+space.** This is what the bug actually asks for, and it is what some kernels
+do. It needs a registry of every address space, a lock around it, and a
+correctness argument about a process being forked while the propagation is
+half done. Pre-allocating needs none of those and cannot be got wrong.
+
+**Cost.** 1020 KiB of RAM on a machine with 127 MiB, 0.8%. The number does
+not grow with memory, only with the size of the kernel half, so it is the
+same 1 MiB on a 4 GiB machine.
+
+**Why.** It converts a class of bug whose symptom is a page fault in an
+unrelated process into something that cannot happen. The assertion that
+replaces it fires at the moment the mistake is made, names the directory slot
+and the address it covers, and says what to do about it.
+
+---
+
+## 19. SMAP, and therefore an enumerable list of user accesses
+
+**Decision.** `CR4.SMAP` is enabled where the CPU has it, and the five places
+the kernel deliberately touches user memory are wrapped in
+`user_access_begin()`/`user_access_end()` — `stac` and `clac`.
+
+**Rejected: SMEP only.** SMEP is free and uncontroversial; the kernel never
+executes user memory, so enabling it costs nothing. Stopping there would have
+been the easy half. SMAP is the one that changes the code, and the change is
+the benefit: after it, the places where the kernel dereferences a ring-3
+pointer are a list of five rather than "anywhere in the kernel".
+
+**Rejected: a copy_from_user/copy_to_user pair instead.** The usual shape, and
+better engineering in a bigger kernel — every user access goes through two
+functions and the windows are invisible. Here it would have hidden what this
+change exists to show: that `cow_fault` reads a user page, that
+`elf_load_user` writes several, that `sys_write` hands a user pointer
+straight to the console layer. Making each site declare itself is worse
+abstraction and better evidence.
+
+**Cost.** Two instructions per access, a flag check before each so that
+`stac` on a CPU without SMAP is not a `#UD`, and the discipline that a new
+user access without a window is a page fault rather than a code review
+comment. Also a nesting rule: `upoke()` in the test suite opens a window and
+writes to a copy-on-write page, which faults into `cow_fault`, which opens
+another. That works because `AC` is part of `EFLAGS` and the handler's `IRET`
+restores it — but it is a thing to know.
+
+**Why.** It caught a bug on its first boot. Not in the kernel — in the
+`vmspace` suite, which writes to a user page from ring 0 to prove
+copy-on-write works and had never declared the access. A mitigation that
+finds a defect in the same change that introduces it has earned its two
+instructions.
+
+And it is read back, not assumed: `harden_init()` writes CR4 and then reads
+it, because a hypervisor may advertise SMAP in CPUID and refuse the bit, and
+a kernel that believed SMAP was on would skip the `stac` pairs and fault on
+its first legitimate user access.
+
+---
+
+## 20. A guard page *and* a canary under every stack
+
+**Decision.** Task stacks moved out of the heap into a region where each one
+is preceded by a permanently unmapped page, and the lowest usable word holds
+a magic that `switch_to()` checks on every switch.
+
+**Rejected: the heap, as before.** `kmalloc_aligned(TASK_STACK_SIZE, 16)` put
+each stack next to another allocation's header. An overflow ate that header
+silently, and the complaint arrived later from an unrelated `kfree`
+complaining about a guard magic — a diagnosis three steps removed from the
+cause.
+
+**Rejected: the guard page alone.** It is the stronger of the two: the
+hardware enforces it, it costs nothing at runtime, and the resulting page
+fault names the guard page and the function that overran. It catches a stack
+that *grew* too far. It does not catch a wild write that landed past it — a
+`memcpy` with a bad length jumps over the guard entirely and lands below.
+
+**Rejected: the canary alone.** Then an overflow is detected at the next
+context switch rather than at the instruction that caused it, which is the
+difference between a backtrace naming the culprit and a backtrace naming the
+scheduler.
+
+**Cost.** One page of address space per task that is never backed by a frame,
+a fixed region instead of a general allocation, and one load plus one compare
+per context switch. The slot index is the task's index in `tasks[]`, which is
+unique and stable, so there is no second allocator.
+
+**Why.** The two mechanisms fail differently, and the cheap one covers the
+expensive one's blind spot. The canary check runs on the task being switched
+*away* from — the one that has just been running — so the panic names the
+culprit rather than its successor.
+
+---
+
+## 21. Two CI scenarios whose expected result is a panic
+
+**Decision.** `fault-text` and `fault-stackguard` boot a kernel, type one
+`fault` command, and require QEMU to exit 35 — the panic code — with the
+serial log naming the right faulting address, reason and region.
+
+**Rejected: asserting the configuration and stopping there.** The `harden`
+suite already checks that the page table entries covering `.text` have no
+write bit and that the page below each stack is unmapped. That is half of a
+mitigation. The other half is whether the CPU acts on it, and the correct
+outcome of testing that is a dead kernel, which no passing test can contain.
+
+**Rejected: an expected-fault mechanism in the page-fault handler.** A flag
+saying "a fault at this address is expected, skip the instruction and carry
+on" would let both halves live in the `harden` suite. It needs
+instruction-length decoding to know where to resume, which is a disassembler
+in the fault path — a large amount of fragile machinery, in the one place
+where a bug is hardest to diagnose.
+
+**Cost.** Two extra QEMU boots in CI, and a harness path that treats a panic
+as success. Each is driven through the serial console a character at a time
+because there is no prompt to wait for afterwards, and the session keeps
+draining for five seconds past the panic banner, because the register dump,
+the resolved symbol and the call trace all arrive after it.
+
+**Why.** A clean exit from `fault text` would mean the kernel's text is
+writable again — exactly the regression that is invisible to every other test
+in the suite. Asserting on the exit code is what makes the scenario a test of
+the CPU rather than of a log line.

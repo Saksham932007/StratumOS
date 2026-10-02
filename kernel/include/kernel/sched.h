@@ -71,6 +71,11 @@ NORETURN void sched_start(void);
 
 struct task *task_current(void);
 u32 sched_switch_count(void);
+
+/* How many times a task's kernel-stack canary has been found broken. Always
+ * zero in practice, because the check panics - it is reported so that the
+ * mechanism is visibly present rather than merely claimed. */
+u32 sched_canary_failures(void);
 const char *task_state_name(enum task_state s);
 void sched_foreach(void (*fn)(const struct task *t, void *ctx), void *ctx);
 

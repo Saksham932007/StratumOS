@@ -7,6 +7,8 @@
  */
 #define LOG_TAG "elf"
 
+#include <arch/harden.h>
+
 #include <kernel/elf.h>
 #include <kernel/layout.h>
 #include <kernel/log.h>
@@ -187,13 +189,22 @@ bool elf_load_user(const void *image, size_t size, struct elf_load_info *out)
                 return false;
             }
 
+            /* Writing a user page from ring 0, which is exactly what SMAP
+             * forbids by default. The window covers one page and closes
+             * immediately. */
+            user_access_begin();
             memset((void *)page, 0, PAGE_SIZE);
+            user_access_end();
+
             info.pages++;
         }
 
-        if (ph->filesz)
+        if (ph->filesz) {
+            user_access_begin();
             memcpy((void *)ph->vaddr, (const u8 *)image + ph->offset,
                    ph->filesz);
+            user_access_end();
+        }
 
         /* The rest of memsz is the .bss tail; the pages were zeroed above. */
 

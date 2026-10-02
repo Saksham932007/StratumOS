@@ -100,6 +100,97 @@ void sched_init(void)
     pr_info("scheduler ready; boot context adopted as pid 0 (idle)");
 }
 
+/* ---- kernel stacks, with guard pages -----------------------------------
+ *
+ * Each task's stack lives at a fixed slot in the KSTACK_BASE region rather
+ * than in the heap, and each slot begins with a page that is deliberately
+ * left unmapped. An overflowing stack therefore walks into nothing and takes
+ * a page fault - with the offending EIP still in the trap frame - instead of
+ * quietly overwriting whatever the heap put below it.
+ *
+ * The slot index is the task's index in `tasks[]`, which is unique and stable
+ * for the life of the slot, so there is no separate allocator to get wrong.
+ * Slot 0 is never used: the idle task runs on the boot stack.
+ *
+ *   KSTACK_BASE + i*KSTACK_SLOT                  guard page (unmapped)
+ *   KSTACK_BASE + i*KSTACK_SLOT + PAGE_SIZE      lowest usable word
+ *   ... + PAGE_SIZE + TASK_STACK_SIZE            esp0, the top
+ *
+ * Slot i's guard page sits immediately above slot i-1's top, so a stack that
+ * grows the wrong way is caught as well.
+ */
+#define KSTACK_SLOT  (PAGE_SIZE + TASK_STACK_SIZE)
+#define KSTACK_SLOTS (KSTACK_REGION / KSTACK_SLOT)
+
+_Static_assert(KSTACK_SLOTS >= TASK_MAX,
+               "the kernel-stack region cannot hold TASK_MAX stacks");
+
+/* The lowest usable word of a stack holds this, and switch_to() checks it.
+ * The guard page catches a stack that grew too far; the canary catches a wild
+ * write that landed past it - a memcpy with a bad length, say, which skips
+ * over the guard entirely. */
+#define KSTACK_CANARY 0x5452414Bu /* "KART", backwards, in a hex dump */
+
+static u32 canary_failures;
+
+static vaddr_t kstack_base_of(size_t slot)
+{
+    return KSTACK_BASE + slot * KSTACK_SLOT + PAGE_SIZE;
+}
+
+/* Map a task's stack. Returns its top (what esp0 wants), or 0. */
+static u32 kstack_alloc(size_t slot)
+{
+    ASSERT(slot > 0 && slot < TASK_MAX);
+
+    vaddr_t base = kstack_base_of(slot);
+
+    for (u32 off = 0; off < TASK_STACK_SIZE; off += PAGE_SIZE) {
+        if (!vmm_alloc_at(base + off, PTE_PRESENT | PTE_WRITE)) {
+            pr_err("cannot map a kernel stack for slot %u", (unsigned)slot);
+            while (off > 0) {
+                off -= PAGE_SIZE;
+                vmm_unmap(base + off);
+            }
+            return 0;
+        }
+    }
+
+    memset((void *)base, 0, TASK_STACK_SIZE);
+    *(volatile u32 *)base = KSTACK_CANARY;
+
+    return base + TASK_STACK_SIZE;
+}
+
+static void kstack_free(size_t slot)
+{
+    vaddr_t base = kstack_base_of(slot);
+
+    for (u32 off = 0; off < TASK_STACK_SIZE; off += PAGE_SIZE)
+        vmm_unmap(base + off);
+}
+
+/* Cheap enough to run on every context switch: one load and one compare. */
+static void kstack_check(const struct task *t)
+{
+    if (!t->stack_base)
+        return; /* the idle task, on the boot stack */
+
+    if (*(const volatile u32 *)t->stack_base == KSTACK_CANARY)
+        return;
+
+    canary_failures++;
+    panic("pid %u \"%s\" overran its kernel stack: the canary at %p reads "
+          "%08x, not %08x",
+          t->pid, t->name, t->stack_base, *(const u32 *)t->stack_base,
+          KSTACK_CANARY);
+}
+
+u32 sched_canary_failures(void)
+{
+    return canary_failures;
+}
+
 static struct task *alloc_slot(void)
 {
     for (size_t i = 1; i < TASK_MAX; i++)
@@ -128,19 +219,21 @@ struct task *task_create(const char *name, task_entry_t entry, void *arg)
     t->state = TASK_BLOCKED;
     irq_restore(irqs);
 
-    void *stack = kmalloc_aligned(TASK_STACK_SIZE, 16);
-    if (!stack) {
+    u32 esp0 = kstack_alloc((size_t)(t - tasks));
+    if (!esp0) {
         t->state = TASK_UNUSED;
         pr_err("cannot create \"%s\": no memory for a %u KiB stack", name,
                (unsigned)(TASK_STACK_SIZE / KIB));
         return NULL;
     }
 
+    void *stack = (void *)(esp0 - TASK_STACK_SIZE);
+
     memset(t->name, 0, sizeof(t->name));
     strlcpy(t->name, name, sizeof(t->name));
     t->stack_base = stack;
     t->stack_size = TASK_STACK_SIZE;
-    t->kernel_esp0 = (u32)stack + TASK_STACK_SIZE;
+    t->kernel_esp0 = esp0;
     t->quantum_left = SCHED_QUANTUM;
     t->ticks_total = 0;
     t->switches = 0;
@@ -222,7 +315,8 @@ static void release_task_resources(struct task *t)
     if (p->next == t)
         p->next = t->next;
 
-    void *stack = t->stack_base;
+    bool had_stack = t->stack_base != NULL;
+    size_t slot = (size_t)(t - tasks);
     paddr_t pd = t->page_dir;
     u32 pid = t->pid;
 
@@ -233,8 +327,8 @@ static void release_task_resources(struct task *t)
     t->page_dir = 0;
     irq_restore(irqs);
 
-    if (stack)
-        kfree(stack);
+    if (had_stack)
+        kstack_free(slot);
 
     /* A forked process owns its address space; a kernel thread shares the
      * kernel's and must not free it. */
@@ -299,6 +393,11 @@ static void switch_to(struct task *next)
         prev->quantum_left = SCHED_QUANTUM;
         return;
     }
+
+    /* Before anything else: the task being switched away from is the one
+     * that has just been running, so its stack is the one that may have been
+     * overrun. Checking here means the panic names the culprit. */
+    kstack_check(prev);
 
     if (prev->state == TASK_RUNNING)
         prev->state = TASK_READY;
@@ -472,18 +571,20 @@ int task_fork(const struct regs *parent_frame)
     child->state = TASK_BLOCKED; /* claim the slot before unlocking */
     irq_restore(irqs);
 
-    void *stack = kmalloc_aligned(TASK_STACK_SIZE, 16);
-    if (!stack) {
+    u32 esp0 = kstack_alloc((size_t)(child - tasks));
+    if (!esp0) {
         child->state = TASK_UNUSED;
         pr_err("fork: no memory for the child's kernel stack");
         return -1;
     }
 
+    void *stack = (void *)(esp0 - TASK_STACK_SIZE);
+
     /* Copy-on-write clone of the caller's address space. Every writable page
      * becomes read-only in *both* and the frames are shared until written. */
     paddr_t child_pd = vmm_clone_current();
     if (!child_pd) {
-        kfree(stack);
+        kstack_free((size_t)(child - tasks));
         child->state = TASK_UNUSED;
         pr_err("fork: could not clone the address space");
         return -1;
@@ -496,7 +597,7 @@ int task_fork(const struct regs *parent_frame)
 
     child->stack_base = stack;
     child->stack_size = TASK_STACK_SIZE;
-    child->kernel_esp0 = (u32)stack + TASK_STACK_SIZE;
+    child->kernel_esp0 = esp0;
     child->page_dir = child_pd;
     child->parent_pid = parent->pid;
     child->quantum_left = SCHED_QUANTUM;
@@ -519,7 +620,7 @@ int task_fork(const struct regs *parent_frame)
      *   [eflags] [ebx] [esi] [edi] [ebp]    <- popfd and four pops
      *                                  ^-- saved_esp
      */
-    u8 *top = (u8 *)stack + TASK_STACK_SIZE;
+    u8 *top = (u8 *)esp0;
     struct regs *frame = (struct regs *)(top - sizeof(struct regs));
 
     *frame = *parent_frame;

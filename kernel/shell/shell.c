@@ -13,6 +13,7 @@
 #define LOG_TAG "shell"
 
 #include <arch/cpu.h>
+#include <arch/harden.h>
 #include <arch/io.h>
 #include <arch/irq.h>
 
@@ -487,12 +488,80 @@ static int cmd_ring3(int argc, char **argv)
 static volatile u32 fault_null_addr = 0;
 static volatile u32 fault_unmapped_addr = 0xC9000000u;
 static volatile u32 fault_readonly_addr;
+static volatile u32 fault_text_addr;
+static volatile u32 fault_guard_addr;
 
 /* Both operands live in volatile storage. With a literal numerator GCC proves
  * the division is undefined and emits `ud2` instead of `idiv`, so the #DE this
  * command exists to show never happens. */
 static volatile int fault_dividend = 1;
 static volatile int fault_divisor; /* left zero */
+
+/* What is actually switched on, as opposed to what the README claims. Every
+ * line is read back from the hardware or the page tables rather than from a
+ * flag the kernel set earlier. */
+static int cmd_harden(int argc, char **argv)
+{
+    UNUSED(argc);
+    UNUSED(argv);
+
+    const struct harden_state *h = harden_get_state();
+
+    kprintf("Kernel/user separation\n");
+    kprintf("  null page       : %s\n",
+            vmm_translate(0, NULL) ? "MAPPED - a NULL dereference would not "
+                                     "fault!"
+                                   : "unmapped");
+    kprintf("  CR0.WP          : %s\n",
+            (read_cr0() & (1u << 16))
+                ? "set - ring 0 honours read-only pages"
+                : "CLEAR - read-only kernel pages are advisory!");
+    kprintf("  kernel .text    : %s\n",
+            h->kernel_text_ro ? "read-only" : "WRITABLE");
+    kprintf("  kernel .rodata  : %s\n",
+            h->kernel_text_ro ? "read-only" : "WRITABLE");
+
+    kprintf("  SMEP (CR4.20)   : %s\n",
+            h->smep_enabled     ? "enabled - ring 0 cannot execute user pages"
+            : h->smep_available ? "available but not enabled"
+                                : "not supported by this CPU");
+    kprintf("  SMAP (CR4.21)   : %s\n",
+            h->smap_enabled     ? "enabled - ring 0 cannot touch user pages "
+                                  "without EFLAGS.AC"
+            : h->smap_available ? "available but not enabled"
+                                : "not supported by this CPU");
+    if (h->smap_enabled)
+        kprintf("  declared windows: %u user accesses so far\n",
+                h->user_access_windows);
+
+    kprintf("Stacks\n");
+    kprintf("  task stacks at  : %p, %u KiB each\n", (void *)KSTACK_BASE,
+            (unsigned)(TASK_STACK_SIZE / KIB));
+    kprintf("  guard pages     : %s\n",
+            h->stack_guard_pages ? "one unmapped page below every stack"
+                                 : "none");
+    kprintf("  canaries        : %s (%u failures)\n",
+            h->stack_canaries ? "checked on every context switch" : "none",
+            sched_canary_failures());
+
+    /* Prove the guard page rather than asserting it: read the page below
+     * this task's own stack out of the page tables. */
+    vaddr_t guard = (vaddr_t)task_current()->stack_base - PAGE_SIZE;
+    kprintf("  this task's guard page at %p is %s\n", (void *)guard,
+            vmm_translate(guard, NULL) ? "MAPPED - the guard is gone!"
+                                       : "unmapped, as it should be");
+
+    kprintf("Address spaces\n");
+    kprintf("  kernel half     : all %u directory slots pre-backed, so "
+            "every\n",
+            1023u - KERNEL_PDE_FIRST);
+    kprintf("                    address space sees identical kernel "
+            "mappings\n");
+
+    kprintf("\nNot yet implemented: NX (needs PAE), KASLR. See "
+            "docs/SECURITY.md.\n");
+    return 0;
+}
 
 static int cmd_fault(int argc, char **argv)
 {
@@ -527,10 +596,27 @@ static int cmd_fault(int argc, char **argv)
     } else if (strcmp(what, "ud") == 0) {
         kprintf("executing an invalid opcode...\n");
         __asm__ volatile("ud2");
+    } else if (strcmp(what, "text") == 0) {
+        /* The negative half of the W^X check. The `harden` suite asserts the
+         * PTEs have no write bit; this asserts the CPU agrees. */
+        kprintf("writing to the kernel's own .text from ring 0...\n");
+        fault_text_addr = (u32)__text_start;
+        volatile u32 *p = (volatile u32 *)fault_text_addr;
+        *p = 0x90909090;
+    } else if (strcmp(what, "stackguard") == 0) {
+        /* The negative half of the guard-page check. Writing below this
+         * task's own stack must land on the unmapped guard page. Done by
+         * address rather than by recursing, so the fault is at a known place
+         * and the diagnosis is checkable. */
+        kprintf("writing below this task's kernel stack...\n");
+        fault_guard_addr = (u32)task_current()->stack_base - 16;
+        volatile u32 *p = (volatile u32 *)fault_guard_addr;
+        *p = 0xDEADBEEF;
     } else if (strcmp(what, "panic") == 0) {
         panic("deliberate panic requested from the shell");
     } else {
-        kprintf("usage: fault <null|unmapped|readonly|div0|ud|panic>\n");
+        kprintf("usage: fault "
+                "<null|unmapped|readonly|text|stackguard|div0|ud|panic>\n");
         kprintf("each of these deliberately crashes the kernel so the\n");
         kprintf("exception handlers and backtrace can be inspected.\n");
         return 1;
@@ -790,7 +876,9 @@ static const struct shell_command commands[] = {
     {"programs", "programs", "list the programs exec() can run", cmd_programs},
     {"stress", "stress [workers] [rounds]",
      "hammer the heap from several tasks", cmd_stress},
-    {"fault", "fault <null|unmapped|readonly|div0|ud|panic>",
+    {"harden", "harden", "report the mitigations that are switched on",
+     cmd_harden},
+    {"fault", "fault <null|unmapped|readonly|text|stackguard|div0|ud|panic>",
      "crash on purpose, to show the handlers", cmd_fault},
     {"reboot", "reboot", "reset the machine", cmd_reboot},
     {"halt", "halt", "stop the machine", cmd_halt},

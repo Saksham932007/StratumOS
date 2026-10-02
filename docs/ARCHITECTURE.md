@@ -4,12 +4,12 @@
 
 ```
                          ┌──────────────────────────┐
-                         │   shell (task, ring 0)   │  24 commands, history
+                         │   shell (task, ring 0)   │  25 commands, history
                          └────────────┬─────────────┘
                                       │
    ┌──────────────┐      ┌────────────┴─────────────┐      ┌──────────────┐
    │ init, hello  │      │        scheduler         │      │   ktest      │
-   │ (ring 3)     │◄────►│  round robin, 100 Hz     │      │ 14 suites    │
+   │ (ring 3)     │◄────►│  round robin, 100 Hz     │      │ 15 suites    │
    └──────┬───────┘      └────────────┬─────────────┘      └──────────────┘
           │ int 0x80                  │
    ┌──────┴───────┐                   │
@@ -31,6 +31,7 @@
    ┌─────────────────────────┴──────────────────┴──────────────────┴───────┐
    │                        arch/x86                                       │
    │   gdt+tss · idt (256 vectors) · irq (8259 PIC) · cpu (CPUID)          │
+   │   harden (SMEP/SMAP, W^X, the kernel/user split)                      │
    │   isr.asm · switch.asm · usermode.asm · boot.asm                      │
    └───────────────────────────────┬───────────────────────────────────────┘
                                    │
@@ -64,13 +65,14 @@ out of sequence.
 | 9 | `timer_init`, `keyboard_init`, `serial_console_init` | Each installs its handler and only then unmasks its own line, so an interrupt can never arrive before someone is ready for it. |
 | 10 | **`sti()`** | The first moment this is safe. See below. |
 | 11 | `pmm_init` | Needs the memory map and the kernel's own extent. Places its bitmap above the kernel image. |
-| 12 | `vmm_init` | Adopts the page directory `_start` built, widens the linear map, and drops the boot identity mapping. Needs the PMM for the new page tables. |
+| 12 | `vmm_init` | Adopts the page directory `_start` built, widens the linear map, claims a page table for every slot in the kernel half, and drops the boot identity mapping. Needs the PMM for the new page tables. |
 | 13 | `heap_init` | Needs paging, because the heap is a virtual window backed on demand. |
-| 14 | `rtc_init`, `pci_init` | Non-essential hardware. A failure is logged, not fatal. |
-| 15 | `sched_init` | Needs the heap for task stacks. Adopts the boot context as pid 0. |
-| 16 | `syscall_init` | Needs the IDT; re-installs vector 0x80 with DPL 3. |
-| 17 | task creation | Needs the scheduler and the heap. |
-| 18 | `sched_start` | The boot context becomes the idle task and never returns. |
+| 14 | `vmm_protect_kernel_text`, `harden_init` | Must follow paging, and must precede any second address space or any user program. Narrowing the kernel's own text needs one address space to narrow it in, and turning SMAP on afterwards would fault inside code already written without the `stac`/`clac` discipline. |
+| 15 | `rtc_init`, `pci_init` | Non-essential hardware. A failure is logged, not fatal. |
+| 16 | `sched_init` | Adopts the boot context as pid 0. |
+| 17 | `syscall_init` | Needs the IDT; re-installs vector 0x80 with DPL 3. |
+| 18 | task creation | Needs the scheduler, and the stack region the VMM reserved. |
+| 19 | `sched_start` | The boot context becomes the idle task and never returns. |
 
 ### The `sti()` placement
 
@@ -194,5 +196,6 @@ cleanly instead of walking off into the heap.
 - [MEMORY.md](MEMORY.md) — the address space, the higher-half transition, the allocators
 - [USERSPACE.md](USERSPACE.md) — the user programs, the ELF loader, the privilege boundary
 - [PROCESSES.md](PROCESSES.md) — address spaces, fork, copy-on-write, exec, wait
+- [SECURITY.md](SECURITY.md) — the mitigations, how each is enforced, and what is missing
 - [PERFORMANCE.md](PERFORMANCE.md) — benchmarks, the profiler, the symbol table
 - [DESIGN-DECISIONS.md](DESIGN-DECISIONS.md) — the trade-offs behind the above

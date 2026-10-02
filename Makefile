@@ -461,7 +461,7 @@ format-check:
 lines:
 	@echo "Lines of code by area:"
 	@for d in boot kernel/arch kernel/core kernel/mm kernel/drivers \
-	          kernel/shell kernel/include tools tests; do \
+	          kernel/shell kernel/include user tools tests ; do \
 		n=$$(find $$d -type f \( -name '*.c' -o -name '*.h' -o -name '*.asm' \
 		     -o -name '*.inc' -o -name '*.py' \) -exec cat {} + 2>/dev/null | wc -l); \
 		printf "  %-20s %6s\n" "$$d" "$$n"; \

@@ -105,13 +105,13 @@ Checking them takes 30 milliseconds.
 
 ## Layer 3: in-kernel suites
 
-`kernel/core/ktest.c` holds 14 suites and 269 assertions, run against
+`kernel/core/ktest.c` holds 15 suites and 293 assertions, run against
 real hardware state — a bitmap with actual firmware-reported memory in it, real
 page tables, a real heap, a real scheduler.
 
 ```
 stratum> selftest
-ktest: running 14 suites
+ktest: running 15 suites
 ktest: string ... PASS (15 checks)
 ktest: boot ... PASS (26 checks)
 ktest: cpu ... PASS (8 checks)
@@ -124,9 +124,10 @@ ktest: syscall ... PASS (8 checks)
 ktest: elf ... PASS (14 checks)
 ktest: vmspace ... PASS (42 checks)
 ktest: proc ... PASS (14 checks)
+ktest: harden ... PASS (24 checks)
 ktest: ksyms ... PASS (12 checks)
 ktest: profile ... PASS (9 checks)
-ktest: summary 14/14 suites passed
+ktest: summary 15/15 suites passed
 ```
 
 | Suite | What it establishes |
@@ -143,6 +144,7 @@ ktest: summary 14/14 suites passed
 | `elf` | a deliberately corrupted image is refused for each of eight reasons, each with a stated cause |
 | `vmspace` | a fresh address space has the kernel's half and an empty user half; a clone marks the page read-only and COW in *both* copies; the reference count rises to 2; the first write allocates exactly one new frame and the second does not fault; destroying the clone drops the shared frame to zero references; and the frame count returns to where it started |
 | `proc` | a kernel thread shares the kernel's page directory; `task_fork(NULL)` is refused rather than reading address zero; `wait()` returns a real pid and status for each child and -1 once there are none; `exec`'s program table contains `init` and terminates |
+| `harden` | `CR0.WP` is set; no page of `.text` or `.rodata` is writable or user-accessible and `.data` still is; every kernel directory entry is present and none has the `USER` bit; this task's stack is in the guarded region with its guard page unmapped above and below; CR4 agrees with CPUID about SMEP and SMAP; a declared user access opens a window and an undeclared one is what SMAP exists to refuse |
 | `ksyms` | the table is sorted; every symbol resolves to itself; an exact address gives offset 0 and an address inside a function gives the right offset; addresses outside every executable section resolve to nothing |
 | `profile` | synthetic frames are attributed correctly — ring 0 inside a known function counts, ring 3 counts separately, an address outside `.text` counts as unattributed, and a stopped profiler ignores ticks |
 
@@ -181,7 +183,8 @@ table.
 
 ## Layer 4: boot scenarios
 
-`tools/run-tests.py` boots the kernel three ways and asserts on what it says.
+`tools/run-tests.py` boots the kernel seven ways and asserts on what it says.
+Five of them must come up clean; two of them must *panic*.
 
 ### Unattended boots
 
@@ -207,7 +210,7 @@ build/stratum-test.img    # cmdline "autotest", via stage 2's patchable header
 build/stratum-test.iso    # cmdline "autotest", via grub-test.cfg
 ```
 
-Each scenario then checks 25 expected lines, 9 forbidden patterns, the
+Each scenario then checks 43 expected lines, 9 forbidden patterns, the
 in-kernel summary, and the exit status. The forbidden list is the important
 half:
 
@@ -233,9 +236,31 @@ one silently fall back to the other is caught:
 ("multiboot2 protocol detected", r"boot protocol\s+\[ok\] Multiboot2"),
 ```
 
+### The same image, on a CPU that has SMEP and SMAP
+
+QEMU's default i386 model does not implement CPUID leaf 7, so SMEP and SMAP
+cannot be detected and the kernel takes its fallback path. That path is worth
+testing — it is what runs on any pre-2012 machine — but it means the other
+half of the code never executes.
+
+So the `hardened-cpu` scenario boots the *same* image with `-cpu max` and
+requires both features to come up:
+
+```python
+("SMEP and SMAP both enabled", r"harden: SMEP enabled, SMAP enabled"),
+("the boot step says so",
+ r"hardening\s+\[ok\] W\^X, guard pages, SMEP \+ SMAP"),
+```
+
+With SMAP on, every place the kernel touches user memory must have declared
+the access with `stac`/`clac`, and a missing declaration is a page fault. So
+this scenario is a test of that discipline rather than of a log line — and it
+earned its keep on its first run, by faulting the `vmspace` suite, which had
+never declared the user-page write it uses to prove copy-on-write works.
+
 ### The interactive scenario
 
-21 shell commands, sent over the serial console and checked against regular
+29 shell commands, sent over the serial console and checked against regular
 expressions:
 
 ```python
@@ -303,8 +328,14 @@ stratum> fault ud          an invalid opcode                 → #UD
 stratum> fault panic       call panic() directly
 ```
 
-These are not part of CI — they deliberately crash the machine — but they are
-how the quality of the diagnostics gets judged.
+```
+stratum> fault text        ring-0 write to the kernel's .text  → #PF, W^X
+stratum> fault stackguard  write below a task's stack          → #PF, guard page
+```
+
+The first six are not part of CI — they are how the quality of the
+diagnostics gets judged. The last two *are*, because a mitigation has two
+halves and only one of them can be checked by a test that passes.
 
 One detail worth recording. The fault addresses and the division operands all
 live in file-scope `volatile` variables:
@@ -321,6 +352,40 @@ At `-O2`, GCC replaces a provably-undefined operation with `ud2`. Both
 `*(u32 *)0 = 1` and `1 / zero` compiled to an invalid opcode, so the commands
 produced a perfectly-reported `#UD` instead of the page fault and divide error
 they were supposed to demonstrate. The kernel was right; the test was wrong.
+
+---
+
+### Scenarios that must panic
+
+The `harden` suite proves the kernel's `.text` has no write bit in its page
+table entry, and that the page below every task stack is unmapped. It cannot
+prove the CPU acts on either, because the correct outcome of trying is a dead
+kernel.
+
+`fault-text` and `fault-stackguard` each boot a kernel, type one command, and
+require the panic to name the right address, the right reason and the right
+region:
+
+```python
+(
+    "fault-text",
+    "fault text",
+    [
+        r"faulting address: 0xc01[0-9a-f]{5}",
+        r"access\s+: write from ring 0",
+        r"reason\s+: the page is mapped read-only \(CR0\.WP applies to ring 0 too\)",
+        r"region\s+: the kernel's own code or constants, which are read-only",
+        r"KERNEL PANIC",
+        r"at\s+cmd_fault\+0x",     # the symbol table survives a fault in .text
+    ],
+),
+```
+
+and on QEMU exiting **35**, the panic code. A clean exit there would mean the
+write succeeded, which is exactly the regression these exist to catch. The
+session keeps draining the serial port for five seconds after the panic
+banner, because the register dump, the resolved symbol and the call trace all
+arrive after it and those are most of what is being asserted.
 
 ---
 

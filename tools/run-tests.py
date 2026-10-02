@@ -68,6 +68,13 @@ COMMON_EXPECTED = [
     ("scheduler", r"boot: scheduler\s+\[ok\]"),
     ("syscalls", r"boot: syscalls\s+\[ok\]"),
     ("paging really enabled", r"vmm: paging: kernel at 0xc0000000"),
+    # Hardening. The kernel half being fully backed is what stops a kernel
+    # mapping made after a fork from existing in only one address space.
+    ("kernel half fully backed",
+     r"kernel half fully backed: 255 page tables"),
+    ("kernel text is read-only",
+     r"kernel \.text and \.rodata mapped read-only \(\d+ pages\)"),
+    ("hardening reported at boot", r"hardening\s+\[ok\]"),
     ("identity map dropped", r"identity map dropped"),
     ("linear map established", r"linear map \d+ MiB"),
     ("user program loaded as an ELF", r"elf: loaded a \d+-segment program"),
@@ -352,6 +359,18 @@ SHELL_SCRIPT: list[tuple[str, list[str]]] = [
     ("selftest vmm", [r"ktest: vmm \.\.\. PASS"]),
     ("selftest vmspace", [r"ktest: vmspace \.\.\. PASS"]),
     ("selftest proc", [r"ktest: proc \.\.\. PASS"]),
+    ("selftest harden", [r"ktest: harden \.\.\. PASS"]),
+    ("harden", [r"null page\s+: unmapped",
+                r"CR0\.WP\s+: set",
+                r"kernel \.text\s+: read-only",
+                r"kernel \.rodata\s+: read-only",
+                r"SMEP \(CR4\.20\)\s+:",
+                r"SMAP \(CR4\.21\)\s+:",
+                r"guard pages\s+: one unmapped page below every stack",
+                r"canaries\s+: checked on every context switch \(0 "
+                r"failures\)",
+                r"guard page at 0xe[0-9a-f]+ is unmapped, as it should be",
+                r"all 255 directory slots pre-backed"]),
     ("programs", [r"exec's namespace", r"init\s+\(started at boot\)",
                   r"\bhello\b"]),
     ("stress 2 40", [r"heap integrity: consistent"]),
@@ -496,6 +515,115 @@ def run_benchmarks(build_dir: Path, keep_logs: Path | None) -> Outcome:
     return Outcome(sc, not failures, qemu_exit, log, failures, None)
 
 
+# ---------------------------------------------------------------------------
+# Deliberate faults
+# ---------------------------------------------------------------------------
+#
+# Every other scenario asserts that nothing panicked. These assert that
+# something *did*, because a mitigation has two halves and only one of them
+# can be checked by a test that passes.
+#
+# The `harden` suite proves the kernel's .text has no write bit in its page
+# table entry and that the page below each stack is unmapped. It cannot prove
+# the CPU acts on either, because the correct outcome of trying is a dead
+# kernel. So each of these boots a kernel, types one `fault` command, and
+# requires the panic to name the right address, the right reason and the
+# right region - which together are the evidence that the mitigation is doing
+# something rather than merely being configured.
+
+FAULT_CASES: list[tuple[str, str, list[str]]] = [
+    (
+        "fault-text",
+        "fault text",
+        [
+            r"writing to the kernel's own \.text from ring 0",
+            r"faulting address: 0xc01[0-9a-f]{5}",
+            r"access\s+: write from ring 0",
+            r"reason\s+: the page is mapped read-only \(CR0\.WP applies to "
+            r"ring 0 too\)",
+            r"region\s+: the kernel's own code or constants, which are "
+            r"read-only",
+            r"KERNEL PANIC",
+            # The symbol table has to survive a fault in the kernel's own
+            # text, which is where it is least convenient to need it.
+            r"at\s+cmd_fault\+0x",
+        ],
+    ),
+    (
+        "fault-stackguard",
+        "fault stackguard",
+        [
+            r"writing below this task's kernel stack",
+            r"faulting address: 0xe000[0-9a-f]{4}",
+            r"reason\s+: nothing is mapped at that address",
+            r"region\s+: a kernel-stack guard page - a task overran its "
+            r"stack",
+            r"KERNEL PANIC",
+        ],
+    ),
+]
+
+
+def run_fault_case(build_dir: Path, name: str, command: str,
+                   patterns: list[str], keep_logs: Path | None) -> Outcome:
+    image = build_dir / "stratum-shell.img"
+    sc = Scenario(
+        name=name,
+        description=f"`{command}` must panic, and say why",
+        image=image,
+        qemu_args=[],
+    )
+
+    failures: list[str] = []
+
+    cmd = [
+        QEMU, "-m", "128M", "-cpu", "max", "-no-reboot", "-display", "none",
+        "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        "-serial", "stdio",
+        "-drive", f"format=raw,file={image},index=0,media=disk",
+    ]
+
+    session = SerialSession(cmd, timeout=40.0)
+
+    if not session.read_until(PROMPT, timeout=40.0):
+        session.close()
+        return Outcome(sc, False, None, session.transcript,
+                       ["the shell prompt never appeared"], None)
+
+    session.send_line(command)
+
+    # The kernel is about to die, so there is no prompt to wait for. Read
+    # until the panic banner, then keep draining: the register dump, the
+    # resolved symbol and the call trace all come *after* it, and those are
+    # most of what this scenario asserts on.
+    session.read_until("KERNEL PANIC", timeout=20.0)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        session.read_until("\x00", timeout=0.5)
+
+    qemu_exit = session.close()
+    log = session.transcript
+
+    if keep_logs:
+        keep_logs.mkdir(parents=True, exist_ok=True)
+        (keep_logs / f"{name}.log").write_text(log)
+
+    for pattern in patterns:
+        if not re.search(pattern, log):
+            failures.append(f"missing: /{pattern}/")
+
+    # A panic exits with 35. Anything else - a clean exit above all - means
+    # the fault did not happen, which is the failure this scenario exists to
+    # catch.
+    if qemu_exit != EXIT_PANIC:
+        failures.append(
+            f"QEMU exited {qemu_exit}, expected {EXIT_PANIC} (a panic). "
+            f"The write was supposed to fault and did not."
+        )
+
+    return Outcome(sc, not failures, qemu_exit, log, failures, None)
+
+
 def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
     scenarios = [
         Scenario(
@@ -519,6 +647,31 @@ def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
             ],
         ),
         Scenario(
+            name="hardened-cpu",
+            description="the same kernel on a CPU that has SMEP and SMAP",
+            image=build_dir / "stratum-test.img",
+            qemu_args=[
+                # QEMU's default i386 model does not implement CPUID leaf 7,
+                # so SMEP and SMAP cannot be detected and the kernel takes
+                # its fallback path - which the other scenarios test. This
+                # one runs the same image on a CPU that has both, so the
+                # stac/clac discipline around every kernel access to user
+                # memory is actually exercised. A missing window shows up
+                # here as a page fault, which is how the first version of
+                # the vmspace suite was caught.
+                "-cpu", "max",
+                "-drive",
+                f"format=raw,file={build_dir / 'stratum-test.img'},"
+                f"index=0,media=disk",
+            ],
+            extra_expected=[
+                ("SMEP and SMAP both enabled",
+                 r"harden: SMEP enabled, SMAP enabled"),
+                ("the boot step says so",
+                 r"hardening\s+\[ok\] W\^X, guard pages, SMEP \+ SMAP"),
+            ],
+        ),
+        Scenario(
             name="multiboot2-grub",
             description="Multiboot2 via GRUB from an ISO",
             image=build_dir / "stratum-test.iso",
@@ -531,7 +684,8 @@ def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
         ),
     ]
 
-    if only in ("interactive-shell", "benchmarks"):
+    if only in ("interactive-shell", "benchmarks") or \
+            (only or "").startswith("fault-"):
         return []
 
     if only:
@@ -616,6 +770,32 @@ def main() -> int:
                 print("    --- end of log ---\n")
         else:
             print(f"  [benchmarks] SKIP ({bench_image} not built)\n")
+
+    for name, command, patterns in FAULT_CASES:
+        if args.only not in (None, name):
+            continue
+        shell_image = args.build_dir / "stratum-shell.img"
+        if not shell_image.is_file():
+            print(f"  [{name}] SKIP ({shell_image} not built)\n")
+            continue
+
+        print(f"  [{name}] `{command}` must panic, and say why")
+        outcome = run_fault_case(args.build_dir, name, command, patterns,
+                                 args.keep_logs)
+        outcomes.append(outcome)
+        print(f"    qemu exit        : {outcome.qemu_exit} "
+              f"(expected {EXIT_PANIC}, a panic)")
+        if outcome.passed:
+            print("    result           : PASS\n")
+        else:
+            print("    result           : FAIL")
+            for f in outcome.failures:
+                print(f"      - {f}")
+            print()
+            print("    --- transcript ---")
+            for line in outcome.log.splitlines():
+                print(f"    | {line}")
+            print("    --- end ---\n")
 
     for sc in scenarios:
         print(f"  [{sc.name}] {sc.description}")
