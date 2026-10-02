@@ -18,7 +18,9 @@ pmm_alloc_frame          ← 4 KiB physical frames, from the firmware map
 ## Address space
 
 The kernel occupies the top gigabyte of every address space; the bottom three
-belong to user processes.
+belong to user processes - and, since the kernel moved to the higher half,
+each process has a page directory of its own with the kernel's half copied
+in. See [PROCESSES.md](PROCESSES.md) for what that buys.
 
 ```
 -- user space ----------------------------------------------------------
@@ -34,6 +36,7 @@ belong to user processes.
   0xC00B8000              the VGA text framebuffer (physical 0xB8000)
   0xC0100000              the kernel image (loaded at physical 0x100000)
   0xC012E000              the frame-allocator bitmap
+0xCF000000 - 0xCF001FFF   two temporary frame-mapping slots (see below)
 0xD0000000 - 0xD4000000   kernel heap window, backed on demand, 64 MiB max
 ...
 0xFFC00000 - 0xFFFFEFFF   recursive window: every page table
@@ -272,6 +275,60 @@ Without this distinction, unmapping either leaks every frame it ever mapped,
 or "frees" frames it never owned — the VGA framebuffer being the memorable
 example. The `vmm` test suite asserts both directions.
 
+### Copy-on-write, and the second software bit
+
+x86 leaves bits 9-11 of a page table entry to software, and this kernel
+spends two of them:
+
+| Bit | Name | Meaning |
+|-----|------|---------|
+| 9 | `PTE_OWNED` | this mapping allocated its frame; unmapping frees it |
+| 10 | `PTE_COW` | shared copy-on-write; the next write faults and copies |
+
+Sharing a frame between address spaces means a frame can be freed while
+somebody is still reading it, so the PMM keeps a **reference count** — one
+byte per frame, 32 KiB per GiB of RAM, allocated next to the allocation
+bitmap. Allocation sets it to 1, `pmm_frame_ref()` raises it, and
+`pmm_free_frame()` reclaims the frame only at zero. The count saturates at
+255 instead of wrapping, because a counter that has to fail should lose
+memory rather than lose data.
+
+`meminfo` reports what that machinery is doing:
+
+```
+  spaces    : 3 address spaces created
+  COW       : 4 faults, 3 needed a copy, 1 resolved by dropping the last sharer
+  shared    : 0 frames held by more than one address space
+```
+
+(after one `ring3` run: `init`'s own address space plus the two it forks.
+`shared` is back to zero because both children have been reaped.)
+
+The fault handler, the `refs <= 1` shortcut that makes forking in a loop
+cheap, and the 42 assertions that check all of it are in
+[PROCESSES.md](PROCESSES.md#copy-on-write).
+
+### Temporary mapping slots
+
+The recursive window reaches the *current* address space's tables only, and
+`fork` has to build the child's while the parent's is loaded. So two kernel
+pages at `VMM_TEMP_BASE` (`0xCF000000`) exist to make an arbitrary frame
+writable for a moment:
+
+```c
+temp_map(0, fresh);
+memcpy(dst, (const void *)page, PAGE_SIZE);
+temp_unmap(0);
+```
+
+Two slots, because cloning needs the child's directory and one of its page
+tables visible at once. The page table backing them is allocated during
+`vmm_init()`, before anything could need it — allocating it lazily would let
+`temp_map` fail inside the clone path, which is precisely where there is
+nothing useful to do about a failure. `temp_map` asserts that a slot is not
+already in use, so a nesting bug is a loud panic rather than silent
+corruption.
+
 ### `vmm_protect` vs `vmm_map`
 
 Changing a page's permissions and replacing its mapping are different
@@ -417,17 +474,18 @@ elsewhere has every string literal pointing where ring 3 cannot read. See
 
 - **Empty page tables are never reclaimed.** Unmapping the last page in a
   4 MiB region leaves its table allocated — one frame per touched region.
-- **No demand paging.** Every fault is a bug.
+- **No demand paging.** Every fault is a bug, or a copy-on-write fault.
 - **No swap, no page replacement, no memory pressure handling.** `kmalloc`
   returns `NULL` when the heap cannot grow, and callers are expected to check.
 - **The heap is a single arena**, so a long-lived small allocation can keep a
   large region from coalescing. Slab caches are the usual answer.
 - **64 MiB heap ceiling** (`KHEAP_MAX_SIZE`), chosen to keep the window well
   clear of the recursive mapping.
-- **One address space.** The kernel is in the higher half, which is the
-  precondition for per-process address spaces, but there is still a single
-  page directory: `context_switch` does not touch CR3, and two user programs
-  would share a view of memory. That is the next thing to build.
+- **A program's segments are mapped eagerly**, so copy-on-write is the only
+  laziness in the memory manager.
+- **Address spaces are freed only in whole.** `vmm_destroy_address_space()`
+  walks the user half and returns everything; there is no `munmap` for a
+  process to release part of its own.
 - **The linear map is capped at 16 MiB**, so the frame bitmap and anything
   else the kernel addresses physically must fit below it. `pmm_init()` panics
   with an explicit message rather than corrupting memory if it does not.

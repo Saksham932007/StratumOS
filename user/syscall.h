@@ -53,6 +53,33 @@ static inline i32 sys_getkey(void)
     return syscall3(SYS_GETKEY, 0, 0, 0);
 }
 
+/* Duplicate this process. Returns the child's pid in the parent and 0 in the
+ * child - the same call, returning twice. */
+static inline i32 sys_fork(void)
+{
+    return syscall3(SYS_FORK, 0, 0, 0);
+}
+
+/* Collect a dead child; blocks while one is still running. Returns its pid,
+ * or -1 if there are no children. */
+static inline i32 sys_wait(int *status)
+{
+    return syscall3(SYS_WAIT, (u32)status, 0, 0);
+}
+
+static inline i32 sys_getppid(void)
+{
+    return syscall3(SYS_GETPPID, 0, 0, 0);
+}
+
+/* Replace this process's image with another, keeping the pid. On success it
+ * does not return - there is nothing left to return to, because the code that
+ * made the call was in the image that was just unmapped. */
+static inline i32 sys_exec(const char *name)
+{
+    return syscall3(SYS_EXEC, (u32)name, 0, 0);
+}
+
 __attribute__((noreturn)) static inline void sys_exit(int code)
 {
     (void)syscall3(SYS_EXIT, (u32)code, 0, 0);
@@ -86,6 +113,25 @@ static inline void u_putu(u32 v)
         buf[--i] = (char)('0' + (v % 10));
         v /= 10;
     }
+
+    u_puts(&buf[i]);
+}
+
+static inline void u_puthex(u32 v)
+{
+    static const char digits[] = "0123456789abcdef";
+    char buf[11];
+    int i = (int)sizeof(buf);
+
+    buf[--i] = '\0';
+    if (v == 0)
+        buf[--i] = '0';
+    while (v && i > 2) {
+        buf[--i] = digits[v & 0xF];
+        v >>= 4;
+    }
+    buf[--i] = 'x';
+    buf[--i] = '0';
 
     u_puts(&buf[i]);
 }

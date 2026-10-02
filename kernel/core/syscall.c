@@ -23,6 +23,7 @@
 #include <kernel/log.h>
 #include <kernel/sched.h>
 #include <kernel/syscall.h>
+#include <kernel/usermode.h>
 
 #include <mm/vmm.h>
 
@@ -79,6 +80,35 @@ static i32 sys_write(u32 ptr, u32 len)
     return (i32)len;
 }
 
+/* Copy a NUL-terminated string from user space into a kernel buffer.
+ *
+ * Validated one byte at a time rather than by validating `max` bytes up
+ * front: a string that ends two bytes into the last mapped page is perfectly
+ * legal, and insisting that the whole buffer be readable would reject it.
+ * Walking it instead means the kernel never reads past what the caller
+ * actually mapped, which is the property that matters. Unterminated input
+ * fails rather than being silently truncated - a truncated program name is a
+ * different program name. */
+static bool user_copy_string(u32 ptr, char *dst, size_t max)
+{
+    for (size_t i = 0; i < max; i++) {
+        if (!user_range_ok(ptr + i, 1)) {
+            pr_warn("pid %u passed an unreadable string pointer %p",
+                    task_current() ? task_current()->pid : 0, (void *)ptr);
+            return false;
+        }
+
+        dst[i] = *(const char *)(ptr + i);
+
+        if (dst[i] == '\0')
+            return true;
+    }
+
+    pr_warn("pid %u passed a string longer than %u bytes",
+            task_current() ? task_current()->pid : 0, (unsigned)max);
+    return false;
+}
+
 static void syscall_handler(struct regs *r)
 {
     i32 ret;
@@ -119,6 +149,65 @@ static void syscall_handler(struct regs *r)
     case SYS_GETKEY:
         ret = keyboard_poll();
         break;
+
+    case SYS_FORK:
+        /* The frame is handed through so the child can be given a copy of it
+         * with EAX zeroed - which is how one call returns twice. */
+        ret = task_fork(r);
+        break;
+
+    case SYS_WAIT: {
+        int status = 0;
+        int pid = task_wait(&status);
+
+        /* The status pointer is optional, and like every pointer from ring 3
+         * it is checked before being written through. */
+        if (pid >= 0 && r->ebx) {
+            if (!user_range_ok(r->ebx, sizeof(int))) {
+                pr_warn("pid %u passed an unwritable status pointer %p to "
+                        "wait()",
+                        task_current() ? task_current()->pid : 0,
+                        (void *)r->ebx);
+                ret = SYS_EFAULT;
+                break;
+            }
+            *(int *)r->ebx = status;
+        }
+
+        ret = pid;
+        break;
+    }
+
+    case SYS_GETPPID:
+        ret = task_current() ? (i32)task_current()->parent_pid : 0;
+        break;
+
+    case SYS_EXEC: {
+        char name[SYS_NAME_MAX];
+
+        /* The name has to be copied out of user memory before exec touches
+         * the address space, because the string itself lives in the image
+         * that is about to be unmapped. Reading it afterwards would be a
+         * dereference of a page that no longer exists. */
+        if (!user_copy_string(r->ebx, name, sizeof(name))) {
+            ret = SYS_EFAULT;
+            break;
+        }
+
+        if (!usermode_exec(name, r)) {
+            pr_warn("pid %u asked to exec \"%s\", which is not a program this "
+                    "kernel has",
+                    task_current() ? task_current()->pid : 0, name);
+            ret = SYS_ENOENT;
+            break;
+        }
+
+        /* On success there is nothing to return to: usermode_exec() rewrote
+         * the frame, including EAX, so the IRET at the end of the interrupt
+         * path lands in the new image's entry point instead. Returning here
+         * would overwrite that. */
+        return;
+    }
 
     default:
         pr_warn("unknown syscall %u from EIP %p", r->eax, (void *)r->eip);

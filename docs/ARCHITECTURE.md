@@ -4,17 +4,17 @@
 
 ```
                          ┌──────────────────────────┐
-                         │   shell (task, ring 0)   │  20 commands, history
+                         │   shell (task, ring 0)   │  24 commands, history
                          └────────────┬─────────────┘
                                       │
    ┌──────────────┐      ┌────────────┴─────────────┐      ┌──────────────┐
-   │ user_demo    │      │        scheduler         │      │   ktest      │
-   │ (ring 3)     │◄────►│  round robin, 100 Hz     │      │ 12 suites    │
+   │ init, hello  │      │        scheduler         │      │   ktest      │
+   │ (ring 3)     │◄────►│  round robin, 100 Hz     │      │ 14 suites    │
    └──────┬───────┘      └────────────┬─────────────┘      └──────────────┘
           │ int 0x80                  │
    ┌──────┴───────┐                   │
-   │   syscall    │  pointer          │
-   │   dispatch   │  validation       │
+   │   syscall    │  pointer          │  fork / exec / wait
+   │   dispatch   │  validation       │  per-process address spaces
    └──────┬───────┘                   │
           │                           │
    ┌──────┴───────────────────────────┴─────────────────────────────────┐
@@ -25,7 +25,7 @@
    ┌──────┴──────┐    ┌──────┴──────┐    ┌──────┴──────┐    ┌─────────┴────┐
    │ heap        │    │    vmm      │    │    pmm      │    │   drivers    │
    │ kmalloc     │───►│  paging     │───►│  frames     │    │ serial  vga  │
-   │ guarded     │    │  recursive  │    │  bitmap     │    │ pit     kbd  │
+   │ guarded     │    │  COW, clone │    │  bitmap+ref │    │ pit     kbd  │
    └─────────────┘    └──────┬──────┘    └──────┬──────┘    │ rtc     pci  │
                              │                  │           └──────┬───────┘
    ┌─────────────────────────┴──────────────────┴──────────────────┴───────┐
@@ -192,6 +192,7 @@ cleanly instead of walking off into the heap.
 
 - [BOOT.md](BOOT.md) — both boot paths, instruction by instruction
 - [MEMORY.md](MEMORY.md) — the address space, the higher-half transition, the allocators
-- [USERSPACE.md](USERSPACE.md) — the user program, the ELF loader, the privilege boundary
+- [USERSPACE.md](USERSPACE.md) — the user programs, the ELF loader, the privilege boundary
+- [PROCESSES.md](PROCESSES.md) — address spaces, fork, copy-on-write, exec, wait
 - [PERFORMANCE.md](PERFORMANCE.md) — benchmarks, the profiler, the symbol table
 - [DESIGN-DECISIONS.md](DESIGN-DECISIONS.md) — the trade-offs behind the above

@@ -111,19 +111,24 @@ ASM_SOURCES := $(sort $(wildcard $(KSRC)/arch/x86/*.asm))
 C_OBJECTS   := $(C_SOURCES:%.c=$(BUILD)/%.o)
 ASM_OBJECTS := $(ASM_SOURCES:%.asm=$(BUILD)/%.o)
 
-# The ring-3 program is a separate ELF, linked for user space and embedded in
-# the kernel image as a blob. Defined here, before LINK_ORDER, because that is
+# The ring-3 programs are separate ELFs, linked for user space and embedded in
+# the kernel image as blobs. Defined here, before LINK_ORDER, because that is
 # expanded immediately.
-USER_ELF  := $(BUILD)/user/init.elf
-USER_BLOB := $(BUILD)/user/init_blob.o
+#
+# `init` is the program the kernel starts; `hello` exists so that exec() has
+# a genuinely different image to replace it with, which is the only way to
+# show that exec replaced an address space rather than reloading one.
+USER_PROGS := init hello
+USER_ELFS  := $(USER_PROGS:%=$(BUILD)/user/%.elf)
+USER_BLOBS := $(USER_PROGS:%=$(BUILD)/user/%_blob.o)
 
 # boot.asm must be linked first so that .multiboot lands at the start of the
 # image, where the Multiboot2 specification requires the header to be.
 BOOT_OBJ    := $(BUILD)/$(KSRC)/arch/x86/boot.o
 LINK_ORDER  := $(BOOT_OBJ) $(filter-out $(BOOT_OBJ),$(ASM_OBJECTS)) \
-               $(C_OBJECTS) $(USER_BLOB)
+               $(C_OBJECTS) $(USER_BLOBS)
 
-OBJECTS := $(ASM_OBJECTS) $(C_OBJECTS) $(USER_BLOB)
+OBJECTS := $(ASM_OBJECTS) $(C_OBJECTS) $(USER_BLOBS)
 DEPS    := $(C_OBJECTS:.o=.d)
 
 # ---- top-level targets ------------------------------------------------------
@@ -242,38 +247,43 @@ USER_CFLAGS := $(ARCHFLAG) -std=gnu11 -O2 -g3 \
                -mgeneral-regs-only -march=i686 \
                -I$(INCLUDE) -I$(USERSRC) $(WARNINGS)
 
-$(BUILD)/user/init.o: $(USERSRC)/init.c $(USERSRC)/syscall.h
+$(BUILD)/user/%.o: $(USERSRC)/%.c $(USERSRC)/syscall.h
 	@mkdir -p $(dir $@)
 	@echo "  CC      $< (ring 3)"
 	@$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(USER_ELF): $(BUILD)/user/init.o $(USERSRC)/user.ld
+$(BUILD)/user/%.elf: $(BUILD)/user/%.o $(USERSRC)/user.ld
 	@echo "  LD      $@ (ring 3)"
 	@$(LD) -m elf_i386 -T $(USERSRC)/user.ld -nostdlib \
 		--no-warn-rwx-segments --build-id=none $< -o $@
 
 # Stripped before embedding: the debug info is three times the size of the
 # program, and it would be carried inside the kernel image for no benefit.
-$(BUILD)/user/init.stripped.elf: $(USER_ELF)
+$(BUILD)/user/%.stripped.elf: $(BUILD)/user/%.elf
 	@$(OBJCOPY) --strip-all $< $@
 
-$(USER_BLOB): $(BUILD)/user/init.stripped.elf
+# One section name per program, so two blobs do not collide in the link.
+$(BUILD)/user/%_blob.o: $(BUILD)/user/%.stripped.elf
 	@echo "  BLOB    $@"
 	@cd $(dir $<) && $(OBJCOPY) -I binary -O elf32-i386 -B i386 \
-		--rename-section .data=.rodata.userblob,alloc,load,readonly,data,contents \
-		--set-section-alignment .rodata.userblob=4 \
-		init.stripped.elf $(notdir $@)
+		--rename-section .data=.rodata.userblob.$*,alloc,load,readonly,data,contents \
+		--set-section-alignment .rodata.userblob.$*=4 \
+		$*.stripped.elf $(notdir $@)
 	@# objcopy derives the blob's symbol names from the input filename, so
-	@# rename them back to the stable _binary_init_elf_* the kernel expects.
+	@# rename them back to the stable _binary_<prog>_elf_* the kernel expects.
 	@$(OBJCOPY) \
-		--redefine-sym _binary_init_stripped_elf_start=_binary_init_elf_start \
-		--redefine-sym _binary_init_stripped_elf_end=_binary_init_elf_end \
-		--redefine-sym _binary_init_stripped_elf_size=_binary_init_elf_size \
+		--redefine-sym _binary_$*_stripped_elf_start=_binary_$*_elf_start \
+		--redefine-sym _binary_$*_stripped_elf_end=_binary_$*_elf_end \
+		--redefine-sym _binary_$*_stripped_elf_size=_binary_$*_elf_size \
 		$@
 
+# Keep the intermediates: make would otherwise delete them after each build
+# and relink the kernel every time.
+.PRECIOUS: $(BUILD)/user/%.o $(BUILD)/user/%.elf $(BUILD)/user/%.stripped.elf
+
 .PHONY: user
-user: $(USER_ELF)
-	@$(OBJDUMP) -h $<
+user: $(USER_ELFS)
+	@for e in $(USER_ELFS); do echo "== $$e"; $(OBJDUMP) -h $$e; done
 
 # ---- bootloader -------------------------------------------------------------
 
@@ -437,14 +447,14 @@ symbols: $(KERNEL_DEBUG)
 format:
 	@command -v clang-format >/dev/null 2>&1 || \
 		{ echo "clang-format is not installed"; exit 1; }
-	@find $(KSRC) tests -name '*.c' -o -name '*.h' | xargs clang-format -i
-	@echo "  formatted $$(find $(KSRC) tests -name '*.c' -o -name '*.h' | wc -l) files"
+	@find $(KSRC) $(USERSRC) tests -name '*.c' -o -name '*.h' | xargs clang-format -i
+	@echo "  formatted $$(find $(KSRC) $(USERSRC) tests -name '*.c' -o -name '*.h' | wc -l) files"
 
 .PHONY: format-check
 format-check:
 	@command -v clang-format >/dev/null 2>&1 || \
 		{ echo "clang-format is not installed; skipping"; exit 0; }
-	@find $(KSRC) tests -name '*.c' -o -name '*.h' | \
+	@find $(KSRC) $(USERSRC) tests -name '*.c' -o -name '*.h' | \
 		xargs clang-format --dry-run --Werror
 
 .PHONY: lines

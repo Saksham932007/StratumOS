@@ -82,6 +82,37 @@ COMMON_EXPECTED = [
     ("kernel pointers rejected", r"\[ring3\] kernel refused it \(EFAULT\)"),
     ("bad syscall rejected", r"\[ring3\] unknown syscall correctly rejected"),
     ("ring 3 exited cleanly", r"\[ring3\] calling exit\(0\)"),
+    # Per-process address spaces. init builds its own before loading its
+    # image; if it did not, fork would be cloning the kernel's user half.
+    ("init has its own address space",
+     r"entering ring 3 at 0x[0-9a-f]+ in its own address space"),
+    # fork, copy-on-write and wait, observed from ring 3. The child's write
+    # landing in the child and *not* in the parent is the only externally
+    # visible difference between copy-on-write and a shared page, so it is
+    # the assertion that matters here.
+    ("fork returned twice", r"\[ring3\] fork\(\) returned \d+ here"),
+    ("the child saw zero", r"\[child\] fork\(\) returned 0 here"),
+    ("the child has the right parent", r"\[child\] .*my parent is \d+"),
+    ("the child inherited the page", r"\[child\] I inherited 0x5a5a5a5a"),
+    ("the child's write took", r"\[child\] my copy now reads 0x1234abcd"),
+    ("wait collected the child",
+     r"\[ring3\] wait\(\) collected pid \d+ with exit code 7"),
+    ("copy-on-write kept the parent's page intact",
+     r"my own copy still reads 0x5a5a5a5a - copy-on-write"),
+    ("wait with no children returns -1",
+     r"wait\(\) with no children returned -1"),
+    # exec: a bogus name must fail without tearing the image down, and a
+    # real one must replace the image while keeping the pid.
+    ("exec of an unknown name fails cleanly",
+     r"\[child\] exec\(\"nonexistent\"\) failed cleanly"),
+    ("exec replaced the image", r"user: pid \d+ now running \"hello\" at 0x"),
+    ("the exec'd image ran", r"\[exec\] hello: a different image"),
+    ("the pid survived exec", r"\[exec\] getpid\(\) returned \d+ - the pid "
+                              r"survived exec"),
+    ("the rebuilt address space is still sealed",
+     r"\[exec\] the rebuilt address space still refuses"),
+    ("the exec'd child exited cleanly",
+     r"the exec'd child \(pid \d+\) exited with 0"),
     ("autotest finished", r"stratum: autotest complete"),
 ]
 
@@ -295,8 +326,13 @@ SHELL_SCRIPT: list[tuple[str, list[str]]] = [
     ("cpuinfo", [r"Vendor\s+:", r"Mode\s+: 32-bit protected mode"]),
     ("meminfo", [r"Physical memory", r"Kernel heap",
                  r"integrity : consistent", r"Firmware memory map",
-                 r"kernel at : 0xc0000000", r"linear map"]),
-    ("ps", [r"PID\s+NAME\s+STATE", r"\bidle\b", r"\bshell\b",
+                 r"kernel at : 0xc0000000", r"linear map",
+                 r"address spaces created", r"COW\s+: \d+ faults",
+                 r"frames held by more than one address space"]),
+    # The VMSPACE column is the readable proof that a kernel thread shares the
+    # kernel's page directory and a process does not.
+    ("ps", [r"PID\s+PPID\s+NAME\s+STATE\s+RING\s+VMSPACE",
+            r"idle\s+.*\bring0\b\s+kernel", r"\bshell\b",
             r"context switches total"]),
     ("irq", [r"IRQ\s+HANDLER\s+COUNT", r"\bpit\b",
              r"spurious: 0"]),
@@ -314,6 +350,10 @@ SHELL_SCRIPT: list[tuple[str, list[str]]] = [
     ("selftest list", [r"SUITE\s+DESCRIPTION", r"heap", r"sched"]),
     ("selftest heap", [r"ktest: heap \.\.\. PASS"]),
     ("selftest vmm", [r"ktest: vmm \.\.\. PASS"]),
+    ("selftest vmspace", [r"ktest: vmspace \.\.\. PASS"]),
+    ("selftest proc", [r"ktest: proc \.\.\. PASS"]),
+    ("programs", [r"exec's namespace", r"init\s+\(started at boot\)",
+                  r"\bhello\b"]),
     ("stress 2 40", [r"heap integrity: consistent"]),
     ("ring3", [r"\[ring3\] hello from user mode",
                r"\[ring3\] calling exit\(0\)"]),

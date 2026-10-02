@@ -11,22 +11,11 @@
 
 #include <arch/idt.h>
 
+#include <kernel/syscall_abi.h>
 #include <kernel/types.h>
 
-enum {
-    SYS_EXIT = 0,
-    SYS_WRITE = 1,
-    SYS_GETPID = 2,
-    SYS_YIELD = 3,
-    SYS_SLEEP = 4,
-    SYS_UPTIME = 5,
-    SYS_GETKEY = 6,
-    SYS_MAX
-};
-
-#define SYS_EBADCALL (-1)
-#define SYS_EFAULT   (-2)
-#define SYS_EINVAL   (-3)
+/* The call numbers and error values live in syscall_abi.h, which user
+ * programs include verbatim. Two copies of an ABI is two versions of it. */
 
 void syscall_init(void);
 u32 syscall_count(void);

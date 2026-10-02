@@ -88,6 +88,11 @@ isr_common:
                 call    interrupt_dispatch
                 add     esp, 4
 
+; A freshly forked child enters here rather than at the top of the stub: its
+; kernel stack already holds a copy of its parent's trap frame, so all that
+; remains is to restore it and return to user space. See task_fork().
+global isr_restore_and_return
+isr_restore_and_return:
                 pop     eax
                 mov     gs, ax
                 pop     eax

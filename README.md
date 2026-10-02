@@ -6,13 +6,13 @@ the way to a preemptively scheduled, higher-half, paged kernel running an
 interactive shell and a separate user-space program in ring 3.
 
 [![CI](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml/badge.svg)](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml)
-![language](https://img.shields.io/badge/C11%20%2B%20NASM-13.7k%20lines-blue)
+![language](https://img.shields.io/badge/C11%20%2B%20NASM-15.3k%20lines-blue)
 ![arch](https://img.shields.io/badge/arch-x86%20(i686)-lightgrey)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 The same kernel binary boots two ways — through a bootloader written for this
-project, and through GRUB via Multiboot2 — and every push runs 305 assertions
-across 92 host unit tests, 12 in-kernel suites, and four QEMU boot scenarios.
+project, and through GRUB via Multiboot2 — and every push runs 361 assertions
+across 92 host unit tests, 14 in-kernel suites, and four QEMU boot scenarios.
 
 ```
 BIOS ─► stage 1 (512 B MBR) ─► stage 2 ─► 32-bit protected mode ─► kernel ─► ring 3
@@ -65,9 +65,11 @@ Concretely, from power-on:
    enables interrupts, builds a physical frame allocator from the firmware
    map, widens its linear map and drops the boot identity mapping, creates a
    guarded kernel heap, enumerates PCI, and starts a round-robin scheduler.
-6. **A user program** — a genuinely separate ELF, linked for user space — is
-   loaded into user-accessible pages and entered at ring 3, where it probes
-   the syscall boundary from the untrusted side.
+6. **A user program** — a genuinely separate ELF, linked for user space — gets
+   an address space of its own, is loaded into user-accessible pages, and is
+   entered at ring 3, where it probes the syscall boundary from the untrusted
+   side, `fork`s, proves copy-on-write from inside the child, `wait`s for it,
+   and then `exec`s a different image into a second child.
 7. **The shell** runs as a scheduled task, reachable from the VGA console or
    over a serial line, with line editing and command history.
 
@@ -123,7 +125,7 @@ StratumOS stage2
   [->] entering protected mode
 
   .-----------------------------------------------------.
-  | StratumOS 0.3.0  -  x86 kernel: real mode to ring 3 |
+  | StratumOS 0.5.0  -  x86 kernel: real mode to ring 3 |
   '-----------------------------------------------------'
 [    0.000] INFO  boot: serial COM1        [ok] 115200 8N1
 [    0.000] INFO  boot: CPU detect         [ok] GenuineIntel
@@ -133,26 +135,51 @@ StratumOS stage2
 [    0.000] INFO  boot: PIC remap          [ok] IRQ 0-15 -> vector 32-47
 [    0.000] INFO  timer: PIT at 100 Hz requested, 99.998 Hz actual (divisor 11932)
 [    0.010] INFO  boot: interrupts         [ok] enabled
-[    0.010] INFO  pmm: 32736 frames total (127 MiB), 32446 free (126 MiB)
-[    0.010] INFO  vmm: paging enabled: 16 MiB identity-mapped, recursive PD
-[    0.020] INFO  heap: kernel heap at 0xd0000000, 1024 KiB committed
-[    0.030] INFO  pci: 6 PCI devices found
+[    0.010] INFO  pmm: 32736 frames total (127 MiB), 32419 free (126 MiB), metadata 35 KiB at phys 0x00134000
+[    0.020] INFO  vmm: paging: kernel at 0xc0000000, linear map 16 MiB, identity map dropped
+[    0.030] INFO  heap: kernel heap at 0xd0000000, 1024 KiB committed, 64 MiB maximum
+[    0.040] INFO  pci: 6 PCI devices found
 [    0.040] INFO  sched: scheduler ready; boot context adopted as pid 0 (idle)
-[    0.040] INFO  syscall: syscall gate installed at int 0x80
+[    0.050] INFO  syscall: syscall gate installed at int 0x80 (11 calls available)
+[    0.050] INFO  boot: StratumOS 0.5.0 is up: 127 MiB RAM, 6 PCI devices, 14 test suites
 ```
 
-Ring 3, exercising the syscall boundary from the untrusted side:
+Ring 3, exercising the syscall boundary from the untrusted side, then
+forking, copying on write, and `exec`ing a different image:
 
 ```
+[    0.060] INFO  user: pid 4 entering ring 3 at 0x004000f0 in its own address space (7 user pages mapped)
   [ring3] hello from user mode - privilege level 3
   [ring3] getpid() returned 4
   [ring3] slept 50 ms via syscall
   [ring3] asking the kernel to read a kernel address on my behalf
-[    0.140] WARN  syscall: pid 4 passed an unreadable buffer 0x00100000+16 to write()
+[    0.120] WARN  syscall: pid 4 passed an unreadable buffer 0xc0100000+16 to write()
   [ring3] kernel refused it (EFAULT) - the pointer check works
   [ring3] unknown syscall correctly rejected
+  [ring3] fork(): duplicating this process
+[    0.130] INFO  sched: fork: pid 4 -> pid 6, address space 0x0024c000
+  [ring3] fork() returned 6 here - one call, two return values
+    [child] fork() returned 0 here; my pid is 6, my parent is 4
+    [child] I inherited 0x5a5a5a5a and am about to write over it
+    [child] my copy now reads 0x1234abcd
+    [child] exiting with 7
+  [ring3] wait() collected pid 6 with exit code 7
+  [ring3] my own copy still reads 0x5a5a5a5a - copy-on-write gave the child a private page
+  [ring3] exec(): forking a child to replace its own image
+    [child] exec("nonexistent") failed cleanly and I am still here
+[    0.140] INFO  user: pid 7 exec("hello"): replacing 7 user pages
+[    0.140] INFO  user: pid 7 now running "hello" at 0x00400000, 6 user pages
+  [exec] hello: a different image, running in the same process
+  [exec] getpid() returned 7 - the pid survived exec, the image did not
+  [ring3] the exec'd child (pid 7) exited with 0
   [ring3] calling exit(0)
 ```
+
+That child writing `0x1234abcd` over a page it inherited, while the parent's
+copy of the same address still reads `0x5a5a5a5a`, is the only externally
+visible difference between copy-on-write done correctly and a kernel that
+simply shared the page. And `getpid()` returning 7 *after* the `exec` is the
+proof that a process survived having its image replaced.
 
 The shell:
 
@@ -160,13 +187,17 @@ The shell:
 stratum> meminfo
 Physical memory
   total     : 127 MiB (32736 frames of 4096 B)
-  in use    : 2 MiB (553 frames)
-  free      : 125 MiB (32183 frames)
+  in use    : 2 MiB (578 frames)
+  free      : 125 MiB (32158 frames)
 Virtual memory
   paging    : enabled
-  identity  : 0x00000000 - 0x01000000
-  tables    : 5 page tables, 4351 pages mapped
-  faults    : 0
+  kernel at : 0xc0000000
+  linear map: 0xc0000000 - 0xc1000000 (16 MiB of physical memory)
+  tables    : 6 page tables, 4352 pages mapped
+  faults    : 4 total
+  spaces    : 3 address spaces created
+  COW       : 4 faults, 3 needed a copy, 1 resolved by dropping the last sharer
+  shared    : 0 frames held by more than one address space
 Kernel heap
   window    : 0xd0000000 (+1 MiB committed, max 64 MiB)
   in use    : 32 KiB across 4 blocks (2 free)
@@ -177,10 +208,18 @@ Firmware memory map (6 regions)
   ...
 
 stratum> ps
-   PID  NAME           STATE        TICKS  SWITCH  STACK
-     0  idle           ready            2       1  0x00000000
-     1  statusd        sleeping         0       5  0xd0000050
-     2  shell          running        104       5  0xd0004070
+   PID  PPID  NAME           STATE     RING VMSPACE      TICKS  SWITCH
+     0     0  idle           ready     ring0 kernel          36       3
+     1     0  statusd        sleeping  ring0 kernel           0       6
+     2     0  shell          running   ring0 kernel         104       7
+     3     2  init           zombie    ring3 -                2       4
+  4 tasks, 22 context switches total
+
+stratum> programs
+Programs embedded in the kernel image (exec's namespace):
+  init   (started at boot)
+  hello
+  1 exec() calls so far this boot
 
 stratum> irq
   IRQ  HANDLER               COUNT
@@ -252,13 +291,17 @@ Everything marked ✅ is implemented and covered by a test.
 | ✅ | `map` / `unmap` / `protect` / `translate`, with frame-ownership tracking |
 | ✅ | Kernel heap: first-fit, coalescing, guard magics, grows on demand |
 | ✅ | Preemptive round-robin scheduler, per-task stacks, sleep/yield/exit |
+| ✅ | **A page directory per process**, kernel half shared, `CR3` switched on context switch |
+| ✅ | **`fork` with copy-on-write** — software PTE bit, per-frame reference counts, no copy for the last sharer |
+| ✅ | **`exec`** by rewriting the syscall's own trap frame, so the return lands in the new image |
+| ✅ | **`wait` and real zombies** — resources released by either the reaper or the parent, exit status held until collected |
 | ✅ | Ring 3 via a forged IRET frame; `int 0x80` with pointer validation |
-| ✅ | A real user program: separate ELF, linked for user space, own pages |
+| ✅ | Two real user programs: separate ELFs, linked for user space, own pages |
 | ✅ | Defensive ELF32 loader — no segment may reach into kernel space |
 | ✅ | Drivers: 16550 (in and out), VGA text, PIT, PS/2 keyboard, CMOS RTC, PCI |
 | ✅ | `kprintf` with width/precision/64-bit support, levelled logging |
 | ✅ | 64-bit division helpers — the kernel links against nothing at all |
-| ✅ | 23-command shell with line editing, history, and fault injection |
+| ✅ | 24-command shell with line editing, history, and fault injection |
 | ✅ | Embedded symbol table: panics print `function+0x1c`, no addr2line needed |
 | ✅ | 11 TSC-calibrated microbenchmarks, overhead-subtracted, median of 24 |
 | ✅ | Timer-driven sampling profiler with symbol attribution |
@@ -369,9 +412,9 @@ QEMU.
 | Layer | What runs | Count |
 | --- | --- | --- |
 | **Host unit tests** | the kernel's real `printf`/`string`/`div64` sources, compiled for the host, diffed against glibc | 92 checks |
-| **Pre-boot validation** | Multiboot2 header and checksum, ELF type, entry point inside a load segment, load address, `.bss`/`.user` alignment, absence of SSE | 20 failure conditions, every link |
-| **In-kernel suites** | allocator, paging, heap coalescing, interrupts, scheduler, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 213 checks in 12 suites |
-| **Boot scenarios** | custom bootloader unattended, GRUB/Multiboot2 unattended, 23 shell commands typed over serial, benchmarks + profile | 4 scenarios |
+| **Pre-boot validation** | Multiboot2 header and checksum, ELF type, entry point inside a load segment, load address, `.bss` alignment, the higher-half split, every embedded ring-3 program, absence of SSE | 20 failure conditions, every link |
+| **In-kernel suites** | allocator, paging, address spaces, copy-on-write, heap coalescing, interrupts, scheduler, processes, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 269 checks in 14 suites |
+| **Boot scenarios** | custom bootloader unattended, GRUB/Multiboot2 unattended, 27 shell commands typed over serial, benchmarks + profile | 4 scenarios |
 
 ```
 $ make test
@@ -433,14 +476,23 @@ kernel/
     heap.c                 guarded first-fit kmalloc
   core/
     bootinfo.c             the two boot protocols, normalised
-    sched.c                round-robin scheduler and tasks
+    sched.c                scheduler, tasks, fork, wait, the zombie reaper
     syscall.c              int 0x80 and userspace pointer validation
-    usermode.c             mapping the ring-3 payload
-    user_demo.c            code that runs at privilege level 3
+    elf.c                  defensive ELF32 loader for untrusted images
+    usermode.c             address space + image for a process, and exec
+    bench.c profile.c      microbenchmarks and the sampling profiler
+    ksyms.c                the embedded symbol table
     printf.c log.c panic.c string.c div64.c spinlock.c ktest.c kmain.c
   drivers/                 serial, vga, timer, keyboard, rtc, pci
-  shell/shell.c            20 commands, line editing, history
+  shell/shell.c            24 commands, line editing, history
   include/                 headers, grouped by subsystem
+
+user/                      ring-3 programs, built as separate ELFs
+  init.c                   started at boot; probes the boundary, forks, execs
+  hello.c                  what exec() replaces a process with
+  syscall.h                the stubs, and the little runtime a libc-less
+                           program needs
+  user.ld                  linked at 0x00400000 — a user address
 
 tools/
   mkimage.py               assemble a bootable image, patch stage 2's header
@@ -516,6 +568,21 @@ The last row is the one that mattered most. The features are now implemented,
 and the test suite exists so that the documentation cannot quietly drift away
 from the code again.
 
+The same suite has since caught defects in *this* code, which is the more
+useful demonstration — a test that has never failed has not been shown to
+work:
+
+| Where | Defect | Caught by |
+| --- | --- | --- |
+| `sched.c` | `wait()` marked a collected zombie's slot reusable while the task was still linked into the run queue, holding a stack and a page directory. The next `task_create()` would hand out that slot and splice it into the list twice. | writing the `proc` suite |
+| `heap.c` | A 4-byte footer made header+footer 28 bytes, so payloads were only 4-byte aligned after a block split. | `KT_ASSERT(IS_ALIGNED(p, 8))` |
+| `bootinfo.c` | The command line and loader name were pointed at, not copied, out of stage 2's memory — and dangled the moment `vmm_init()` dropped the identity map. | `version` in the shell, page-faulting in `strlen` |
+| `vmm.c` | The boot identity map covered page 0, so a write to address zero did not fault and NULL-dereference detection was silently off. | `fault null` returning success |
+
+The `bootinfo.c` one is also what the embedded symbol table earned its keep
+on: the panic read `at strlen+0x6` under `emit_number / kprintf / cmd_version`,
+which made it a two-line diagnosis instead of a bisection.
+
 ---
 
 ## What is deliberately not here
@@ -525,13 +592,21 @@ Being clear about scope is more useful than a longer feature list.
 - **No filesystem.** Nothing is read from disk after the kernel itself.
 - **No SMP.** Uniprocessor only; `spinlock.c` is honest about being an
   interrupt mask rather than a spin, and says what it will become.
-- **One address space.** The kernel is in the higher half, which is the
-  precondition for per-process address spaces, but `context_switch` does not
-  yet touch `CR3` — so two user programs would share a view of memory, and
-  only one can be loaded at a time. This is the next thing to build.
-- **No `fork`, `exec` or `wait`.** A task enters ring 3 once and exits.
-- **No demand paging or copy-on-write.** Every page fault is currently a bug,
-  and is reported as one.
+- **No `argv`, environment or file descriptors.** `exec` takes a program
+  name and nothing else; `write` goes to the console unconditionally, so
+  `fork` has no descriptor table to duplicate.
+- **No signals, process groups or `kill`.** A process leaves through `exit`
+  or a fault.
+- **No demand paging.** A program's image is mapped eagerly; copy-on-write
+  is the only laziness in the memory manager, and every other page fault is
+  a bug and is reported as one.
+- **No NX.** Without PAE, x86 cannot mark a page non-executable, so a user
+  image's read-only segments are enforced and its non-executable ones are
+  not. PAE and the rest of the hardening work are next in
+  [docs/ROADMAP.md](docs/ROADMAP.md).
+- **`exec`'s namespace is a table, not a filesystem.** The programs a
+  process can `exec` into are the ones embedded in the kernel image. A path
+  lookup is the only change the rest of the call needs.
 - **Serial transmit is polled**, which holds interrupts off for the duration of
   a write. The fix is a transmit ring buffer, in
   [docs/ROADMAP.md](docs/ROADMAP.md).
@@ -547,7 +622,8 @@ Being clear about scope is more useful than a longer feature list.
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | subsystem map, initialisation order and why it is forced |
 | [docs/BOOT.md](docs/BOOT.md) | both boot paths instruction by instruction |
 | [docs/MEMORY.md](docs/MEMORY.md) | address-space layout, the higher-half transition, the three allocators |
-| [docs/USERSPACE.md](docs/USERSPACE.md) | the user program, the ELF loader, and the privilege boundary |
+| [docs/USERSPACE.md](docs/USERSPACE.md) | the user programs, the ELF loader, and the privilege boundary |
+| [docs/PROCESSES.md](docs/PROCESSES.md) | address spaces, `fork`, copy-on-write, `exec`, `wait` |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | benchmark methodology, results with analysis, the profiler and its limits |
 | [docs/TESTING.md](docs/TESTING.md) | the four test layers and how to add to each |
 | [docs/DEBUGGING.md](docs/DEBUGGING.md) | GDB against QEMU, reading a panic, common symptoms |

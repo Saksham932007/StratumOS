@@ -198,7 +198,13 @@ static int cmd_meminfo(int argc, char **argv)
     kprintf("  user space: 0x00001000 - %p\n", (void *)KERNEL_VIRT_BASE);
     kprintf("  tables    : %u page tables, %u pages mapped\n", vm.page_tables,
             vm.mapped_pages);
-    kprintf("  faults    : %u\n", vm.page_faults);
+    kprintf("  faults    : %u total\n", vm.page_faults);
+    kprintf("  spaces    : %u address spaces created\n", vm.address_spaces);
+    kprintf("  COW       : %u faults, %u needed a copy, %u resolved by "
+            "dropping the last sharer\n",
+            vm.cow_faults, vm.cow_copies, vm.cow_faults - vm.cow_copies);
+    kprintf("  shared    : %u frames held by more than one address space\n",
+            pm.shared_frames);
 
     kprintf("Kernel heap\n");
     kprintf("  window    : %p (+", (void *)KHEAP_BASE);
@@ -232,9 +238,22 @@ static void ps_row(const struct task *t, void *ctx)
 {
     UNUSED(ctx);
 
-    kprintf("  %4u  %-14s %-9s %8u %7u  %p\n", t->pid, t->name,
-            task_state_name(t->state), t->ticks_total, t->switches,
-            t->stack_base);
+    /* The address space column is the one worth reading. A kernel thread
+     * shows "kernel" because it shares the kernel's page directory; a process
+     * shows the physical address of its own, and two processes showing the
+     * same one would mean fork() handed out a shared address space. */
+    char space[12];
+
+    if (!t->page_dir)
+        strlcpy(space, "-", sizeof(space));
+    else if (t->page_dir == vmm_kernel_pd_phys())
+        strlcpy(space, "kernel", sizeof(space));
+    else
+        ksnprintf(space, sizeof(space), "%08x", (unsigned)t->page_dir);
+
+    kprintf("  %4u %5u  %-14s %-9s %-4s %-9s %8u %7u\n", t->pid, t->parent_pid,
+            t->name, task_state_name(t->state), t->user ? "ring3" : "ring0",
+            space, t->ticks_total, t->switches);
 }
 
 static int cmd_ps(int argc, char **argv)
@@ -242,10 +261,11 @@ static int cmd_ps(int argc, char **argv)
     UNUSED(argc);
     UNUSED(argv);
 
-    kprintf("  %4s  %-14s %-9s %8s %7s  %s\n", "PID", "NAME", "STATE", "TICKS",
-            "SWITCH", "STACK");
+    kprintf("  %4s %5s  %-14s %-9s %-4s %-9s %8s %7s\n", "PID", "PPID", "NAME",
+            "STATE", "RING", "VMSPACE", "TICKS", "SWITCH");
     sched_foreach(ps_row, NULL);
-    kprintf("  %u context switches total\n", sched_switch_count());
+    kprintf("  %u tasks, %u context switches total\n", task_count(),
+            sched_switch_count());
     return 0;
 }
 
@@ -414,6 +434,30 @@ static int cmd_selftest(int argc, char **argv)
     }
 
     return failed == 0 ? 0 : 1;
+}
+
+/* exec()'s namespace. There is no filesystem yet, so the programs a process
+ * can exec into are the ones embedded in the kernel image; printing them is
+ * how you find out what `exec` will accept. */
+static int cmd_programs(int argc, char **argv)
+{
+    UNUSED(argc);
+    UNUSED(argv);
+
+    kprintf("Programs embedded in the kernel image (exec's namespace):\n");
+
+    for (u32 i = 0;; i++) {
+        const char *name = usermode_program_name(i);
+
+        if (!name)
+            break;
+
+        kprintf("  %s%s\n", name,
+                strcmp(name, "init") == 0 ? "   (started at boot)" : "");
+    }
+
+    kprintf("  %u exec() calls so far this boot\n", usermode_exec_count());
+    return 0;
 }
 
 static int cmd_ring3(int argc, char **argv)
@@ -743,6 +787,7 @@ static const struct shell_command commands[] = {
      cmd_profile},
     {"syms", "syms <address>", "resolve an address to a symbol", cmd_syms},
     {"ring3", "ring3", "run the user-mode demo", cmd_ring3},
+    {"programs", "programs", "list the programs exec() can run", cmd_programs},
     {"stress", "stress [workers] [rounds]",
      "hammer the heap from several tasks", cmd_stress},
     {"fault", "fault <null|unmapped|readonly|div0|ud|panic>",

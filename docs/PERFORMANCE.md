@@ -205,9 +205,9 @@ is embedded in, rather than trusting that argument:
 
 ```
   LD      pass A (enumerate symbols)
-  KSYMS   559 symbols -> build/ksyms_a.c
+  KSYMS   564 symbols -> build/ksyms_a.c
   LD      pass B (addresses settle)
-  KSYMS   559 symbols -> build/ksyms_b.c
+  KSYMS   564 symbols -> build/ksyms_b.c
   LD      build/stratum.debug.elf (pass C, final)
   VERIFY  embedded symbol table describes this kernel
 ```
@@ -216,8 +216,8 @@ Only *function* symbols are emitted. That is the constraint that makes the
 argument hold: data symbols would include the table's own, so the set of names
 would differ between passes B and C and the size would change again.
 
-The 559 symbols cost 11.3 KiB of the image - 4.4 KiB of address/pointer
-pairs plus 6.9 KiB of names. In exchange, a panic is
+The 564 symbols cost 11.5 KiB of the image - 4.4 KiB of address/pointer
+pairs plus 7.1 KiB of names. In exchange, a panic is
 readable with nothing but the serial log:
 
 ```

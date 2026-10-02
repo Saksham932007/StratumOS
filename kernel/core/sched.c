@@ -31,6 +31,8 @@
 #include <kernel/string.h>
 
 #include <mm/heap.h>
+#include <mm/pmm.h>
+#include <mm/vmm.h>
 
 /* Laid out by task_create() so that switch.asm's `ret` lands here. */
 extern void thread_trampoline(void);
@@ -82,6 +84,10 @@ void sched_init(void)
     idle->stack_base = NULL; /* not heap-allocated; never freed */
     idle->stack_size = 0;
     idle->kernel_esp0 = (u32)stack_top;
+    idle->parent_pid = 0;
+    /* Kernel threads all run in the kernel's address space. Only a forked
+     * process gets its own. */
+    idle->page_dir = vmm_kernel_pd_phys();
     idle->next = idle;
 
     current = idle;
@@ -141,6 +147,11 @@ struct task *task_create(const char *name, task_entry_t entry, void *arg)
     t->wake_at = 0;
     t->exit_code = 0;
     t->user = false;
+    t->resources_freed = false;
+    t->parent_pid = current ? current->pid : 0;
+    /* A kernel thread shares the kernel's address space; there is nothing
+     * private for it to see. */
+    t->page_dir = vmm_kernel_pd_phys();
 
     /* Build the stack so that context_switch()'s epilogue - pop ebp/edi/esi/
      * ebx, popfd, ret - delivers control to thread_trampoline with `entry`
@@ -180,37 +191,71 @@ struct task *task_create(const char *name, task_entry_t entry, void *arg)
     return t;
 }
 
-/* Free the stacks of tasks that have exited. Only ever called from a task
- * that is definitely not the one being reaped - freeing the stack you are
- * standing on is not recoverable. */
+/* Release one dead task's stack and address space.
+ *
+ * Only ever called from a task that is definitely not the one being released -
+ * freeing the stack you are standing on, or the address space you are running
+ * in, is not recoverable. Two callers qualify: the idle task's reaper, and a
+ * parent collecting a child in wait().
+ *
+ * The task *slot* is deliberately not freed here. It stays ZOMBIE, holding
+ * the exit code, until a parent collects it. That is what a zombie process
+ * is: resources gone, exit status still owed to somebody.
+ *
+ * Idempotent, because both callers race for it: `resources_freed` is the
+ * flag, set under the same IRQ-off window that unlinks the task.
+ */
+static void release_task_resources(struct task *t)
+{
+    bool irqs = irq_save();
+
+    if (t->resources_freed || t == current) {
+        irq_restore(irqs);
+        return;
+    }
+
+    /* Unlink from the run queue so pick_next() stops walking through it. The
+     * walk starts at `current`, which is by definition still in the list. */
+    struct task *p = current;
+    while (p->next != t && p->next != current)
+        p = p->next;
+    if (p->next == t)
+        p->next = t->next;
+
+    void *stack = t->stack_base;
+    paddr_t pd = t->page_dir;
+    u32 pid = t->pid;
+
+    t->stack_base = NULL;
+    t->next = NULL;
+    t->resources_freed = true;
+    /* Keep page_dir readable for diagnostics but make clear it is gone. */
+    t->page_dir = 0;
+    irq_restore(irqs);
+
+    if (stack)
+        kfree(stack);
+
+    /* A forked process owns its address space; a kernel thread shares the
+     * kernel's and must not free it. */
+    if (pd && pd != vmm_kernel_pd_phys())
+        vmm_destroy_address_space(pd);
+
+    pr_debug("released pid %u's stack and address space", pid);
+}
+
+/* Sweep every zombie that nobody has collected yet. Called from the idle
+ * task, so a process whose parent never calls wait() still has its memory
+ * returned - only the slot lingers. */
 static void reap_zombies(void)
 {
     for (size_t i = 1; i < TASK_MAX; i++) {
         struct task *t = &tasks[i];
 
-        if (t->state != TASK_ZOMBIE || t == current)
+        if (t->state != TASK_ZOMBIE || t == current || t->resources_freed)
             continue;
 
-        bool irqs = irq_save();
-
-        /* Unlink from the run queue. */
-        struct task *p = current;
-        while (p->next != t && p->next != current)
-            p = p->next;
-        if (p->next == t)
-            p->next = t->next;
-
-        void *stack = t->stack_base;
-        u32 pid = t->pid;
-
-        t->state = TASK_UNUSED;
-        t->stack_base = NULL;
-        t->next = NULL;
-        irq_restore(irqs);
-
-        if (stack)
-            kfree(stack);
-        pr_debug("reaped pid %u", pid);
+        release_task_resources(t);
     }
 }
 
@@ -268,6 +313,13 @@ static void switch_to(struct task *next)
      * task is in ring 3. Wrong value here means a ring-3 interrupt corrupts
      * some other task's stack. */
     tss_set_kernel_stack(next->kernel_esp0);
+
+    /* Switch address spaces. Safe to do before the stack swap because every
+     * task's kernel stack lives in the kernel heap, which is mapped
+     * identically in every address space - that identity is the whole reason
+     * vmm_create_address_space() copies the kernel's page directory half. */
+    if (next->page_dir && next->page_dir != prev->page_dir)
+        vmm_switch_address_space(next->page_dir);
 
     context_switch(&prev->saved_esp, next->saved_esp);
 }
@@ -381,6 +433,15 @@ NORETURN void task_exit(int code)
     current->state = TASK_ZOMBIE;
     need_resched = false;
 
+    /* If the parent is blocked in wait(), it is waiting for exactly this. */
+    for (size_t i = 0; i < TASK_MAX; i++) {
+        if (tasks[i].pid == current->parent_pid &&
+            tasks[i].state == TASK_BLOCKED) {
+            tasks[i].state = TASK_READY;
+            break;
+        }
+    }
+
     struct task *next = pick_next();
     /* pick_next() will not return a zombie, so this always moves us off the
      * dying task. Its stack stays allocated until someone else reaps it. */
@@ -388,6 +449,172 @@ NORETURN void task_exit(int code)
     irq_restore(irqs);
 
     panic("a zombie task was scheduled again (pid %u)", current->pid);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Processes                                                                 */
+/* ------------------------------------------------------------------------- */
+
+int task_fork(const struct regs *parent_frame)
+{
+    if (!sched_ready || !parent_frame)
+        return -1;
+
+    bool irqs = irq_save();
+    struct task *child = alloc_slot();
+
+    if (!child) {
+        irq_restore(irqs);
+        pr_err("fork: all %u task slots are in use", (unsigned)TASK_MAX);
+        return -1;
+    }
+
+    child->state = TASK_BLOCKED; /* claim the slot before unlocking */
+    irq_restore(irqs);
+
+    void *stack = kmalloc_aligned(TASK_STACK_SIZE, 16);
+    if (!stack) {
+        child->state = TASK_UNUSED;
+        pr_err("fork: no memory for the child's kernel stack");
+        return -1;
+    }
+
+    /* Copy-on-write clone of the caller's address space. Every writable page
+     * becomes read-only in *both* and the frames are shared until written. */
+    paddr_t child_pd = vmm_clone_current();
+    if (!child_pd) {
+        kfree(stack);
+        child->state = TASK_UNUSED;
+        pr_err("fork: could not clone the address space");
+        return -1;
+    }
+
+    struct task *parent = current;
+
+    memset(child->name, 0, sizeof(child->name));
+    strlcpy(child->name, parent->name, sizeof(child->name));
+
+    child->stack_base = stack;
+    child->stack_size = TASK_STACK_SIZE;
+    child->kernel_esp0 = (u32)stack + TASK_STACK_SIZE;
+    child->page_dir = child_pd;
+    child->parent_pid = parent->pid;
+    child->quantum_left = SCHED_QUANTUM;
+    child->ticks_total = 0;
+    child->switches = 0;
+    child->wake_at = 0;
+    child->exit_code = 0;
+    child->user = parent->user;
+    child->resources_freed = false;
+
+    /* Build the child's kernel stack so that the first context switch into it
+     * restores a copy of the parent's trap frame and returns to user space.
+     *
+     * Top of the stack holds the frame itself; below it, the five words
+     * context_switch's epilogue pops, then the trampoline's argument:
+     *
+     *   [struct regs]                       <- the copied frame, eax = 0
+     *   [&frame]                            <- popped by fork_trampoline
+     *   [fork_trampoline]                   <- context_switch's `ret`
+     *   [eflags] [ebx] [esi] [edi] [ebp]    <- popfd and four pops
+     *                                  ^-- saved_esp
+     */
+    u8 *top = (u8 *)stack + TASK_STACK_SIZE;
+    struct regs *frame = (struct regs *)(top - sizeof(struct regs));
+
+    *frame = *parent_frame;
+
+    /* The one difference between parent and child, and the whole trick:
+     * fork returns the child's pid in the parent and 0 in the child.
+     * isr_restore_and_return's `popa` picks this up. */
+    frame->eax = 0;
+
+    u32 *sp = (u32 *)frame;
+    *--sp = (u32)frame;
+    *--sp = (u32)fork_trampoline;
+    *--sp = 0x202; /* IF | reserved bit 1 */
+    *--sp = 0;     /* ebx */
+    *--sp = 0;     /* esi */
+    *--sp = 0;     /* edi */
+    *--sp = 0;     /* ebp */
+
+    child->saved_esp = (u32)sp;
+
+    irqs = irq_save();
+    child->pid = next_pid++;
+    child->next = current->next;
+    current->next = child;
+    child->state = TASK_READY;
+    irq_restore(irqs);
+
+    pr_info("fork: pid %u -> pid %u, address space %p", parent->pid, child->pid,
+            (void *)child_pd);
+
+    return (int)child->pid;
+}
+
+int task_wait(int *status_out)
+{
+    if (!sched_ready)
+        return -1;
+
+    for (;;) {
+        bool irqs = irq_save();
+        bool have_children = false;
+
+        for (size_t i = 1; i < TASK_MAX; i++) {
+            struct task *t = &tasks[i];
+
+            if (t->state == TASK_UNUSED || t->parent_pid != current->pid)
+                continue;
+
+            if (t->state == TASK_ZOMBIE) {
+                int pid = (int)t->pid;
+
+                if (status_out)
+                    *status_out = t->exit_code;
+
+                irq_restore(irqs);
+
+                /* The reaper may not have got to this child yet, and the slot
+                 * must not go back into circulation while it is still in the
+                 * run queue holding a stack and a page directory. Releasing
+                 * here rather than waiting for idle is also what makes
+                 * wait() the point at which a child's memory is definitely
+                 * gone. Idempotent, so racing the reaper is harmless. */
+                release_task_resources(t);
+
+                /* Collecting the exit code is what finally frees the slot. */
+                irqs = irq_save();
+                t->state = TASK_UNUSED;
+                t->parent_pid = 0;
+                irq_restore(irqs);
+                return pid;
+            }
+
+            have_children = true;
+        }
+
+        if (!have_children) {
+            irq_restore(irqs);
+            return -1;
+        }
+
+        /* Block rather than spin. task_exit() moves us back to READY. */
+        current->state = TASK_BLOCKED;
+        irq_restore(irqs);
+        sched_yield();
+    }
+}
+
+u32 task_count(void)
+{
+    u32 n = 0;
+
+    for (size_t i = 0; i < TASK_MAX; i++)
+        if (tasks[i].state != TASK_UNUSED)
+            n++;
+    return n;
 }
 
 NORETURN void sched_start(void)

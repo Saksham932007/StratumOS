@@ -308,3 +308,109 @@ mode and does not help CI at all.
 
 **Why.** The same kernel binary is interactive, self-testing and
 serial-only — the images differ only in 96 bytes of stage 2.
+
+---
+
+## 15. Copy-on-write marks *both* copies, and stores the mark in the PTE
+
+**Decision.** `vmm_clone_current()` clears `PTE_WRITE` and sets `PTE_COW` —
+software bit 10 — in the parent's page table entry as well as the child's, and
+bumps a per-frame reference count the PMM keeps in one byte per frame.
+
+**Rejected: marking only the child.** It looks sufficient, and it is wrong in a
+way that will not show up in a test that forks once. The parent stays writable,
+so the parent's next write goes straight through into a page the child is still
+reading. The two processes share a page until the *child* writes, at which
+point they stop — so the symptom is a parent whose data is occasionally,
+quietly wrong, with no fault and no log line anywhere.
+
+**Rejected: a side table of COW pages.** A hash of `(address space, page)`
+keeps the page tables clean, but it is a second structure to keep in step with
+the first, and the fault handler has to consult it on every write fault
+rather than reading the entry it already walked to. x86 leaves bits 9–11 of a
+PTE to software precisely so that this does not have to be invented.
+
+**Rejected: no reference count — copy on every fault.** Simpler, and it leaks.
+When one of two sharers exits, the survivor's page is still COW; without a
+count, the next write allocates a frame, copies 4 KiB and drops the original,
+all to arrive at the page it already had. A process forking in a loop pays
+that cost every time. With a count, `refs <= 1` hands the write bit back and
+copies nothing.
+
+**Cost.** One byte per frame — 32 KiB per GiB of RAM — allocated next to the
+frame bitmap, plus the discipline that every frame-sharing path has to call
+`pmm_frame_ref()`. The count saturates at 255 instead of wrapping, because a
+counter that has to fail should leak a page rather than free one that is
+still in use.
+
+**Why.** The bit is already there, the fault handler has already walked to the
+entry, and the reference count is what makes the whole thing safe rather than
+merely working. The `vmspace` suite checks all three properties — both copies
+marked, the count rising and falling, the frame count returning to where it
+started — because each of them fails silently.
+
+---
+
+## 16. `exec` returns by rewriting the trap frame
+
+**Decision.** `usermode_exec()` does not return a value. It sets `r->eip` to
+the new image's entry point and `r->user_esp` to the top of a fresh stack, and
+the syscall's own `IRET` delivers control into the new program. The dispatcher
+`return`s without touching `r->eax`.
+
+**Rejected: returning to the caller and jumping afterwards.** There is nothing
+to return to. The code that executed `int 0x80` was in the image that `exec`
+just unmapped, so the return address in the trap frame points at a page that
+no longer exists.
+
+**Rejected: a dedicated "enter user mode" path, as the first `exec` uses.**
+`usermode_enter()` forges an inter-privilege `IRET` frame from scratch and
+works fine for a task that has never been in ring 3. Using it here would mean
+abandoning the kernel stack frame the syscall is standing on, and two separate
+pieces of code that know how to get from ring 0 to ring 3. The trap frame is
+already exactly the right shape; the only honest thing to do with it is edit
+it.
+
+**Cost.** `SYS_EXEC` has to receive `struct regs *`, like `SYS_FORK`, and the
+dispatcher needs a `return` rather than a `break` in that one case — a quiet
+asymmetry that a comment has to carry. And the ordering rules become load
+bearing: the program name must be copied out of user memory *before* the
+address space is torn down, because the string lives in the image being
+replaced.
+
+**Why.** It is the same mechanism `fork` uses from the other direction.
+`fork_trampoline` jumps into `isr_restore_and_return` so a brand-new child
+returns to user space through the identical instructions a page fault does;
+`exec` edits the frame those instructions will read. One restore path, two
+callers, nothing duplicated.
+
+---
+
+## 17. A dead task's resources are released by two paths, not one
+
+**Decision.** `release_task_resources()` is idempotent and called from both the
+idle task's reaper and from `wait()`. The task *slot* stays `TASK_ZOMBIE`
+holding the exit code until a parent collects it.
+
+**Rejected: the reaper alone.** This was the first implementation, and it had a
+real bug. `wait()` simply marked the slot `TASK_UNUSED`, and `wait()` usually
+wins the race — the parent becomes runnable the moment its child exits. So the
+slot went back into circulation while the task was **still linked into the run
+queue**, holding a stack and a page directory. The next `task_create()` handed
+out that slot and spliced it into the list a second time.
+
+**Rejected: `wait()` alone.** Then a process whose parent never calls `wait()`
+holds 16 KiB of kernel stack and a whole address space forever. Orphans are
+normal, not exceptional.
+
+**Rejected: freeing in `task_exit()`.** A task cannot free the stack it is
+standing on or the address space it is running in. That is the constraint the
+whole design follows from, and it is why a zombie state exists at all.
+
+**Cost.** A `resources_freed` flag, set inside the same interrupts-off window
+that unlinks the task, and the discipline that both callers go through one
+function. The function has to refuse to act on `current`.
+
+**Why.** The two lifetimes are genuinely different: memory should come back as
+soon as anyone notices, and an exit status is owed to a specific process until
+it asks. Trying to serve both with one trigger is what produced the bug.

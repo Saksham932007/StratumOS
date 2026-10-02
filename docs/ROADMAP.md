@@ -6,27 +6,45 @@ most of these in mind.
 
 ---
 
+## Done since v0.4.0
+
+### Per-process address spaces, fork, copy-on-write, exec, wait
+
+Landed in v0.5.0. A page directory per process with the kernel's half
+copied in, a `CR3` switch in `switch_to()`, `fork` with copy-on-write
+(software PTE bit 10, per-frame reference counts in the PMM, a fault
+handler with a no-copy shortcut for the last sharer), `exec` by rewriting
+the syscall's own trap frame, and `wait` with real zombies. Two ring-3
+programs are embedded so `exec` has a different image to switch to.
+
+Two new in-kernel suites (`vmspace`, `proc`, 56 assertions between them)
+and fifteen new CI expectations. Documented in
+[PROCESSES.md](PROCESSES.md).
+
+What it still lacks: `argv`, file descriptors, signals, and loading the
+image from a file rather than the embedded table — the last of which is
+item 5 below.
+
+---
+
 ## Next
 
-### 1. Per-process address spaces, fork, exec, wait
+### 1. Security hardening
 
-The kernel moved to the higher half in v0.4.0, which was the
-precondition. What remains is the part that makes "user space" mean more
-than one program: a page directory per task, a CR3 switch in
-`context_switch`, an address-space clone, and copy-on-write `fork`.
+The parts a reviewer looks for and this kernel does not have yet:
 
-Copy-on-write is where it gets interesting - mark both copies read-only
-and have the page-fault handler duplicate on write. The handler is already
-structured to distinguish a resolvable fault from a fatal one; right now
-it reports every fault as fatal, with a comment marking where demand
-paging goes.
-
-`exec` is half done already: `kernel/core/elf.c` maps PT_LOAD segments
-into the current address space with user permissions, validated against a
-hostile image. It needs to tear down the old address space first, and to
-read its input from a file rather than an embedded blob (item 5).
-
-Roughly two to three weekends, and the boot tests will earn their keep.
+- **Guard pages** below each kernel stack, so an overflow faults instead
+  of quietly eating the neighbouring allocation. `kmalloc_aligned` would
+  become a mapped-with-a-hole allocation.
+- **W^X for user images.** The ELF loader already applies `PF_W` in a
+  second pass; without PAE there is no NX bit, so "writable" and
+  "executable" cannot both be enforced. PAE is the price.
+- **SMEP/SMAP** (`CR4` bits 20 and 21) so a kernel bug cannot execute or
+  read user memory by accident. Both need a CPUID check and a fallback.
+- **Stack canaries** on task stacks, checked on every switch.
+- **KASLR**, which on a higher-half kernel means relocating at load time —
+  the loader already parses ELF program headers, so the hard part is
+  relocations rather than the mechanics.
 
 ### 2. Interrupt-driven serial transmit
 
@@ -57,6 +75,11 @@ already exists - see [PERFORMANCE.md](PERFORMANCE.md).
 ATA PIO first, because it needs no DMA and no interrupts. Then FAT16 read-only,
 which is enough to load an init binary and is well documented. The existing
 `pci.c` already finds the IDE controller.
+
+This is also what finishes `exec`: its namespace is currently a table of
+programs embedded in the kernel image, and a path lookup is the only change
+the rest of the call needs. See
+[PROCESSES.md](PROCESSES.md#execs-namespace).
 
 ### 6. A slab allocator over the heap
 
@@ -100,15 +123,43 @@ calls (`ps`, `meminfo`, `irq`) belongs behind readable files instead.
 
 ---
 
+## Further out
+
+These are bigger than the items above, and each one is a project in its own
+right rather than a weekend:
+
+### x86-64 long mode
+
+The natural continuation of the boot story this project is about: 16-bit
+real mode to 32-bit protected mode to 64-bit long mode, with 4-level
+paging. It is a second architecture port of the whole kernel, not a flag.
+Mentioned here because the boot path is the part of this project most worth
+extending, and the existing two-stage loader already does the hard half
+(A20, E820, a protected-mode GDT, ELF program headers).
+
+### A network stack
+
+An e1000 driver, then ARP, IP, UDP and a minimal TCP. It is a
+protocol-stack project rather than an OS-fundamentals one, which is why it
+is last, but it is also the one that exercises interrupt latency, DMA and
+buffer lifetime management in a way nothing else here does.
+
+### A second architecture
+
+RISC-V or AArch64. Most of `kernel/core` and `kernel/mm` is already free of
+x86, and `kernel/arch/x86` is where everything that is not would have to
+grow a sibling. The value is in finding out how much of that claim is true.
+
+---
+
 ## Not planned
 
 Things deliberately out of scope, so the roadmap is not read as a to-do list
 of everything:
 
-- **64-bit / long mode.** A different project. The 32-bit boot path, with its
-  A20 gate and its real-to-protected transition, is the thing being
-  demonstrated here.
 - **A GUI.** The VGA text driver is a means, not an end.
-- **Networking.** Interesting, but it is a protocol-stack project rather than
-  an OS-fundamentals one.
 - **Binary compatibility with anything.** No Linux syscall ABI, no POSIX.
+  The syscall surface is small and deliberately its own.
+- **A port to a machine without a BIOS.** UEFI boot is a different loader
+  for a different firmware, and the BIOS path is the thing being
+  demonstrated.

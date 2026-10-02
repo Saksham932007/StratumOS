@@ -52,6 +52,9 @@ static bool initialised;
 static u32 stat_page_tables;
 static u32 stat_mapped_pages;
 static u32 stat_page_faults;
+static u32 stat_cow_faults;
+static u32 stat_cow_copies;
+static u32 stat_address_spaces;
 
 /* Page tables are always reached through the recursive window. Before the
  * higher-half jump there was a physical path as well; there no longer is,
@@ -69,6 +72,60 @@ static inline u32 *pt_entries(u32 pdi)
 paddr_t vmm_kernel_pd_phys(void)
 {
     return kernel_pd_phys;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Temporary mappings                                                        */
+/* ------------------------------------------------------------------------- */
+/*
+ * The recursive window reaches only the *current* address space's tables, but
+ * fork has to build the child's while the parent's is loaded. These two slots
+ * are how a frame that is mapped nowhere becomes writable for a moment.
+ *
+ * Two slots, because cloning needs the child's page directory and one of its
+ * page tables visible at once. They are a fixed resource, so every use is a
+ * short, non-nesting critical section - asserted rather than assumed.
+ */
+static bool temp_slot_busy[VMM_TEMP_SLOTS];
+
+static void *temp_map(unsigned slot, paddr_t frame)
+{
+    ASSERT(slot < VMM_TEMP_SLOTS);
+    ASSERT(!temp_slot_busy[slot]);
+
+    vaddr_t va = VMM_TEMP_BASE + slot * PAGE_SIZE;
+    u32 *pt = pt_entries(PDE_INDEX(va));
+
+    temp_slot_busy[slot] = true;
+    pt[PTE_INDEX(va)] = (frame & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITE;
+    invlpg(va);
+
+    return (void *)va;
+}
+
+static void temp_unmap(unsigned slot)
+{
+    ASSERT(slot < VMM_TEMP_SLOTS);
+
+    vaddr_t va = VMM_TEMP_BASE + slot * PAGE_SIZE;
+    u32 *pt = pt_entries(PDE_INDEX(va));
+
+    pt[PTE_INDEX(va)] = 0;
+    invlpg(va);
+    temp_slot_busy[slot] = false;
+}
+
+/* Replace a present page's entry outright, keeping nothing. Used by the
+ * copy-on-write handler, which needs to change both the frame and the flags
+ * in one step - vmm_protect() keeps the frame and vmm_map() would warn about
+ * replacing a live mapping. */
+static void set_pte(vaddr_t va, u32 entry)
+{
+    u32 pdi = PDE_INDEX(va);
+
+    ASSERT(pd_entries()[pdi] & PTE_PRESENT);
+    pt_entries(pdi)[PTE_INDEX(va)] = entry;
+    invlpg(va);
 }
 
 /* Create the page table for a directory slot if it is missing. */
@@ -259,6 +316,206 @@ bool vmm_translate(vaddr_t va, paddr_t *out)
 }
 
 /* ------------------------------------------------------------------------- */
+/* Address spaces                                                            */
+/* ------------------------------------------------------------------------- */
+
+paddr_t vmm_create_address_space(void)
+{
+    paddr_t pd = pmm_alloc_frame();
+
+    if (pd == PMM_NO_FRAME) {
+        pr_err("cannot allocate a page directory");
+        return 0;
+    }
+
+    bool irqs = irq_save();
+    u32 *dst = temp_map(0, pd);
+    const u32 *kernel = pd_entries();
+
+    memset(dst, 0, PAGE_SIZE);
+
+    /* Share the kernel's half. Every address space must see identical kernel
+     * mappings, or an interrupt delivered while this process is running would
+     * fault on the kernel's own code. */
+    for (u32 i = KERNEL_PDE_FIRST; i < RECURSIVE_SLOT; i++)
+        dst[i] = kernel[i];
+
+    /* The recursive entry must point at *this* directory, not the kernel's -
+     * copying it would make the new address space's window show someone
+     * else's page tables. */
+    dst[RECURSIVE_SLOT] = pd | PTE_PRESENT | PTE_WRITE;
+
+    temp_unmap(0);
+    irq_restore(irqs);
+
+    stat_address_spaces++;
+    return pd;
+}
+
+paddr_t vmm_clone_current(void)
+{
+    paddr_t child_pd = vmm_create_address_space();
+
+    if (!child_pd)
+        return 0;
+
+    bool irqs = irq_save();
+    u32 *parent_pd = pd_entries();
+    u32 *child_pd_map = temp_map(0, child_pd);
+
+    for (u32 pdi = 0; pdi < KERNEL_PDE_FIRST; pdi++) {
+        if (!(parent_pd[pdi] & PTE_PRESENT))
+            continue;
+
+        paddr_t child_pt_frame = pmm_alloc_frame();
+        if (child_pt_frame == PMM_NO_FRAME) {
+            pr_err("out of memory cloning an address space");
+            temp_unmap(0);
+            irq_restore(irqs);
+            vmm_destroy_address_space(child_pd);
+            return 0;
+        }
+
+        u32 *parent_pt = pt_entries(pdi);
+        u32 *child_pt = temp_map(1, child_pt_frame);
+
+        for (u32 pti = 0; pti < 1024; pti++) {
+            u32 entry = parent_pt[pti];
+
+            if (!(entry & PTE_PRESENT)) {
+                child_pt[pti] = 0;
+                continue;
+            }
+
+            /* A writable page becomes read-only and COW-marked on *both*
+             * sides. Marking only the child would let the parent write
+             * through to a page the child believes is private. */
+            if (entry & PTE_WRITE) {
+                entry = (entry & ~(u32)PTE_WRITE) | PTE_COW;
+                parent_pt[pti] = entry;
+                invlpg((pdi << 22) | (pti << PAGE_SHIFT));
+            }
+
+            /* Both address spaces now hold the frame. */
+            pmm_frame_ref(entry & PTE_ADDR_MASK);
+            child_pt[pti] = entry;
+            stat_mapped_pages++;
+        }
+
+        temp_unmap(1);
+
+        child_pd_map[pdi] = child_pt_frame | PTE_PRESENT | PTE_WRITE | PTE_USER;
+        stat_page_tables++;
+    }
+
+    temp_unmap(0);
+    irq_restore(irqs);
+
+    return child_pd;
+}
+
+void vmm_destroy_address_space(paddr_t pd_phys)
+{
+    if (!pd_phys)
+        return;
+
+    if (pd_phys == read_cr3())
+        panic("vmm_destroy_address_space(%p): that is the address space we "
+              "are running in",
+              (void *)pd_phys);
+
+    bool irqs = irq_save();
+    u32 *pd = temp_map(0, pd_phys);
+
+    for (u32 pdi = 0; pdi < KERNEL_PDE_FIRST; pdi++) {
+        if (!(pd[pdi] & PTE_PRESENT))
+            continue;
+
+        paddr_t pt_frame = pd[pdi] & PTE_ADDR_MASK;
+        u32 *pt = temp_map(1, pt_frame);
+
+        for (u32 pti = 0; pti < 1024; pti++) {
+            if (!(pt[pti] & PTE_PRESENT))
+                continue;
+            if (pt[pti] & PTE_OWNED) {
+                /* Drops a reference; the frame only goes back to the
+                 * allocator if no other address space holds it. */
+                pmm_free_frame(pt[pti] & PTE_ADDR_MASK);
+                stat_mapped_pages--;
+            }
+        }
+
+        temp_unmap(1);
+        pmm_free_frame(pt_frame);
+        stat_page_tables--;
+        pd[pdi] = 0;
+    }
+
+    temp_unmap(0);
+    irq_restore(irqs);
+
+    pmm_free_frame(pd_phys);
+}
+
+void vmm_clear_user_space(void)
+{
+    bool irqs = irq_save();
+    u32 *pd = pd_entries();
+
+    for (u32 pdi = 0; pdi < KERNEL_PDE_FIRST; pdi++) {
+        if (!(pd[pdi] & PTE_PRESENT))
+            continue;
+
+        u32 *pt = pt_entries(pdi);
+
+        for (u32 pti = 0; pti < 1024; pti++) {
+            if (!(pt[pti] & PTE_PRESENT))
+                continue;
+            if (pt[pti] & PTE_OWNED) {
+                pmm_free_frame(pt[pti] & PTE_ADDR_MASK);
+                stat_mapped_pages--;
+            }
+            pt[pti] = 0;
+        }
+
+        paddr_t pt_frame = pd[pdi] & PTE_ADDR_MASK;
+        pd[pdi] = 0;
+        pmm_free_frame(pt_frame);
+        stat_page_tables--;
+    }
+
+    /* The whole user half changed, so a per-page invlpg would be 786432
+     * invalidations. Reloading CR3 flushes everything at once. */
+    write_cr3(read_cr3());
+    irq_restore(irqs);
+}
+
+void vmm_switch_address_space(paddr_t pd_phys)
+{
+    if (pd_phys && pd_phys != read_cr3())
+        write_cr3(pd_phys);
+}
+
+u32 vmm_count_user_pages(void)
+{
+    u32 count = 0;
+    bool irqs = irq_save();
+    u32 *pd = pd_entries();
+
+    for (u32 pdi = 0; pdi < KERNEL_PDE_FIRST; pdi++) {
+        if (!(pd[pdi] & PTE_PRESENT))
+            continue;
+        u32 *pt = pt_entries(pdi);
+        for (u32 pti = 0; pti < 1024; pti++)
+            if (pt[pti] & PTE_PRESENT)
+                count++;
+    }
+
+    irq_restore(irqs);
+    return count;
+}
+
+/* ------------------------------------------------------------------------- */
 
 /* Naming the region a fault landed in is most of the diagnosis: the same
  * "page fault at 0x..." means very different things in the heap window and at
@@ -283,16 +540,82 @@ static const char *fault_region(u32 addr)
     return "no region the kernel maps - a wild pointer";
 }
 
+/* Try to resolve a fault as a copy-on-write break. Returns true if the fault
+ * was handled and execution can resume at the faulting instruction.
+ *
+ * This is the one kind of page fault that is not a bug: it is how fork() gets
+ * away with sharing every page of the parent's memory until somebody writes
+ * to one. */
+static bool cow_fault(struct regs *r, u32 addr)
+{
+    /* Must be a write to a page that is present. A read of a COW page is
+     * legitimate and never faults; a write to an absent page is a real
+     * fault. */
+    if (!(r->err_code & 0x02) || !(r->err_code & 0x01))
+        return false;
+
+    if (is_kernel_address(addr))
+        return false; /* the kernel's own pages are never COW */
+
+    u32 pte = vmm_pte(addr);
+
+    if (!(pte & PTE_PRESENT) || !(pte & PTE_COW))
+        return false;
+
+    paddr_t old_frame = pte & PTE_ADDR_MASK;
+    vaddr_t page = PAGE_TRUNC(addr);
+
+    stat_cow_faults++;
+
+    /* Sole owner: the other side already broke its copy, so there is nothing
+     * to duplicate. Just restore write access. This is the common case in a
+     * fork-then-exit pattern and it costs one PTE write. */
+    if (pmm_frame_refs(old_frame) <= 1) {
+        set_pte(page, (pte & ~(u32)PTE_COW) | PTE_WRITE);
+        return true;
+    }
+
+    paddr_t fresh = pmm_alloc_frame();
+    if (fresh == PMM_NO_FRAME) {
+        pr_err("out of memory breaking a copy-on-write page at %p",
+               (void *)page);
+        return false; /* fall through to the panic: we cannot continue */
+    }
+
+    /* Copy through a temporary mapping. The source is readable through its
+     * own (read-only) mapping, which is why no second temp slot is needed. */
+    bool irqs = irq_save();
+    void *dst = temp_map(0, fresh);
+    memcpy(dst, (const void *)page, PAGE_SIZE);
+    temp_unmap(0);
+    irq_restore(irqs);
+
+    /* The new frame is private: writable, owned, no longer COW. */
+    set_pte(page, fresh | (pte & 0xFFF & ~(u32)PTE_COW) | PTE_WRITE |
+                      PTE_PRESENT | PTE_OWNED);
+
+    /* Release our share of the original. */
+    pmm_free_frame(old_frame);
+
+    stat_cow_copies++;
+    return true;
+}
+
 static void page_fault_handler(struct regs *r)
 {
     u32 addr = read_cr2();
-    const char *where = fault_region(addr);
 
     stat_page_faults++;
 
-    /* Nothing grows a mapping on demand yet, so every fault is a real bug and
-     * the job is to report it as precisely as possible. Demand paging and
-     * copy-on-write are the natural extensions - see docs/ROADMAP.md. */
+    /* A copy-on-write break is the one fault that is expected. */
+    if (cow_fault(r, addr))
+        return;
+
+    /* Everything else is a real bug, so the job is to report it as precisely
+     * as possible. Demand paging is the other natural resolvable case - see
+     * docs/ROADMAP.md. */
+    const char *where = fault_region(addr);
+
     kprintf("\n");
     page_fault_describe(r);
     kprintf("  region          : %s\n", where);
@@ -333,6 +656,12 @@ void vmm_init(void)
         panic("cannot extend the kernel's linear map to %u MiB",
               (unsigned)(VMM_LINEAR_SIZE / MIB));
 
+    /* Reserve a page table for the temporary-mapping slots now, while there
+     * is exactly one address space. Created later, it would be missing from
+     * every address space already cloned from the kernel's. */
+    if (!ensure_table(PDE_INDEX(VMM_TEMP_BASE), PTE_PRESENT | PTE_WRITE))
+        panic("cannot reserve the temporary-mapping page table");
+
     /* Drop the identity mapping of the first 4 MiB. It existed only to keep
      * the handful of instructions between `mov cr0` and the higher-half jump
      * fetchable. Removing it is what makes the bottom of the address space
@@ -370,4 +699,7 @@ void vmm_get_stats(struct vmm_stats *out)
     out->page_tables = stat_page_tables;
     out->mapped_pages = stat_mapped_pages;
     out->page_faults = stat_page_faults;
+    out->cow_faults = stat_cow_faults;
+    out->cow_copies = stat_cow_copies;
+    out->address_spaces = stat_address_spaces;
 }

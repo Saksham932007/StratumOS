@@ -47,7 +47,7 @@ struct idt_ptr {
 #define IDT_GATE_TRAP32 0x0F
 
 #define IDT_ENTRIES     256
-#define INT_SYSCALL     0x80
+/* INT_SYSCALL lives in kernel/syscall_abi.h, shared with user programs. */
 
 typedef void (*isr_handler_t)(struct regs *r);
 

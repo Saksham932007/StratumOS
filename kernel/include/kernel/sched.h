@@ -32,6 +32,10 @@ typedef void (*task_entry_t)(void *arg);
 struct task {
     u32 saved_esp; /* must stay first: switch.asm indexes it */
     u32 pid;
+    u32 parent_pid;
+    /* Physical address of this task's page directory. Kernel threads all
+     * share the kernel's; a forked process gets its own. */
+    paddr_t page_dir;
     char name[TASK_NAME_MAX];
     enum task_state state;
     u32 quantum_left;
@@ -43,6 +47,10 @@ struct task {
     u32 kernel_esp0; /* ring-0 stack top for the TSS */
     int exit_code;
     bool user;
+    /* Set once the reaper has released this task's stack and address space.
+     * The slot itself stays ZOMBIE until a parent collects the exit code -
+     * which is what a zombie process is. */
+    bool resources_freed;
     struct task *next;
 };
 
@@ -66,7 +74,24 @@ u32 sched_switch_count(void);
 const char *task_state_name(enum task_state s);
 void sched_foreach(void (*fn)(const struct task *t, void *ctx), void *ctx);
 
+/* ---- processes ---------------------------------------------------------
+ *
+ * fork() duplicates the calling task: a new kernel stack, a copy-on-write
+ * clone of its address space, and a register frame rigged so the child
+ * returns 0 where the parent returns the child's pid.
+ */
+int task_fork(const struct regs *parent_frame);
+
+/* Collect a dead child. Returns its pid and writes its exit code, blocks
+ * while a child is still running, or returns -1 when there are none. */
+int task_wait(int *status_out);
+
+u32 task_count(void);
+
 /* Implemented in arch/x86/switch.asm */
 void context_switch(u32 *save_esp, u32 load_esp);
+/* The address a freshly forked child "returns" into; it restores the copied
+ * trap frame and irets into user space. */
+void fork_trampoline(void);
 
 #endif /* _KERNEL_SCHED_H */

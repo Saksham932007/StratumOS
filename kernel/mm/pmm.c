@@ -31,6 +31,8 @@
 
 static u32 *bitmap;
 static u32 bitmap_words;
+/* One reference count per frame; see the header for why. */
+static u8 *refcounts;
 static u32 total_frames;
 static u32 used_frames;
 static u32 reserved_frames;
@@ -116,8 +118,13 @@ void pmm_init(const struct boot_params *bp)
     bitmap_phys = PAGE_ALIGN((u32)__kernel_phys_end);
     bitmap = (u32 *)phys_to_virt(bitmap_phys);
 
+    /* The reference counts live immediately after the bitmap, in the same
+     * reserved region, so there is one allocation decision rather than two. */
+    refcounts = (u8 *)phys_to_virt(bitmap_phys + bitmap_bytes);
+
     /* Everything used, then open up what the firmware vouched for. */
     memset(bitmap, 0xFF, bitmap_bytes);
+    memset(refcounts, 0, total_frames);
     used_frames = total_frames;
     reserved_frames = 0;
 
@@ -149,8 +156,9 @@ void pmm_init(const struct boot_params *bp)
     /* The kernel image, by physical address. */
     pmm_reserve_range((paddr_t)__kernel_phys_start, (paddr_t)__kernel_phys_end);
 
-    /* The bitmap itself - allocating over it would be memorable. */
-    pmm_reserve_range(bitmap_phys, bitmap_phys + bitmap_bytes);
+    /* The bitmap and the reference counts - allocating over either would be
+     * memorable. */
+    pmm_reserve_range(bitmap_phys, bitmap_phys + bitmap_bytes + total_frames);
 
     /* Whatever the bootloader asked us to leave alone (its info block). */
     if (bp->reserved_hi > bp->reserved_lo)
@@ -159,17 +167,17 @@ void pmm_init(const struct boot_params *bp)
     search_hint = PFN(1 * MIB);
     alloc_calls = free_calls = 0;
 
-    if (bitmap_phys + bitmap_bytes > VMM_BOOT_MAPPED)
-        panic("the frame bitmap needs %u KiB at %p, which is outside the "
-              "%u MiB that _start mapped",
-              bitmap_bytes / KIB, (void *)bitmap_phys,
+    if (bitmap_phys + bitmap_bytes + total_frames > VMM_BOOT_MAPPED)
+        panic("the frame bitmap and reference counts need %u KiB at %p, "
+              "which is outside the %u MiB that _start mapped",
+              (bitmap_bytes + total_frames) / KIB, (void *)bitmap_phys,
               (unsigned)(VMM_BOOT_MAPPED / MIB));
 
-    pr_info("%u frames total (%llu MiB), %u free (%u MiB), bitmap %u KiB at "
+    pr_info("%u frames total (%llu MiB), %u free (%u MiB), metadata %u KiB at "
             "phys %p",
             total_frames, highest_addr / MIB, total_frames - used_frames,
             ((total_frames - used_frames) * (PAGE_SIZE / KIB)) / KIB,
-            bitmap_bytes / KIB, (void *)bitmap_phys);
+            (bitmap_bytes + total_frames) / KIB, (void *)bitmap_phys);
 }
 
 paddr_t pmm_alloc_frame(void)
@@ -198,6 +206,7 @@ paddr_t pmm_alloc_frame(void)
                     continue;
 
                 frame_set(pfn);
+                refcounts[pfn] = 1;
                 used_frames++;
                 search_hint = pfn + 1;
                 if (search_hint >= total_frames)
@@ -236,6 +245,7 @@ paddr_t pmm_alloc_frames(size_t count)
         if (++run == count) {
             for (u32 i = 0; i < count; i++) {
                 frame_set(run_start + i);
+                refcounts[run_start + i] = 1;
                 used_frames++;
             }
             alloc_calls++;
@@ -261,14 +271,55 @@ void pmm_free_frame(paddr_t frame)
         panic("pmm_free_frame(%p): frame is already free (double free)",
               (void *)frame);
 
+    free_calls++;
+
+    /* A shared frame - one that copy-on-write handed to a second address
+     * space - only goes back to the allocator when its last reference does.
+     * Freeing it on the first release would hand a live page to someone
+     * else, which is the whole hazard COW introduces. */
+    if (refcounts[pfn] > 1) {
+        refcounts[pfn]--;
+        return;
+    }
+
+    if (refcounts[pfn] == 0)
+        panic("pmm_free_frame(%p): frame is allocated but has no references",
+              (void *)frame);
+
+    refcounts[pfn] = 0;
     frame_clear(pfn);
     used_frames--;
-    free_calls++;
 
     /* Bias the next search towards the frame we just released: it is almost
      * certainly still in cache. */
     if (pfn < search_hint)
         search_hint = pfn;
+}
+
+void pmm_frame_ref(paddr_t frame)
+{
+    u32 pfn = PFN(frame);
+
+    if (pfn >= total_frames)
+        panic("pmm_frame_ref(%p): beyond end of memory", (void *)frame);
+
+    if (!frame_is_set(pfn))
+        panic("pmm_frame_ref(%p): frame is not allocated", (void *)frame);
+
+    /* Saturate rather than wrap. Wrapping to zero would make the next free
+     * reclaim a page that several address spaces are still using; saturating
+     * leaks one page instead. */
+    if (refcounts[pfn] < 0xFF)
+        refcounts[pfn]++;
+}
+
+u8 pmm_frame_refs(paddr_t frame)
+{
+    u32 pfn = PFN(frame);
+
+    if (pfn >= total_frames)
+        return 0;
+    return refcounts[pfn];
 }
 
 void pmm_free_frames(paddr_t frame, size_t count)
@@ -289,4 +340,9 @@ void pmm_get_stats(struct pmm_stats *out)
     out->highest_addr = highest_addr;
     out->alloc_calls = alloc_calls;
     out->free_calls = free_calls;
+
+    out->shared_frames = 0;
+    for (u32 pfn = 0; pfn < total_frames; pfn++)
+        if (refcounts[pfn] > 1)
+            out->shared_frames++;
 }

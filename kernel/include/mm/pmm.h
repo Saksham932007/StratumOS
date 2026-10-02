@@ -36,6 +36,21 @@ paddr_t pmm_alloc_frames(size_t count);
 void pmm_free_frame(paddr_t frame);
 void pmm_free_frames(paddr_t frame, size_t count);
 
+/* ---- reference counting ------------------------------------------------
+ *
+ * Copy-on-write means two address spaces can point at one frame, so "free"
+ * cannot mean "return to the allocator" unconditionally. Each frame carries a
+ * count: allocation sets it to 1, pmm_frame_ref() raises it,
+ * pmm_free_frame() lowers it, and the frame is reclaimed at zero.
+ *
+ * One byte per frame - 32 KiB per GiB of RAM, next to the allocation bitmap.
+ * A count of 255 saturates, which leaks a page rather than freeing one that
+ * is still in use; 255 sharers does not happen here, and that is the safe
+ * direction to fail in.
+ */
+void pmm_frame_ref(paddr_t frame);
+u8 pmm_frame_refs(paddr_t frame);
+
 /* Mark a physical range as never-allocatable. Used for firmware regions,
  * the kernel image itself and the structures the bootloader left behind. */
 void pmm_reserve_range(paddr_t start, paddr_t end);
@@ -48,6 +63,7 @@ struct pmm_stats {
     u64 highest_addr;
     u32 alloc_calls;
     u32 free_calls;
+    u32 shared_frames; /* frames with a reference count above one */
 };
 
 void pmm_get_stats(struct pmm_stats *out);

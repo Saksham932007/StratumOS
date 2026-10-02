@@ -66,4 +66,23 @@ thread_trampoline:
                 hlt
                 jmp     .unreachable
 
+; -----------------------------------------------------------------------------
+; void fork_trampoline(void)
+;
+; Where a forked child begins. task_fork() lays out its kernel stack so that
+; context_switch's `ret` lands here with a pointer to the child's copied trap
+; frame on top; restoring that frame and returning from the interrupt puts the
+; child back in user space at the instruction after its `int 0x80`, with EAX
+; set to 0.
+;
+; The parent, meanwhile, returns from the same syscall with the child's pid -
+; which is how one call returns twice.
+; -----------------------------------------------------------------------------
+                extern  isr_restore_and_return
+global fork_trampoline
+fork_trampoline:
+                pop     eax                     ; -> struct regs
+                mov     esp, eax
+                jmp     isr_restore_and_return
+
 section .note.GNU-stack noalloc noexec nowrite progbits

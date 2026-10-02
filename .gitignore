@@ -22,3 +22,7 @@ Thumbs.db
 logs/
 *.log
 bochsout.txt
+
+# Python bytecode from the tools
+__pycache__/
+*.pyc

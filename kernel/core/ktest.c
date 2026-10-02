@@ -34,6 +34,7 @@
 #include <kernel/sched.h>
 #include <kernel/string.h>
 #include <kernel/syscall.h>
+#include <kernel/usermode.h>
 
 #include <mm/heap.h>
 #include <mm/pmm.h>
@@ -690,6 +691,232 @@ static void test_elf(struct ktest_result *r)
 
 /* ---- registry ---------------------------------------------------------- */
 
+/* ---- address spaces and copy-on-write ---------------------------------
+ *
+ * The user-visible version of this lives in user/init.c, where a forked child
+ * writes to an inherited page and the parent proves its own copy is intact.
+ * That test is the one that matters, but it can only observe the outcome.
+ * This one runs inside the kernel, where the page table entries, the frame
+ * reference counts and the fault counters are all visible, so it can check
+ * the mechanism rather than the result: that the clone marked the page in
+ * *both* address spaces, that the reference count rose, that the write
+ * allocated exactly one new frame, and that tearing the clone down handed the
+ * shared frame back.
+ *
+ * It runs in an address space of its own, created and destroyed here, for the
+ * obvious reason that a test which clones the kernel's address space and then
+ * writes to the result is not a test anybody should run twice.
+ */
+static void test_address_spaces(struct ktest_result *r)
+{
+    struct task *self = task_current();
+    const paddr_t kernel_pd = vmm_kernel_pd_phys();
+    const vaddr_t up = USER_IMAGE_BASE;
+    struct pmm_stats pm_before, pm_after;
+    struct vmm_stats vs_before, vs_after;
+
+    /* The shell task running this is a kernel thread, so it starts in the
+     * kernel's address space. If that is not true the rest of the test would
+     * be destroying somebody's process. */
+    KT_ASSERT(r, self->page_dir == kernel_pd);
+    if (self->page_dir != kernel_pd)
+        return;
+
+    pmm_get_stats(&pm_before);
+
+    paddr_t pd = vmm_create_address_space();
+    KT_ASSERT(r, pd != 0);
+    KT_ASSERT(r, pd != kernel_pd);
+    if (!pd)
+        return;
+
+    /* Record it before loading CR3. A preemption between the two would
+     * otherwise put us back in the kernel's address space without the code
+     * below noticing. */
+    self->page_dir = pd;
+    vmm_switch_address_space(pd);
+
+    /* The kernel half came across. The strongest evidence is that this
+     * function is still executing, but check the mappings the kernel reaches
+     * by physical address too - those are the ones a half-copied directory
+     * would lose. */
+    paddr_t phys = 0;
+    KT_ASSERT(r, vmm_translate(VGA_VIRT, &phys) && phys == VGA_PHYS);
+    KT_ASSERT(r, vmm_translate((vaddr_t)&test_address_spaces, NULL));
+    KT_ASSERT(r, vmm_translate(KHEAP_BASE, NULL));
+
+    /* The user half did not. */
+    KT_EQ(r, vmm_count_user_pages(), 0u);
+    KT_ASSERT(r, !vmm_translate(up, NULL));
+
+    /* --- one user page, with something recognisable in it ---------------- */
+    KT_ASSERT(r, vmm_alloc_at(up, PTE_PRESENT | PTE_WRITE | PTE_USER));
+    volatile u32 *probe = (volatile u32 *)up;
+    *probe = 0x00C0FFEEu;
+    KT_EQ(r, vmm_count_user_pages(), 1u);
+
+    paddr_t shared = 0;
+    KT_ASSERT(r, vmm_translate(up, &shared));
+    KT_EQ(r, pmm_frame_refs(shared), 1);
+
+    vmm_get_stats(&vs_before);
+
+    /* --- clone it ------------------------------------------------------- */
+    paddr_t child = vmm_clone_current();
+    KT_ASSERT(r, child != 0);
+    KT_ASSERT(r, child != pd);
+
+    if (child) {
+        /* The clone had to make the page read-only in the *parent* as well.
+         * Marking only the child would mean the parent's next write went
+         * straight through into a page the child is still reading - the
+         * single most likely way to get copy-on-write subtly wrong. */
+        u32 pte = vmm_pte(up);
+        KT_ASSERT(r, (pte & PTE_PRESENT) != 0);
+        KT_ASSERT(r, (pte & PTE_WRITE) == 0);
+        KT_ASSERT(r, (pte & PTE_COW) != 0);
+        KT_ASSERT(r, (pte & PTE_USER) != 0);
+
+        /* Two address spaces hold the frame, and it is still readable. */
+        KT_EQ(r, pmm_frame_refs(shared), 2);
+        KT_EQ(r, *probe, 0x00C0FFEEu);
+
+        /* --- the write that forces the copy ----------------------------- */
+        *probe = 0x0BADC0DEu;
+
+        vmm_get_stats(&vs_after);
+        KT_ASSERT(r, vs_after.cow_faults > vs_before.cow_faults);
+        KT_ASSERT(r, vs_after.cow_copies > vs_before.cow_copies);
+        KT_ASSERT(r, vs_after.address_spaces > vs_before.address_spaces);
+
+        paddr_t private_frame = 0;
+        KT_ASSERT(r, vmm_translate(up, &private_frame));
+        KT_ASSERT(r, private_frame != shared);
+        KT_EQ(r, *probe, 0x0BADC0DEu);
+
+        /* The copy is ours outright now: writable, no longer COW, and the
+         * only reference to its frame. The old frame belongs to the child
+         * alone. */
+        pte = vmm_pte(up);
+        KT_ASSERT(r, (pte & PTE_WRITE) != 0);
+        KT_ASSERT(r, (pte & PTE_COW) == 0);
+        KT_ASSERT(r, (pte & PTE_OWNED) != 0);
+        KT_EQ(r, pmm_frame_refs(private_frame), 1);
+        KT_EQ(r, pmm_frame_refs(shared), 1);
+
+        /* A second write must not fault again. A COW implementation that
+         * forgets to clear the bit or to flush the TLB entry copies the page
+         * on every single write, which is correct and useless. */
+        vmm_get_stats(&vs_before);
+        *probe = 0x0BADC0DEu + 1;
+        vmm_get_stats(&vs_after);
+        KT_EQ(r, vs_after.cow_faults, vs_before.cow_faults);
+        KT_EQ(r, *probe, 0x0BADC0DEu + 1);
+
+        /* Tearing the child down releases the last reference to the frame
+         * the parent used to share. */
+        vmm_destroy_address_space(child);
+        KT_EQ(r, pmm_frame_refs(shared), 0);
+        KT_EQ(r, *probe, 0x0BADC0DEu + 1);
+    }
+
+    /* --- exec's half: clear the user half, keep the kernel's ------------- */
+    vmm_clear_user_space();
+    KT_EQ(r, vmm_count_user_pages(), 0u);
+    KT_ASSERT(r, !vmm_translate(up, NULL));
+    KT_ASSERT(r, vmm_translate(VGA_VIRT, NULL));
+    KT_ASSERT(r, vmm_translate(KHEAP_BASE, NULL));
+
+    /* --- back to the kernel's address space ------------------------------ */
+    self->page_dir = kernel_pd;
+    vmm_switch_address_space(kernel_pd);
+    vmm_destroy_address_space(pd);
+
+    KT_ASSERT(r, !vmm_translate(up, NULL));
+    KT_ASSERT(r, vmm_translate(VGA_VIRT, NULL));
+
+    /* Nothing leaked. Everything this test allocated - the two directories,
+     * their page tables, the shared frame and the private copy - came back. */
+    pmm_get_stats(&pm_after);
+    KT_EQ(r, pm_after.used_frames, pm_before.used_frames);
+}
+
+/* ---- fork and wait from the kernel side -------------------------------
+ *
+ * fork() needs a trap frame to copy, and a kernel thread has no user frame to
+ * give it, so the duplication itself is tested from ring 3 in user/init.c.
+ * What can be checked here is the bookkeeping either side of it: that the
+ * process table accounts for what it holds, that wait() refuses to invent a
+ * child, and that fork() rejects a caller with nothing to copy rather than
+ * reading whatever happened to be on the stack.
+ */
+static void test_processes(struct ktest_result *r)
+{
+    struct task *self = task_current();
+
+    KT_ASSERT(r, self != NULL);
+    KT_ASSERT(r, task_count() >= 2); /* at least idle and this one */
+    KT_ASSERT(r, task_count() <= TASK_MAX);
+
+    /* A kernel thread shares the kernel's address space; only a process gets
+     * one of its own. Conflating the two is how fork() ends up cloning the
+     * kernel's user half. */
+    KT_ASSERT(r, self->page_dir == vmm_kernel_pd_phys());
+    KT_ASSERT(r, !self->user);
+
+    /* No frame, no fork. The alternative - trusting a NULL - would have
+     * fork() copy 68 bytes from address zero into a child's stack. */
+    KT_EQ(r, task_fork(NULL), -1);
+
+    /* Kernel threads are children of whoever created them, and the earlier
+     * suites create several, so this task has a queue of collectable
+     * children before wait() can be asked what it does with none. Draining
+     * them is itself the test that wait() returns a plausible pid and a
+     * plausible exit code for each, and the bound is there because a wait()
+     * that invented children would otherwise spin here forever. */
+    u32 collected = 0;
+
+    for (u32 i = 0; i < TASK_MAX; i++) {
+        int st = 0x7F7F;
+        int pid = task_wait(&st);
+
+        if (pid < 0)
+            break;
+
+        collected++;
+        KT_ASSERT(r, pid > 0);
+        KT_ASSERT(r, st != 0x7F7F); /* wait() wrote a real status */
+    }
+
+    KT_ASSERT(r, collected < TASK_MAX);
+
+    /* Now there are none, and wait() must say so instead of blocking on a
+     * child that does not exist. */
+    int status = 0x5A5A;
+    KT_EQ(r, task_wait(&status), -1);
+    KT_EQ(r, status, 0x5A5A); /* untouched on failure */
+
+    /* exec()'s namespace. `init` has to be in it - that is the program the
+     * kernel starts - and the table has to end rather than run on. */
+    bool found_init = false;
+    u32 n = 0;
+
+    for (u32 i = 0; i < 16; i++) {
+        const char *name = usermode_program_name(i);
+
+        if (!name)
+            break;
+
+        n++;
+        if (strcmp(name, "init") == 0)
+            found_init = true;
+    }
+
+    KT_ASSERT(r, found_init);
+    KT_ASSERT(r, n >= 2); /* init, plus something for exec to switch to */
+    KT_ASSERT(r, usermode_program_name(n) == NULL);
+}
+
 static const struct ktest tests[] = {
     {"string", "string and formatting primitives", test_string},
     {"boot", "boot protocol normalisation", test_boot},
@@ -701,6 +928,8 @@ static const struct ktest tests[] = {
     {"sched", "task switching and sleeping", test_scheduler},
     {"syscall", "userspace pointer validation", test_syscall_guard},
     {"elf", "user ELF validation and rejection", test_elf},
+    {"vmspace", "address spaces and copy-on-write", test_address_spaces},
+    {"proc", "process table, fork guards, exec namespace", test_processes},
     {"ksyms", "embedded symbol table lookup", test_ksyms},
     {"profile", "sampling profiler attribution", test_profile},
 };

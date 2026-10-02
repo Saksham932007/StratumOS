@@ -105,13 +105,13 @@ Checking them takes 30 milliseconds.
 
 ## Layer 3: in-kernel suites
 
-`kernel/core/ktest.c` holds 12 suites and 213 assertions, run against
+`kernel/core/ktest.c` holds 14 suites and 269 assertions, run against
 real hardware state — a bitmap with actual firmware-reported memory in it, real
 page tables, a real heap, a real scheduler.
 
 ```
 stratum> selftest
-ktest: running 12 suites
+ktest: running 14 suites
 ktest: string ... PASS (15 checks)
 ktest: boot ... PASS (26 checks)
 ktest: cpu ... PASS (8 checks)
@@ -122,9 +122,11 @@ ktest: irq ... PASS (9 checks)
 ktest: sched ... PASS (10 checks)
 ktest: syscall ... PASS (8 checks)
 ktest: elf ... PASS (14 checks)
+ktest: vmspace ... PASS (42 checks)
+ktest: proc ... PASS (14 checks)
 ktest: ksyms ... PASS (12 checks)
 ktest: profile ... PASS (9 checks)
-ktest: summary 12/12 suites passed
+ktest: summary 14/14 suites passed
 ```
 
 | Suite | What it establishes |
@@ -139,6 +141,8 @@ ktest: summary 12/12 suites passed
 | `sched` | a created task actually runs, switch counts rise, and a 60 ms sleep takes at least 50 ms |
 | `syscall` | `user_range_ok` rejects kernel addresses, address-space wraps, unmapped pages, and ranges that *straddle* the kernel boundary |
 | `elf` | a deliberately corrupted image is refused for each of eight reasons, each with a stated cause |
+| `vmspace` | a fresh address space has the kernel's half and an empty user half; a clone marks the page read-only and COW in *both* copies; the reference count rises to 2; the first write allocates exactly one new frame and the second does not fault; destroying the clone drops the shared frame to zero references; and the frame count returns to where it started |
+| `proc` | a kernel thread shares the kernel's page directory; `task_fork(NULL)` is refused rather than reading address zero; `wait()` returns a real pid and status for each child and -1 once there are none; `exec`'s program table contains `init` and terminates |
 | `ksyms` | the table is sorted; every symbol resolves to itself; an exact address gives offset 0 and an address inside a function gives the right offset; addresses outside every executable section resolve to nothing |
 | `profile` | synthetic frames are attributed correctly — ring 0 inside a known function counts, ring 3 counts separately, an address outside `.text` counts as unattributed, and a stopped profiler ignores ticks |
 

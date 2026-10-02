@@ -20,12 +20,22 @@ enum {
     SYS_SLEEP = 4,
     SYS_UPTIME = 5,
     SYS_GETKEY = 6,
+    SYS_FORK = 7,
+    SYS_WAIT = 8,
+    SYS_GETPPID = 9,
+    SYS_EXEC = 10,
     SYS_MAX
 };
 
 #define SYS_EBADCALL (-1)
 #define SYS_EFAULT   (-2)
 #define SYS_EINVAL   (-3)
+#define SYS_ENOENT   (-4)
+
+/* The longest program name exec() will look at. There is no filesystem yet,
+ * so a name is a key into the table of programs embedded in the kernel
+ * image; the bound exists because the name arrives from ring 3. */
+#define SYS_NAME_MAX 32
 
 /* The vector the gate is installed on. */
 #define INT_SYSCALL  0x80

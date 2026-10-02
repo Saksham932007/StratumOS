@@ -17,8 +17,28 @@ stratum> ring3
   [ring3] kernel refused it (EFAULT) - the pointer check works
   [ring3] unmapped user pointer also refused
   [ring3] unknown syscall correctly rejected
+  [ring3] fork(): duplicating this process
+  [ring3] fork() returned 6 here - one call, two return values
+    [child] fork() returned 0 here; my pid is 6, my parent is 4
+    [child] I inherited 0x5a5a5a5a and am about to write over it
+    [child] my copy now reads 0x1234abcd
+    [child] exiting with 7
+  [ring3] wait() collected pid 6 with exit code 7
+  [ring3] my own copy still reads 0x5a5a5a5a - copy-on-write gave the child a private page
+  [ring3] wait() with no children returned -1, as it should
+  [ring3] exec(): forking a child to replace its own image
+    [child] exec("nonexistent") failed cleanly and I am still here
+  [exec] hello: a different image, running in the same process
+  [exec] getpid() returned 7 - the pid survived exec, the image did not
+  [exec] the rebuilt address space still refuses kernel and unmapped pointers
+  [exec] calling exit(0)
+  [ring3] the exec'd child (pid 7) exited with 0
   [ring3] calling exit(0)
 ```
+
+`fork`, copy-on-write, `exec` and `wait` have a document of their own:
+[PROCESSES.md](PROCESSES.md). This one is about the privilege boundary —
+how a program gets to ring 3 and what stops it coming back.
 
 ---
 
@@ -59,18 +79,26 @@ not share a page and can carry different permissions.
 The compiled ELF is stripped and embedded in the kernel image as a blob:
 
 ```make
-$(USER_BLOB): $(BUILD)/user/init.stripped.elf
+USER_PROGS := init hello
+
+$(BUILD)/user/%_blob.o: $(BUILD)/user/%.stripped.elf
 	cd $(dir $<) && $(OBJCOPY) -I binary -O elf32-i386 -B i386 \
-		--rename-section .data=.rodata.userblob,... \
-		init.stripped.elf $(notdir $@)
+		--rename-section .data=.rodata.userblob.$*,... \
+		$*.stripped.elf $(notdir $@)
 ```
 
-which gives the kernel `_binary_init_elf_start` and `_binary_init_elf_end`.
+which gives the kernel `_binary_init_elf_start` / `_binary_init_elf_end` and
+the same pair for `hello`. The rules are pattern rules over `USER_PROGS`, so
+adding a program is one word in the Makefile and one `.c` file; each gets its
+own section name so two blobs do not collide in the link.
+
 Embedding rather than reading from disk is a scoping decision — there is no
 filesystem yet — and the loader is written so that swapping the blob for a
-file read is the only change needed.
+file read is the only change needed. The table that maps a name to a blob is
+`exec`'s namespace, described in [PROCESSES.md](PROCESSES.md#execs-namespace).
 
-9 KiB of the kernel image, most of it page-alignment padding.
+`init` is 12 KiB and `hello` 8 KiB of the kernel image, most of it
+page-alignment padding.
 
 ---
 
@@ -83,11 +111,13 @@ is a contract with two versions.
 ```c
 enum {
     SYS_EXIT = 0, SYS_WRITE = 1, SYS_GETPID = 2, SYS_YIELD = 3,
-    SYS_SLEEP = 4, SYS_UPTIME = 5, SYS_GETKEY = 6, SYS_MAX
+    SYS_SLEEP = 4, SYS_UPTIME = 5, SYS_GETKEY = 6, SYS_FORK = 7,
+    SYS_WAIT = 8, SYS_GETPPID = 9, SYS_EXEC = 10, SYS_MAX
 };
 #define SYS_EBADCALL (-1)
 #define SYS_EFAULT   (-2)
 #define SYS_EINVAL   (-3)
+#define SYS_ENOENT   (-4)
 ```
 
 Nothing in it depends on kernel-internal headers, which is what lets the user
@@ -143,9 +173,14 @@ build time, so a user image that could reach into kernel space fails the build
 rather than the boot:
 
 ```
-embedded user program: 9120 bytes, entry 0x400080, 2 segment(s),
-                       all below 0xc0000000
+  `hello`: 8752 bytes, entry 0x400000, 2 segment(s), all below 0xc0000000
+  `init`: 12524 bytes, entry 0x4000f0, 3 segment(s), all below 0xc0000000
+embedded ring-3 programs: hello, init
 ```
+
+It checks every embedded program, not just the one the kernel starts, and it
+insists `init` is among them — a kernel whose `init` went missing would link
+and boot and then have nothing to run.
 
 The `elf` in-kernel test suite feeds the validator a deliberately corrupted
 copy — bad magic, ELFCLASS64, `EM_X86_64`, `ET_DYN`, 60000 program headers, a
@@ -233,16 +268,14 @@ line never does.
 
 ## Limits
 
-- **One address space.** There is a single page directory;
-  `context_switch()` does not touch `CR3`. Two user programs would share a
-  view of memory, and only one can be loaded at a time.
-- **No `fork`, `exec` or `wait`.** A task enters ring 3 once and leaves
-  through `exit`.
 - **No demand paging.** A program's whole image is mapped eagerly.
+  Copy-on-write is the only laziness in the memory manager.
 - **No NX.** Without PAE, x86 cannot mark a page non-executable, so
   "read-only" is enforced but "non-executable" is not.
-- **Seven system calls**, and no file descriptors — `write` goes to the
-  console unconditionally.
+- **Eleven system calls**, and no file descriptors — `write` goes to the
+  console unconditionally, so `fork` has no descriptor table to duplicate.
+- **No `argv` or environment.** `exec` takes a program name and nothing else.
 
-The first two are what per-process address spaces fix, and they are the next
-item in [ROADMAP.md](ROADMAP.md).
+What used to be at the top of this list — one address space, no `fork`, no
+`exec`, no `wait` — is now [PROCESSES.md](PROCESSES.md). NX and the rest of
+the hardening work are the next items in [ROADMAP.md](ROADMAP.md).

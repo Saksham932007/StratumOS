@@ -13,9 +13,10 @@ boot. This runs the checks whose failure modes are otherwise silent:
   * the higher-half split is real: the boot segment has VMA == LMA so that it
     can run with paging off, and every other segment is linked exactly
     KERNEL_VIRT_BASE above where it loads;
-  * the embedded user program is a valid ELF whose segments all lie below
+  * every embedded ring-3 program is a valid ELF whose segments all lie below
     KERNEL_VIRT_BASE - a user image that could map into kernel space would be
-    a request to overwrite the kernel;
+    a request to overwrite the kernel - and `init`, the one the kernel starts,
+    is among them;
   * no SSE/MMX instructions crept in from the compiler.
 
 Each of these has cost somebody an afternoon of QEMU bisection at some point.
@@ -25,6 +26,7 @@ Checking them takes 30 milliseconds.
 from __future__ import annotations
 
 import argparse
+import re
 import struct
 import subprocess
 import sys
@@ -214,9 +216,11 @@ class Checker:
         return None
 
     def check_embedded_user_program(self) -> None:
-        """The ring-3 program is a separate ELF embedded as a blob. Validate
-        it here, because a user image whose segments reach into kernel space
-        would be asking the kernel to overwrite itself on its behalf."""
+        """The ring-3 programs are separate ELFs embedded as blobs. Validate
+        every one of them here, because a user image whose segments reach into
+        kernel space would be asking the kernel to overwrite itself on its
+        behalf - and the loader's bounds checks are exactly the code that
+        should never be the only thing standing between the two."""
         try:
             out = subprocess.run(["nm", str(self.path)], capture_output=True,
                                  text=True, check=True).stdout
@@ -227,33 +231,53 @@ class Checker:
         syms: dict[str, int] = {}
         for line in out.splitlines():
             parts = line.split()
-            if len(parts) == 3 and parts[2].startswith("_binary_init_elf_"):
+            if len(parts) == 3 and parts[2].startswith("_binary_"):
                 syms[parts[2]] = int(parts[0], 16)
 
-        start = syms.get("_binary_init_elf_start")
-        end = syms.get("_binary_init_elf_end")
+        programs = sorted(
+            m.group(1) for m in
+            (re.fullmatch(r"_binary_(\w+)_elf_start", n) for n in syms)
+            if m
+        )
+
+        if not programs:
+            self.fail("no embedded user program found "
+                      "(_binary_*_elf_start not present). Ring 3 would have "
+                      "nothing to run.")
+            return
+
+        if "init" not in programs:
+            self.fail("the embedded program table has no `init`; that is the "
+                      "one the kernel starts at boot")
+
+        for name in programs:
+            self.check_one_user_program(name, syms)
+
+        self.note(f"embedded ring-3 programs: {', '.join(programs)}")
+
+    def check_one_user_program(self, name: str, syms: dict[str, int]) -> None:
+        start = syms.get(f"_binary_{name}_elf_start")
+        end = syms.get(f"_binary_{name}_elf_end")
 
         if start is None or end is None:
-            self.fail("the embedded user program is missing "
-                      "(_binary_init_elf_start/_end not found). Ring 3 would "
-                      "have nothing to run.")
+            self.fail(f"embedded program `{name}` has no start/end pair")
             return
 
         off = self.vaddr_to_offset(start)
         if off is None:
-            self.fail(f"the embedded user program's address {start:#x} is not "
+            self.fail(f"embedded program `{name}`: address {start:#x} is not "
                       f"inside any loadable segment")
             return
 
         blob = self.data[off:off + (end - start)]
 
         if len(blob) < 52 or blob[:4] != b"\x7fELF":
-            self.fail("the embedded user program is not an ELF file")
+            self.fail(f"embedded program `{name}` is not an ELF file")
             return
 
         e_type, e_machine = struct.unpack_from("<HH", blob, 16)
         if e_type != 2 or e_machine != 3:
-            self.fail(f"the embedded user program has e_type {e_type} / "
+            self.fail(f"embedded program `{name}` has e_type {e_type} / "
                       f"e_machine {e_machine}; ET_EXEC/EM_386 required")
             return
 
@@ -261,15 +285,15 @@ class Checker:
         u_phentsize, u_phnum = struct.unpack_from("<HH", blob, 42)
 
         if u_entry >= KERNEL_VIRT_BASE:
-            self.fail(f"the embedded user program's entry point {u_entry:#x} "
+            self.fail(f"embedded program `{name}`: entry point {u_entry:#x} "
                       f"is in kernel space")
 
         user_loads = 0
         for i in range(u_phnum):
             base = u_phoff + i * u_phentsize
             if base + 32 > len(blob):
-                self.fail("the embedded user program's program headers run "
-                          "past the end of the blob")
+                self.fail(f"embedded program `{name}`: program headers run "
+                          f"past the end of the blob")
                 return
             (p_type, _p_off, p_vaddr, _p_paddr, _p_filesz, p_memsz,
              _p_flags, _p_align) = struct.unpack_from("<8I", blob, base)
@@ -277,21 +301,23 @@ class Checker:
                 continue
             user_loads += 1
             if p_vaddr < PAGE:
-                self.fail(f"a user segment at {p_vaddr:#x} overlaps the null "
-                          f"page, which must stay unmapped")
+                self.fail(f"embedded program `{name}`: a segment at "
+                          f"{p_vaddr:#x} overlaps the null page, which must "
+                          f"stay unmapped")
             if p_vaddr >= KERNEL_VIRT_BASE or \
                p_vaddr + p_memsz > KERNEL_VIRT_BASE:
-                self.fail(f"a user segment spans {p_vaddr:#x}+{p_memsz:#x}, "
-                          f"reaching into kernel space")
+                self.fail(f"embedded program `{name}`: a segment spans "
+                          f"{p_vaddr:#x}+{p_memsz:#x}, reaching into kernel "
+                          f"space")
 
         if user_loads == 0:
-            self.fail("the embedded user program has no loadable segments")
+            self.fail(f"embedded program `{name}` has no loadable segments")
+            return
 
-        self.note(f"embedded user program: {len(blob)} bytes, entry "
-                  f"{u_entry:#x}, {user_loads} segment(s), all below "
-                  f"{KERNEL_VIRT_BASE:#x}")
+        self.note(f"  `{name}`: {len(blob)} bytes, entry {u_entry:#x}, "
+                  f"{user_loads} segment(s), all below {KERNEL_VIRT_BASE:#x}")
 
-    # ---- multiboot2 header ----    # ---- multiboot2 header ----------------------------------------------
+    # ---- multiboot2 header ----------------------------------------------
 
     def check_multiboot(self) -> None:
         window = self.data[:MB2_SEARCH_LIMIT]
