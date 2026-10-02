@@ -11,7 +11,9 @@
 #include <arch/cpu.h>
 #include <arch/idt.h>
 #include <arch/io.h>
+
 #include <drivers/vga.h>
+
 #include <kernel/console.h>
 #include <kernel/kernel.h>
 #include <kernel/panic.h>
@@ -36,7 +38,8 @@ void backtrace(u32 ebp, unsigned max_frames)
      * Resolve any of these with:
      *     addr2line -f -e build/stratum.debug.elf <address>
      */
-    kprintf("Call trace (return addresses; the faulting frame is EIP above):\n");
+    kprintf(
+        "Call trace (return addresses; the faulting frame is EIP above):\n");
 
     for (unsigned depth = 0; depth < max_frames; depth++) {
         u32 *frame = (u32 *)ebp;
@@ -64,14 +67,17 @@ static void panic_banner(void)
 {
     vga_set_attr(vga_attr(VGA_WHITE, VGA_RED));
     kprintf("\n");
-    kprintf("================================================================\n");
+    kprintf(
+        "================================================================\n");
     kprintf(" KERNEL PANIC - " STRATUM_NAME " " STRATUM_VERSION "\n");
-    kprintf("================================================================\n");
+    kprintf(
+        "================================================================\n");
 }
 
 static NORETURN void panic_finish(void)
 {
-    kprintf("================================================================\n");
+    kprintf(
+        "================================================================\n");
     vga_status_line(" KERNEL PANIC - system halted ",
                     vga_attr(VGA_WHITE, VGA_RED));
 

@@ -32,8 +32,8 @@ void log_emit(enum log_level level, const char *tag, const char *fmt, ...)
 #endif
 
 #define pr_err(...)   log_emit(LOG_ERROR, LOG_TAG, __VA_ARGS__)
-#define pr_warn(...)  log_emit(LOG_WARN,  LOG_TAG, __VA_ARGS__)
-#define pr_info(...)  log_emit(LOG_INFO,  LOG_TAG, __VA_ARGS__)
+#define pr_warn(...)  log_emit(LOG_WARN, LOG_TAG, __VA_ARGS__)
+#define pr_info(...)  log_emit(LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define pr_debug(...) log_emit(LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #define pr_trace(...) log_emit(LOG_TRACE, LOG_TAG, __VA_ARGS__)
 

@@ -86,7 +86,7 @@ CFLAGS := $(ARCHFLAG) -std=gnu11 -O2 -g3 \
           -fno-pie -fno-pic -fno-stack-protector \
           -fno-omit-frame-pointer -fno-asynchronous-unwind-tables \
           -mgeneral-regs-only -march=i686 \
-          -I$(INCLUDE) $(WARNINGS) -MMD -MP
+          -I$(INCLUDE) $(WARNINGS) -MMD -MP $(CFLAGS_EXTRA)
 
 ASFLAGS  := -f elf32 -g -F dwarf -I $(KSRC)/arch/x86/
 # --no-warn-rwx-segments: a kernel image is one writable, executable blob by

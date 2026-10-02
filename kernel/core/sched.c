@@ -22,11 +22,14 @@
 
 #include <arch/gdt.h>
 #include <arch/io.h>
+
 #include <drivers/timer.h>
+
 #include <kernel/log.h>
 #include <kernel/panic.h>
 #include <kernel/sched.h>
 #include <kernel/string.h>
+
 #include <mm/heap.h>
 
 /* Laid out by task_create() so that switch.asm's `ret` lands here. */

@@ -14,8 +14,10 @@
 
 #include <arch/io.h>
 #include <arch/irq.h>
+
 #include <drivers/keyboard.h>
 #include <drivers/serial.h>
+
 #include <kernel/log.h>
 
 static u16 serial_port;
@@ -171,15 +173,31 @@ static void rx_dispatch(u8 byte)
     case RX_SAW_BRACKET:
         rx_state = RX_NORMAL;
         switch (byte) {
-        case 'A': keyboard_inject(KEY_UP);    return;
-        case 'B': keyboard_inject(KEY_DOWN);  return;
-        case 'C': keyboard_inject(KEY_RIGHT); return;
-        case 'D': keyboard_inject(KEY_LEFT);  return;
-        case 'H': keyboard_inject(KEY_HOME);  return;
-        case 'F': keyboard_inject(KEY_END);   return;
-        case '3': keyboard_inject(KEY_DELETE); return; /* ESC [ 3 ~ */
-        case '~': return;                              /* the tilde tail */
-        default:  return;                              /* ignore the rest */
+        case 'A':
+            keyboard_inject(KEY_UP);
+            return;
+        case 'B':
+            keyboard_inject(KEY_DOWN);
+            return;
+        case 'C':
+            keyboard_inject(KEY_RIGHT);
+            return;
+        case 'D':
+            keyboard_inject(KEY_LEFT);
+            return;
+        case 'H':
+            keyboard_inject(KEY_HOME);
+            return;
+        case 'F':
+            keyboard_inject(KEY_END);
+            return;
+        case '3':
+            keyboard_inject(KEY_DELETE);
+            return; /* ESC [ 3 ~ */
+        case '~':
+            return; /* the tilde tail */
+        default:
+            return; /* ignore the rest */
         }
     }
 }

@@ -11,11 +11,13 @@
  *   * Row 0 is reserved for a status line, so scrolling must leave it alone.
  */
 #include <arch/io.h>
+
 #include <drivers/vga.h>
+
 #include <kernel/string.h>
 
-#define CRTC_INDEX 0x3D4
-#define CRTC_DATA  0x3D5
+#define CRTC_INDEX        0x3D4
+#define CRTC_DATA         0x3D5
 
 #define CRTC_CURSOR_START 0x0A
 #define CRTC_CURSOR_END   0x0B
@@ -23,7 +25,7 @@
 #define CRTC_CURSOR_LO    0x0F
 
 /* The top row is a status bar; normal output lives below it. */
-#define TEXT_TOP 1
+#define TEXT_TOP          1
 
 static volatile u16 *const fb = (volatile u16 *)VGA_PHYS;
 static size_t cur_x, cur_y;
@@ -58,8 +60,14 @@ void vga_init(void)
     vga_show_cursor();
 }
 
-void vga_set_attr(u8 a) { attr = a; }
-u8   vga_get_attr(void) { return attr; }
+void vga_set_attr(u8 a)
+{
+    attr = a;
+}
+u8 vga_get_attr(void)
+{
+    return attr;
+}
 
 void vga_clear(void)
 {

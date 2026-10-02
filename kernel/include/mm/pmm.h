@@ -13,18 +13,19 @@
 #define _MM_PMM_H
 
 #include <boot/bootinfo.h>
+
 #include <kernel/types.h>
 
-#define PAGE_SIZE  4096u
-#define PAGE_SHIFT 12
-#define PAGE_MASK  (PAGE_SIZE - 1)
+#define PAGE_SIZE     4096u
+#define PAGE_SHIFT    12
+#define PAGE_MASK     (PAGE_SIZE - 1)
 
-#define PFN(addr)       ((u32)(addr) >> PAGE_SHIFT)
-#define PFN_PHYS(pfn)   ((paddr_t)(pfn) << PAGE_SHIFT)
-#define PAGE_ALIGN(x)   ALIGN_UP((u32)(x), PAGE_SIZE)
-#define PAGE_TRUNC(x)   ALIGN_DOWN((u32)(x), PAGE_SIZE)
+#define PFN(addr)     ((u32)(addr) >> PAGE_SHIFT)
+#define PFN_PHYS(pfn) ((paddr_t)(pfn) << PAGE_SHIFT)
+#define PAGE_ALIGN(x) ALIGN_UP((u32)(x), PAGE_SIZE)
+#define PAGE_TRUNC(x) ALIGN_DOWN((u32)(x), PAGE_SIZE)
 
-#define PMM_NO_FRAME ((paddr_t)0)
+#define PMM_NO_FRAME  ((paddr_t)0)
 
 void pmm_init(const struct boot_params *bp);
 
@@ -32,8 +33,8 @@ void pmm_init(const struct boot_params *bp);
 paddr_t pmm_alloc_frame(void);
 /* Allocate `count` physically contiguous frames (for DMA-style needs). */
 paddr_t pmm_alloc_frames(size_t count);
-void    pmm_free_frame(paddr_t frame);
-void    pmm_free_frames(paddr_t frame, size_t count);
+void pmm_free_frame(paddr_t frame);
+void pmm_free_frames(paddr_t frame, size_t count);
 
 /* Mark a physical range as never-allocatable. Used for firmware regions,
  * the kernel image itself and the structures the bootloader left behind. */

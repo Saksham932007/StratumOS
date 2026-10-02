@@ -30,8 +30,8 @@ struct regs {
 struct idt_entry {
     u16 base_low;
     u16 selector;
-    u8  always0;
-    u8  flags;
+    u8 always0;
+    u8 flags;
     u16 base_high;
 } PACKED;
 
@@ -40,14 +40,14 @@ struct idt_ptr {
     u32 base;
 } PACKED;
 
-#define IDT_PRESENT   0x80
-#define IDT_RING0     0x00
-#define IDT_RING3     0x60
+#define IDT_PRESENT     0x80
+#define IDT_RING0       0x00
+#define IDT_RING3       0x60
 #define IDT_GATE_INT32  0x0E
 #define IDT_GATE_TRAP32 0x0F
 
-#define IDT_ENTRIES 256
-#define INT_SYSCALL 0x80
+#define IDT_ENTRIES     256
+#define INT_SYSCALL     0x80
 
 typedef void (*isr_handler_t)(struct regs *r);
 

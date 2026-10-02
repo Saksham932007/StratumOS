@@ -11,15 +11,19 @@
 #define _KERNEL_SPINLOCK_H
 
 #include <arch/io.h>
+
 #include <kernel/types.h>
 
 typedef struct {
     volatile u32 locked;
-    bool         saved_if;
-    const char  *name;
+    bool saved_if;
+    const char *name;
 } spinlock_t;
 
-#define SPINLOCK_INIT(nm) { 0, false, (nm) }
+#define SPINLOCK_INIT(nm) \
+    {                     \
+        0, false, (nm)    \
+    }
 
 void spin_lock(spinlock_t *lock);
 void spin_unlock(spinlock_t *lock);

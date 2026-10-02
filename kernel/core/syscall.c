@@ -14,12 +14,15 @@
 
 #include <arch/gdt.h>
 #include <arch/idt.h>
+
 #include <drivers/keyboard.h>
 #include <drivers/timer.h>
+
 #include <kernel/console.h>
 #include <kernel/log.h>
 #include <kernel/sched.h>
 #include <kernel/syscall.h>
+
 #include <mm/vmm.h>
 
 #define SYS_WRITE_MAX 1024

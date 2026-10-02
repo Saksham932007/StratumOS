@@ -17,37 +17,35 @@
 
 #include <arch/io.h>
 #include <arch/irq.h>
+
 #include <drivers/keyboard.h>
+
 #include <kernel/log.h>
 #include <kernel/sched.h>
 
 /* Scancode set 1, unshifted. Index is the make code. */
 static const char keymap[128] = {
-    0,    27,  '1', '2',  '3', '4', '5', '6',  /* 00-07 */
-    '7',  '8', '9', '0',  '-', '=', '\b', '\t',/* 08-0F */
-    'q',  'w', 'e', 'r',  't', 'y', 'u', 'i',  /* 10-17 */
-    'o',  'p', '[', ']',  '\n', 0,  'a', 's',  /* 18-1F */
-    'd',  'f', 'g', 'h',  'j', 'k', 'l', ';',  /* 20-27 */
-    '\'', '`', 0,   '\\', 'z', 'x', 'c', 'v',  /* 28-2F */
-    'b',  'n', 'm', ',',  '.', '/', 0,   '*',  /* 30-37 */
-    0,    ' ', 0,   0,    0,   0,   0,   0,    /* 38-3F */
-    0,    0,   0,   0,    0,   0,   0,   '7',  /* 40-47 */
-    '8',  '9', '-', '4',  '5', '6', '+', '1',  /* 48-4F */
-    '2',  '3', '0', '.',  0,   0,   0,   0,    /* 50-57 */
+    0,    27,  '1', '2',  '3',  '4', '5',  '6',  /* 00-07 */
+    '7',  '8', '9', '0',  '-',  '=', '\b', '\t', /* 08-0F */
+    'q',  'w', 'e', 'r',  't',  'y', 'u',  'i',  /* 10-17 */
+    'o',  'p', '[', ']',  '\n', 0,   'a',  's',  /* 18-1F */
+    'd',  'f', 'g', 'h',  'j',  'k', 'l',  ';',  /* 20-27 */
+    '\'', '`', 0,   '\\', 'z',  'x', 'c',  'v',  /* 28-2F */
+    'b',  'n', 'm', ',',  '.',  '/', 0,    '*',  /* 30-37 */
+    0,    ' ', 0,   0,    0,    0,   0,    0,    /* 38-3F */
+    0,    0,   0,   0,    0,    0,   0,    '7',  /* 40-47 */
+    '8',  '9', '-', '4',  '5',  '6', '+',  '1',  /* 48-4F */
+    '2',  '3', '0', '.',  0,    0,   0,    0,    /* 50-57 */
 };
 
 static const char keymap_shift[128] = {
-    0,    27,  '!', '@',  '#', '$', '%', '^',
-    '&',  '*', '(', ')',  '_', '+', '\b', '\t',
-    'Q',  'W', 'E', 'R',  'T', 'Y', 'U', 'I',
-    'O',  'P', '{', '}',  '\n', 0,  'A', 'S',
-    'D',  'F', 'G', 'H',  'J', 'K', 'L', ':',
-    '"',  '~', 0,   '|',  'Z', 'X', 'C', 'V',
-    'B',  'N', 'M', '<',  '>', '?', 0,   '*',
-    0,    ' ', 0,   0,    0,   0,   0,   0,
-    0,    0,   0,   0,    0,   0,   0,   '7',
-    '8',  '9', '-', '4',  '5', '6', '+', '1',
-    '2',  '3', '0', '.',  0,   0,   0,   0,
+    0,   27,   '!',  '@', '#', '$', '%', '^', '&', '*', '(', ')', '_',
+    '+', '\b', '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P',
+    '{', '}',  '\n', 0,   'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L',
+    ':', '"',  '~',  0,   '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<',
+    '>', '?',  0,    '*', 0,   ' ', 0,   0,   0,   0,   0,   0,   0,
+    0,   0,    0,    0,   0,   0,   '7', '8', '9', '-', '4', '5', '6',
+    '+', '1',  '2',  '3', '0', '.', 0,   0,   0,   0,
 };
 
 /* Scancodes (set 1) */
@@ -59,16 +57,16 @@ static const char keymap_shift[128] = {
 #define SC_NUMLOCK  0x45
 #define SC_EXTENDED 0xE0
 
-#define SC_UP     0x48
-#define SC_DOWN   0x50
-#define SC_LEFT   0x4B
-#define SC_RIGHT  0x4D
-#define SC_HOME   0x47
-#define SC_END    0x4F
-#define SC_PGUP   0x49
-#define SC_PGDN   0x51
-#define SC_DELETE 0x53
-#define SC_INSERT 0x52
+#define SC_UP       0x48
+#define SC_DOWN     0x50
+#define SC_LEFT     0x4B
+#define SC_RIGHT    0x4D
+#define SC_HOME     0x47
+#define SC_END      0x4F
+#define SC_PGUP     0x49
+#define SC_PGDN     0x51
+#define SC_DELETE   0x53
+#define SC_INSERT   0x52
 
 static volatile int ring[KBD_BUFFER_SIZE];
 static volatile u32 ring_head, ring_tail;
@@ -100,17 +98,28 @@ void keyboard_inject(int key)
 static int translate_extended(u8 code)
 {
     switch (code) {
-    case SC_UP:     return KEY_UP;
-    case SC_DOWN:   return KEY_DOWN;
-    case SC_LEFT:   return KEY_LEFT;
-    case SC_RIGHT:  return KEY_RIGHT;
-    case SC_HOME:   return KEY_HOME;
-    case SC_END:    return KEY_END;
-    case SC_PGUP:   return KEY_PGUP;
-    case SC_PGDN:   return KEY_PGDN;
-    case SC_DELETE: return KEY_DELETE;
-    case SC_INSERT: return KEY_INSERT;
-    default:        return -1;
+    case SC_UP:
+        return KEY_UP;
+    case SC_DOWN:
+        return KEY_DOWN;
+    case SC_LEFT:
+        return KEY_LEFT;
+    case SC_RIGHT:
+        return KEY_RIGHT;
+    case SC_HOME:
+        return KEY_HOME;
+    case SC_END:
+        return KEY_END;
+    case SC_PGUP:
+        return KEY_PGUP;
+    case SC_PGDN:
+        return KEY_PGDN;
+    case SC_DELETE:
+        return KEY_DELETE;
+    case SC_INSERT:
+        return KEY_INSERT;
+    default:
+        return -1;
     }
 }
 
@@ -199,7 +208,7 @@ static void keyboard_irq(struct regs *r)
         return;
 
     bool shift = (modifiers & KBD_MOD_SHIFT) != 0;
-    bool caps  = (modifiers & KBD_MOD_CAPS) != 0;
+    bool caps = (modifiers & KBD_MOD_CAPS) != 0;
     char ch = shift ? keymap_shift[code] : keymap[code];
 
     if (ch == 0)

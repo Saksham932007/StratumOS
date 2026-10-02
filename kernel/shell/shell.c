@@ -15,12 +15,14 @@
 #include <arch/cpu.h>
 #include <arch/io.h>
 #include <arch/irq.h>
+
 #include <drivers/keyboard.h>
 #include <drivers/pci.h>
 #include <drivers/rtc.h>
 #include <drivers/serial.h>
 #include <drivers/timer.h>
 #include <drivers/vga.h>
+
 #include <kernel/console.h>
 #include <kernel/kernel.h>
 #include <kernel/ktest.h>
@@ -32,6 +34,7 @@
 #include <kernel/string.h>
 #include <kernel/syscall.h>
 #include <kernel/usermode.h>
+
 #include <mm/heap.h>
 #include <mm/pmm.h>
 #include <mm/vmm.h>
@@ -106,7 +109,8 @@ static int cmd_version(int argc, char **argv)
     const struct boot_params *bp = kernel_boot_params();
 
     kprintf("%s %s\n", STRATUM_NAME, STRATUM_VERSION);
-    kprintf("  built     : " __DATE__ " " __TIME__ " with GCC " __VERSION__ "\n");
+    kprintf("  built     : " __DATE__ " " __TIME__ " with GCC " __VERSION__
+            "\n");
     kprintf("  boot via  : %s (%s)\n", bp ? bp->protocol_name : "?",
             bp ? bp->loader_name : "?");
     kprintf("  cmdline   : %s\n",
@@ -141,8 +145,8 @@ static int cmd_date(int argc, char **argv)
     struct rtc_time t;
     rtc_read(&t);
 
-    kprintf("%04u-%02u-%02u %02u:%02u:%02u UTC  (unix %llu)\n", t.year,
-            t.month, t.day, t.hour, t.minute, t.second, rtc_unix_time());
+    kprintf("%04u-%02u-%02u %02u:%02u:%02u UTC  (unix %llu)\n", t.year, t.month,
+            t.day, t.hour, t.minute, t.second, rtc_unix_time());
     return 0;
 }
 
@@ -230,8 +234,8 @@ static int cmd_ps(int argc, char **argv)
     UNUSED(argc);
     UNUSED(argv);
 
-    kprintf("  %4s  %-14s %-9s %8s %7s  %s\n", "PID", "NAME", "STATE",
-            "TICKS", "SWITCH", "STACK");
+    kprintf("  %4s  %-14s %-9s %8s %7s  %s\n", "PID", "NAME", "STATE", "TICKS",
+            "SWITCH", "STACK");
     sched_foreach(ps_row, NULL);
     kprintf("  %u context switches total\n", sched_switch_count());
     return 0;
@@ -271,9 +275,8 @@ static int cmd_pci(int argc, char **argv)
         const struct pci_device *d = pci_device_at(i);
         if (!d)
             continue;
-        kprintf("  %02x:%02x.%u %04x:%04x %-24s %s\n", d->bus, d->slot,
-                d->func, d->vendor_id, d->device_id,
-                pci_vendor_name(d->vendor_id),
+        kprintf("  %02x:%02x.%u %04x:%04x %-24s %s\n", d->bus, d->slot, d->func,
+                d->vendor_id, d->device_id, pci_vendor_name(d->vendor_id),
                 pci_class_name(d->class_code, d->subclass));
     }
     return 0;
@@ -437,7 +440,7 @@ static volatile u32 fault_readonly_addr;
  * the division is undefined and emits `ud2` instead of `idiv`, so the #DE this
  * command exists to show never happens. */
 static volatile int fault_dividend = 1;
-static volatile int fault_divisor;  /* left zero */
+static volatile int fault_divisor; /* left zero */
 
 static int cmd_fault(int argc, char **argv)
 {
@@ -567,28 +570,30 @@ static int cmd_halt(int argc, char **argv)
 }
 
 static const struct shell_command commands[] = {
-    { "help",     "help [command]",            "list commands, or explain one", cmd_help },
-    { "clear",    "clear",                     "clear the screen", cmd_clear },
-    { "echo",     "echo <words...>",           "print its arguments", cmd_echo },
-    { "version",  "version",                   "kernel version and build info", cmd_version },
-    { "uptime",   "uptime",                    "time since boot", cmd_uptime },
-    { "date",     "date",                      "read the hardware clock", cmd_date },
-    { "cpuinfo",  "cpuinfo",                   "CPU vendor, model and features", cmd_cpuinfo },
-    { "meminfo",  "meminfo",                   "physical, virtual and heap usage", cmd_meminfo },
-    { "ps",       "ps",                        "list tasks", cmd_ps },
-    { "irq",      "irq",                       "interrupt counters", cmd_irq },
-    { "pci",      "pci",                       "enumerate the PCI bus", cmd_pci },
-    { "pagemap",  "pagemap <address>",         "resolve a virtual address", cmd_pagemap },
-    { "hexdump",  "hexdump <address> [bytes]", "dump memory", cmd_hexdump },
-    { "log",      "log [level]",               "show or set the log level", cmd_log },
-    { "selftest", "selftest [suite|list]",     "run the in-kernel test suite", cmd_selftest },
-    { "ring3",    "ring3",                     "run the user-mode demo", cmd_ring3 },
-    { "stress",   "stress [workers] [rounds]", "hammer the heap from several tasks", cmd_stress },
-    { "fault",    "fault <null|unmapped|readonly|div0|ud|panic>",
-                                               "crash on purpose, to show the handlers", cmd_fault },
-    { "reboot",   "reboot",                    "reset the machine", cmd_reboot },
-    { "halt",     "halt",                      "stop the machine", cmd_halt },
-    { NULL, NULL, NULL, NULL },
+    {"help", "help [command]", "list commands, or explain one", cmd_help},
+    {"clear", "clear", "clear the screen", cmd_clear},
+    {"echo", "echo <words...>", "print its arguments", cmd_echo},
+    {"version", "version", "kernel version and build info", cmd_version},
+    {"uptime", "uptime", "time since boot", cmd_uptime},
+    {"date", "date", "read the hardware clock", cmd_date},
+    {"cpuinfo", "cpuinfo", "CPU vendor, model and features", cmd_cpuinfo},
+    {"meminfo", "meminfo", "physical, virtual and heap usage", cmd_meminfo},
+    {"ps", "ps", "list tasks", cmd_ps},
+    {"irq", "irq", "interrupt counters", cmd_irq},
+    {"pci", "pci", "enumerate the PCI bus", cmd_pci},
+    {"pagemap", "pagemap <address>", "resolve a virtual address", cmd_pagemap},
+    {"hexdump", "hexdump <address> [bytes]", "dump memory", cmd_hexdump},
+    {"log", "log [level]", "show or set the log level", cmd_log},
+    {"selftest", "selftest [suite|list]", "run the in-kernel test suite",
+     cmd_selftest},
+    {"ring3", "ring3", "run the user-mode demo", cmd_ring3},
+    {"stress", "stress [workers] [rounds]",
+     "hammer the heap from several tasks", cmd_stress},
+    {"fault", "fault <null|unmapped|readonly|div0|ud|panic>",
+     "crash on purpose, to show the handlers", cmd_fault},
+    {"reboot", "reboot", "reset the machine", cmd_reboot},
+    {"halt", "halt", "stop the machine", cmd_halt},
+    {NULL, NULL, NULL, NULL},
 };
 
 /* ---- line editing ------------------------------------------------------ */
@@ -611,8 +616,8 @@ static void history_add(const char *text)
 
     /* Skip an immediate repeat: pressing Enter twice should not fill the
      * history with the same line. */
-    if (history_count && strcmp(history[(history_count - 1) % SHELL_HISTORY],
-                                text) == 0)
+    if (history_count &&
+        strcmp(history[(history_count - 1) % SHELL_HISTORY], text) == 0)
         return;
 
     strlcpy(history[history_count % SHELL_HISTORY], text, SHELL_LINE_MAX);
@@ -735,7 +740,8 @@ NORETURN void shell_task(void *arg)
     kprintf("\n");
     vga_set_attr(vga_attr(VGA_LIGHT_CYAN, VGA_BLACK));
     kprintf("%s %s - type 'help' for commands, 'selftest' to run the "
-            "test suite\n", STRATUM_NAME, STRATUM_VERSION);
+            "test suite\n",
+            STRATUM_NAME, STRATUM_VERSION);
     vga_set_attr(vga_attr(VGA_LIGHT_GREY, VGA_BLACK));
     kprintf("%s", PROMPT);
 

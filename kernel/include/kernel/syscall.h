@@ -10,14 +10,15 @@
 #define _KERNEL_SYSCALL_H
 
 #include <arch/idt.h>
+
 #include <kernel/types.h>
 
 enum {
-    SYS_EXIT   = 0,
-    SYS_WRITE  = 1,
+    SYS_EXIT = 0,
+    SYS_WRITE = 1,
     SYS_GETPID = 2,
-    SYS_YIELD  = 3,
-    SYS_SLEEP  = 4,
+    SYS_YIELD = 3,
+    SYS_SLEEP = 4,
     SYS_UPTIME = 5,
     SYS_GETKEY = 6,
     SYS_MAX
@@ -28,7 +29,7 @@ enum {
 #define SYS_EINVAL   (-3)
 
 void syscall_init(void);
-u32  syscall_count(void);
+u32 syscall_count(void);
 
 /* Validate that a userspace buffer is mapped and user-accessible before the
  * kernel dereferences it. Never trust a pointer that came from ring 3. */

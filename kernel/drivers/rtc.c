@@ -15,19 +15,21 @@
 #define LOG_TAG "rtc"
 
 #include <arch/io.h>
+
 #include <drivers/rtc.h>
+
 #include <kernel/log.h>
 #include <kernel/string.h>
 
-#define RTC_SECONDS 0x00
-#define RTC_MINUTES 0x02
-#define RTC_HOURS   0x04
-#define RTC_DAY     0x07
-#define RTC_MONTH   0x08
-#define RTC_YEAR    0x09
-#define RTC_CENTURY 0x32
-#define RTC_STATUS_A 0x0A
-#define RTC_STATUS_B 0x0B
+#define RTC_SECONDS                 0x00
+#define RTC_MINUTES                 0x02
+#define RTC_HOURS                   0x04
+#define RTC_DAY                     0x07
+#define RTC_MONTH                   0x08
+#define RTC_YEAR                    0x09
+#define RTC_CENTURY                 0x32
+#define RTC_STATUS_A                0x0A
+#define RTC_STATUS_B                0x0B
 
 #define STATUS_A_UPDATE_IN_PROGRESS 0x80
 #define STATUS_B_24_HOUR            0x02
@@ -96,10 +98,10 @@ void rtc_read(struct rtc_time *out)
 
         a.second = cmos_read(RTC_SECONDS);
         a.minute = cmos_read(RTC_MINUTES);
-        a.hour   = cmos_read(RTC_HOURS);
-        a.day    = cmos_read(RTC_DAY);
-        a.month  = cmos_read(RTC_MONTH);
-        a.year   = cmos_read(RTC_YEAR);
+        a.hour = cmos_read(RTC_HOURS);
+        a.day = cmos_read(RTC_DAY);
+        a.month = cmos_read(RTC_MONTH);
+        a.year = cmos_read(RTC_YEAR);
         u8 cent_a = have_century ? cmos_read(RTC_CENTURY) : 0;
 
         for (unsigned spin = 0; spin < 100000 && update_in_progress(); spin++)
@@ -107,10 +109,10 @@ void rtc_read(struct rtc_time *out)
 
         b.second = cmos_read(RTC_SECONDS);
         b.minute = cmos_read(RTC_MINUTES);
-        b.hour   = cmos_read(RTC_HOURS);
-        b.day    = cmos_read(RTC_DAY);
-        b.month  = cmos_read(RTC_MONTH);
-        b.year   = cmos_read(RTC_YEAR);
+        b.hour = cmos_read(RTC_HOURS);
+        b.day = cmos_read(RTC_DAY);
+        b.month = cmos_read(RTC_MONTH);
+        b.year = cmos_read(RTC_YEAR);
         u8 cent_b = have_century ? cmos_read(RTC_CENTURY) : 0;
 
         if (memcmp(&a, &b, sizeof(a)) == 0 && cent_a == cent_b) {
@@ -127,9 +129,9 @@ void rtc_read(struct rtc_time *out)
     if (!(status_b & STATUS_B_BINARY)) {
         a.second = from_bcd(a.second);
         a.minute = from_bcd(a.minute);
-        a.day    = from_bcd(a.day);
-        a.month  = from_bcd(a.month);
-        a.year   = from_bcd((u8)a.year);
+        a.day = from_bcd(a.day);
+        a.month = from_bcd(a.month);
+        a.year = from_bcd((u8)a.year);
         century_raw = from_bcd(century_raw);
         /* The hour's PM flag lives in bit 7 and must survive BCD conversion,
          * so it is masked off first and re-applied. */
@@ -150,9 +152,9 @@ void rtc_read(struct rtc_time *out)
          * below 70 means the 2000s. */
         out->year = (u16)((a.year < 70 ? 2000 : 1900) + a.year);
 
-    out->month  = a.month;
-    out->day    = a.day;
-    out->hour   = a.hour;
+    out->month = a.month;
+    out->day = a.day;
+    out->hour = a.hour;
     out->minute = a.minute;
     out->second = a.second;
 }
@@ -180,7 +182,8 @@ u64 rtc_unix_time(void)
     days += month_start[month - 1];
 
     /* This year's leap day only counts once we are past February. */
-    if (month > 2 && (((year % 4 == 0) && (year % 100 != 0)) || year % 400 == 0))
+    if (month > 2 &&
+        (((year % 4 == 0) && (year % 100 != 0)) || year % 400 == 0))
         days += 1;
 
     days += (t.day ? t.day - 1u : 0u);

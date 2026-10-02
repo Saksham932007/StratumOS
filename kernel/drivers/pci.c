@@ -18,7 +18,9 @@
 #define LOG_TAG "pci"
 
 #include <arch/io.h>
+
 #include <drivers/pci.h>
+
 #include <kernel/log.h>
 #include <kernel/string.h>
 
@@ -32,7 +34,7 @@
 #define PCI_BAR0        0x10
 #define PCI_IRQ_LINE    0x3C
 
-#define PCI_NONE 0xFFFF
+#define PCI_NONE        0xFFFF
 
 static struct pci_device devices[PCI_MAX_DEVICES];
 static u32 device_count;
@@ -78,55 +80,89 @@ const char *pci_vendor_name(u16 vendor_id)
     /* Only the handful we are likely to meet in a VM or on a test board.
      * A full database belongs in userspace, not in a kernel image. */
     switch (vendor_id) {
-    case 0x8086: return "Intel";
-    case 0x1022: return "AMD";
-    case 0x10DE: return "NVIDIA";
-    case 0x1002: return "ATI/AMD";
-    case 0x1234: return "QEMU (Bochs VGA)";
-    case 0x1AF4: return "Red Hat (virtio)";
-    case 0x1B36: return "Red Hat (QEMU device)";
-    case 0x15AD: return "VMware";
-    case 0x80EE: return "VirtualBox";
-    case 0x1013: return "Cirrus Logic";
-    case 0x106B: return "Apple";
-    case 0x5333: return "S3";
-    default:     return "unknown vendor";
+    case 0x8086:
+        return "Intel";
+    case 0x1022:
+        return "AMD";
+    case 0x10DE:
+        return "NVIDIA";
+    case 0x1002:
+        return "ATI/AMD";
+    case 0x1234:
+        return "QEMU (Bochs VGA)";
+    case 0x1AF4:
+        return "Red Hat (virtio)";
+    case 0x1B36:
+        return "Red Hat (QEMU device)";
+    case 0x15AD:
+        return "VMware";
+    case 0x80EE:
+        return "VirtualBox";
+    case 0x1013:
+        return "Cirrus Logic";
+    case 0x106B:
+        return "Apple";
+    case 0x5333:
+        return "S3";
+    default:
+        return "unknown vendor";
     }
 }
 
 const char *pci_class_name(u8 class_code, u8 subclass)
 {
     switch (class_code) {
-    case 0x00: return "unclassified";
+    case 0x00:
+        return "unclassified";
     case 0x01:
         switch (subclass) {
-        case 0x00: return "SCSI controller";
-        case 0x01: return "IDE controller";
-        case 0x06: return "SATA controller";
-        case 0x08: return "NVMe controller";
-        default:   return "storage controller";
+        case 0x00:
+            return "SCSI controller";
+        case 0x01:
+            return "IDE controller";
+        case 0x06:
+            return "SATA controller";
+        case 0x08:
+            return "NVMe controller";
+        default:
+            return "storage controller";
         }
-    case 0x02: return "network controller";
-    case 0x03: return "display controller";
-    case 0x04: return "multimedia controller";
-    case 0x05: return "memory controller";
+    case 0x02:
+        return "network controller";
+    case 0x03:
+        return "display controller";
+    case 0x04:
+        return "multimedia controller";
+    case 0x05:
+        return "memory controller";
     case 0x06:
         switch (subclass) {
-        case 0x00: return "host bridge";
-        case 0x01: return "ISA bridge";
-        case 0x04: return "PCI-to-PCI bridge";
-        default:   return "bridge";
+        case 0x00:
+            return "host bridge";
+        case 0x01:
+            return "ISA bridge";
+        case 0x04:
+            return "PCI-to-PCI bridge";
+        default:
+            return "bridge";
         }
-    case 0x07: return "communication controller";
-    case 0x08: return "system peripheral";
-    case 0x09: return "input device";
+    case 0x07:
+        return "communication controller";
+    case 0x08:
+        return "system peripheral";
+    case 0x09:
+        return "input device";
     case 0x0C:
         switch (subclass) {
-        case 0x03: return "USB controller";
-        default:   return "serial bus controller";
+        case 0x03:
+            return "USB controller";
+        default:
+            return "serial bus controller";
         }
-    case 0x0D: return "wireless controller";
-    default:   return "other device";
+    case 0x0D:
+        return "wireless controller";
+    default:
+        return "other device";
     }
 }
 
@@ -165,8 +201,7 @@ void pci_init(void)
 
     for (u32 bus = 0; bus < 256; bus++) {
         for (u32 slot = 0; slot < 32; slot++) {
-            u16 vendor = pci_config_read16((u8)bus, (u8)slot, 0,
-                                           PCI_VENDOR_ID);
+            u16 vendor = pci_config_read16((u8)bus, (u8)slot, 0, PCI_VENDOR_ID);
             if (vendor == PCI_NONE)
                 continue;
 
@@ -174,8 +209,7 @@ void pci_init(void)
 
             /* Bit 7 of the header type marks a multi-function device. Only
              * then is it meaningful to probe functions 1-7. */
-            u8 header = pci_config_read8((u8)bus, (u8)slot, 0,
-                                         PCI_HEADER_TYPE);
+            u8 header = pci_config_read8((u8)bus, (u8)slot, 0, PCI_HEADER_TYPE);
             if (!(header & 0x80))
                 continue;
 

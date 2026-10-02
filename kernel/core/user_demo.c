@@ -107,8 +107,7 @@ static USER_RODATA char msg_hello[] =
 static USER_RODATA char msg_pid[] = "  [ring3] getpid() returned ";
 static USER_RODATA char msg_uptime[] = "  [ring3] uptime() returned ";
 static USER_RODATA char msg_seconds[] = " s\n";
-static USER_RODATA char msg_yield[] =
-    "  [ring3] yielded and was rescheduled\n";
+static USER_RODATA char msg_yield[] = "  [ring3] yielded and was rescheduled\n";
 static USER_RODATA char msg_slept[] = "  [ring3] slept 50 ms via syscall\n";
 static USER_RODATA char msg_fault[] =
     "  [ring3] asking the kernel to read a kernel address on my behalf\n";

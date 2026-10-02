@@ -16,6 +16,7 @@
 #include <arch/idt.h>
 #include <arch/io.h>
 #include <arch/irq.h>
+
 #include <kernel/log.h>
 #include <kernel/string.h>
 
@@ -69,7 +70,7 @@ static void pic_remap(void)
      * the slave PIC can never deliver anything. Drivers unmask their own
      * line when they are ready to receive - so an interrupt cannot arrive
      * before its handler is installed. */
-    irq_mask_cache = (u16)~(1u << IRQ_CASCADE);
+    irq_mask_cache = (u16) ~(1u << IRQ_CASCADE);
     pic_write_masks();
 }
 
@@ -123,7 +124,7 @@ void irq_unmask(unsigned irq)
 {
     if (irq >= IRQ_COUNT)
         return;
-    irq_mask_cache &= (u16)~(1u << irq);
+    irq_mask_cache &= (u16) ~(1u << irq);
     pic_write_masks();
 }
 

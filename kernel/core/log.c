@@ -6,6 +6,7 @@
  * at wording.
  */
 #include <drivers/timer.h>
+
 #include <kernel/console.h>
 #include <kernel/log.h>
 #include <kernel/string.h>

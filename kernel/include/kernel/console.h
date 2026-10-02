@@ -11,9 +11,9 @@
 #include <kernel/types.h>
 
 enum console_sink {
-    CONSOLE_SINK_VGA    = 1 << 0,
+    CONSOLE_SINK_VGA = 1 << 0,
     CONSOLE_SINK_SERIAL = 1 << 1,
-    CONSOLE_SINK_ALL    = CONSOLE_SINK_VGA | CONSOLE_SINK_SERIAL,
+    CONSOLE_SINK_ALL = CONSOLE_SINK_VGA | CONSOLE_SINK_SERIAL,
 };
 
 void console_init(void);

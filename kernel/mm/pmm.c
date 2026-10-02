@@ -23,17 +23,18 @@
 #include <kernel/log.h>
 #include <kernel/panic.h>
 #include <kernel/string.h>
+
 #include <mm/pmm.h>
 
 #define BITS_PER_WORD 32
 
 static u32 *bitmap;
-static u32  bitmap_words;
-static u32  total_frames;
-static u32  used_frames;
-static u32  reserved_frames;
-static u64  highest_addr;
-static u32  alloc_calls, free_calls;
+static u32 bitmap_words;
+static u32 total_frames;
+static u32 used_frames;
+static u32 reserved_frames;
+static u64 highest_addr;
+static u32 alloc_calls, free_calls;
 
 /* Rotating search hint: without it, every allocation rescans the low frames
  * that are permanently reserved. */
@@ -58,7 +59,7 @@ static inline void frame_clear(u32 pfn)
 static void mark_range_free(paddr_t start, paddr_t end)
 {
     u32 first = PFN(PAGE_ALIGN(start));
-    u32 last  = PFN(PAGE_TRUNC(end));
+    u32 last = PFN(PAGE_TRUNC(end));
 
     for (u32 pfn = first; pfn < last && pfn < total_frames; pfn++) {
         if (frame_is_set(pfn)) {
@@ -74,7 +75,7 @@ void pmm_reserve_range(paddr_t start, paddr_t end)
      * because handing out the rest of it would hand out part of something
      * that matters. */
     u32 first = PFN(PAGE_TRUNC(start));
-    u32 last  = PFN(PAGE_ALIGN(end));
+    u32 last = PFN(PAGE_ALIGN(end));
 
     for (u32 pfn = first; pfn < last && pfn < total_frames; pfn++) {
         if (!frame_is_set(pfn)) {
@@ -170,7 +171,7 @@ paddr_t pmm_alloc_frame(void)
      * compare instead of 32. */
     for (int pass = 0; pass < 2; pass++) {
         u32 from = (pass == 0) ? search_hint : 0;
-        u32 to   = (pass == 0) ? total_frames : search_hint;
+        u32 to = (pass == 0) ? total_frames : search_hint;
 
         for (u32 word = from / BITS_PER_WORD; word < bitmap_words; word++) {
             if (bitmap[word] == 0xFFFFFFFFu)
@@ -271,11 +272,11 @@ void pmm_get_stats(struct pmm_stats *out)
     if (!out)
         return;
 
-    out->total_frames    = total_frames;
-    out->used_frames     = used_frames;
-    out->free_frames     = total_frames - used_frames;
+    out->total_frames = total_frames;
+    out->used_frames = used_frames;
+    out->free_frames = total_frames - used_frames;
     out->reserved_frames = reserved_frames;
-    out->highest_addr    = highest_addr;
-    out->alloc_calls     = alloc_calls;
-    out->free_calls      = free_calls;
+    out->highest_addr = highest_addr;
+    out->alloc_calls = alloc_calls;
+    out->free_calls = free_calls;
 }

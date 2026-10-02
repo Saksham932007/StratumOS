@@ -15,14 +15,14 @@
 #define PIT_CH0     0x40
 #define PIT_CMD     0x43
 
-#define TIMER_HZ 100u
+#define TIMER_HZ    100u
 
 void timer_init(u32 hz);
-u64  timer_ticks(void);
-u32  timer_hz(void);
-u32  timer_actual_hz_milli(void); /* real frequency * 1000, for reporting */
-u64  timer_ms(void);
-u32  timer_uptime_seconds(void);
+u64 timer_ticks(void);
+u32 timer_hz(void);
+u32 timer_actual_hz_milli(void); /* real frequency * 1000, for reporting */
+u64 timer_ms(void);
+u32 timer_uptime_seconds(void);
 void timer_busy_wait_ms(u32 ms);
 
 #endif /* _DRIVERS_TIMER_H */

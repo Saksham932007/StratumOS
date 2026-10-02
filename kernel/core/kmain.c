@@ -24,12 +24,14 @@
 #include <arch/idt.h>
 #include <arch/io.h>
 #include <arch/irq.h>
+
 #include <drivers/keyboard.h>
 #include <drivers/pci.h>
 #include <drivers/rtc.h>
 #include <drivers/serial.h>
 #include <drivers/timer.h>
 #include <drivers/vga.h>
+
 #include <kernel/console.h>
 #include <kernel/kernel.h>
 #include <kernel/ktest.h>
@@ -41,6 +43,7 @@
 #include <kernel/string.h>
 #include <kernel/syscall.h>
 #include <kernel/usermode.h>
+
 #include <mm/heap.h>
 #include <mm/pmm.h>
 #include <mm/vmm.h>
@@ -75,8 +78,7 @@ static bool cmdline_has(const char *cmd, const char *flag)
         if (p != cmd && p[-1] != ' ')
             continue;
         if (strncmp(p, flag, flag_len) == 0 &&
-            (p[flag_len] == '\0' || p[flag_len] == ' ' ||
-             p[flag_len] == '='))
+            (p[flag_len] == '\0' || p[flag_len] == ' ' || p[flag_len] == '='))
             return true;
     }
     return false;
@@ -118,8 +120,8 @@ static void banner(void)
      * dashes, so the frame cannot drift out of alignment when the version
      * string changes length. */
     width = ksnprintf(title, sizeof(title),
-                      "%s %s  -  x86 kernel: real mode to ring 3",
-                      STRATUM_NAME, STRATUM_VERSION);
+                      "%s %s  -  x86 kernel: real mode to ring 3", STRATUM_NAME,
+                      STRATUM_VERSION);
 
     vga_set_attr(vga_attr(VGA_LIGHT_CYAN, VGA_BLACK));
     kprintf("\n  .");
@@ -151,10 +153,10 @@ static void status_task(void *arg)
 
         ksnprintf(bar, sizeof(bar),
                   " %s %s  up %02u:%02u:%02u  mem %u/%u MiB  tasks:%u  "
-                  "ctxsw:%u", STRATUM_NAME, STRATUM_VERSION, secs / 3600,
-                  (secs / 60) % 60, secs % 60,
-                  (pm.used_frames * 4) / 1024, (pm.total_frames * 4) / 1024,
-                  1u, sched_switch_count());
+                  "ctxsw:%u",
+                  STRATUM_NAME, STRATUM_VERSION, secs / 3600, (secs / 60) % 60,
+                  secs % 60, (pm.used_frames * 4) / 1024,
+                  (pm.total_frames * 4) / 1024, 1u, sched_switch_count());
 
         vga_status_line(bar, vga_attr(VGA_BLACK, VGA_LIGHT_GREY));
         task_sleep_ms(250);
@@ -190,8 +192,8 @@ static void autotest_task(void *arg)
     kprintf("\n");
     unsigned failed = ktest_run_all();
 
-    kprintf("ktest: %s\n", failed == 0 ? "ALL TESTS PASSED"
-                                       : "THERE WERE FAILURES");
+    kprintf("ktest: %s\n",
+            failed == 0 ? "ALL TESTS PASSED" : "THERE WERE FAILURES");
     kprintf("stratum: autotest complete, shutting down\n");
 
     timer_busy_wait_ms(50);

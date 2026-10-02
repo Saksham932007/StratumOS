@@ -23,10 +23,12 @@
 
 #include <arch/idt.h>
 #include <arch/io.h>
+
 #include <kernel/kernel.h>
 #include <kernel/log.h>
 #include <kernel/panic.h>
 #include <kernel/string.h>
+
 #include <mm/pmm.h>
 #include <mm/vmm.h>
 
@@ -34,8 +36,8 @@
 #define PD_VADDR       0xFFFFF000u
 #define PT_VADDR(pdi)  (0xFFC00000u + ((u32)(pdi) << PAGE_SHIFT))
 
-#define CR0_PG 0x80000000u
-#define CR0_WP 0x00010000u
+#define CR0_PG         0x80000000u
+#define CR0_WP         0x00010000u
 
 static paddr_t pd_phys;
 static bool paging_on;
@@ -96,7 +98,8 @@ bool vmm_map(vaddr_t va, paddr_t pa, u32 flags)
 
     if (pdi == RECURSIVE_SLOT)
         panic("vmm_map(%p): refusing to map over the recursive page-table "
-              "window", (void *)va);
+              "window",
+              (void *)va);
 
     if (!ensure_table(pdi, flags))
         return false;
@@ -320,7 +323,8 @@ void vmm_init(void)
     /* ...unless a loader put something we still need down there. No loader in
      * practice does, but failing loudly beats faulting mysteriously. */
     const struct boot_params *bp = kernel_boot_params();
-    if (bp && bp->reserved_hi > bp->reserved_lo && bp->reserved_lo < PAGE_SIZE) {
+    if (bp && bp->reserved_hi > bp->reserved_lo &&
+        bp->reserved_lo < PAGE_SIZE) {
         pr_warn("the loader's info block overlaps the null page; mapping it "
                 "and giving up NULL-dereference detection");
         if (!vmm_map(0, 0, PTE_PRESENT | PTE_WRITE))
@@ -343,8 +347,8 @@ void vmm_init(void)
     paging_on = true;
 
     pr_info("paging enabled: %u MiB identity-mapped, directory at %p, "
-            "%u page tables", VMM_IDENTITY_SIZE / MIB, (void *)pd_phys,
-            stat_page_tables);
+            "%u page tables",
+            VMM_IDENTITY_SIZE / MIB, (void *)pd_phys, stat_page_tables);
 }
 
 bool vmm_is_enabled(void)
@@ -357,7 +361,7 @@ void vmm_get_stats(struct vmm_stats *out)
     if (!out)
         return;
 
-    out->page_tables  = stat_page_tables;
+    out->page_tables = stat_page_tables;
     out->mapped_pages = stat_mapped_pages;
-    out->page_faults  = stat_page_faults;
+    out->page_faults = stat_page_faults;
 }

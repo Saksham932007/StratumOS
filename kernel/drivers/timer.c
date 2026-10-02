@@ -14,7 +14,9 @@
 
 #include <arch/io.h>
 #include <arch/irq.h>
+
 #include <drivers/timer.h>
+
 #include <kernel/log.h>
 #include <kernel/sched.h>
 

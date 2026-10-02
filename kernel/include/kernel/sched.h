@@ -10,6 +10,7 @@
 #define _KERNEL_SCHED_H
 
 #include <arch/idt.h>
+
 #include <kernel/types.h>
 
 #define TASK_NAME_MAX   24
@@ -29,17 +30,17 @@ enum task_state {
 typedef void (*task_entry_t)(void *arg);
 
 struct task {
-    u32 saved_esp;              /* must stay first: switch.asm indexes it */
+    u32 saved_esp; /* must stay first: switch.asm indexes it */
     u32 pid;
     char name[TASK_NAME_MAX];
     enum task_state state;
     u32 quantum_left;
-    u32 ticks_total;            /* timer ticks spent running */
+    u32 ticks_total; /* timer ticks spent running */
     u32 switches;
-    u64 wake_at;                /* tick to wake a sleeper */
+    u64 wake_at; /* tick to wake a sleeper */
     void *stack_base;
     size_t stack_size;
-    u32 kernel_esp0;            /* ring-0 stack top for the TSS */
+    u32 kernel_esp0; /* ring-0 stack top for the TSS */
     int exit_code;
     bool user;
     struct task *next;

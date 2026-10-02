@@ -22,19 +22,19 @@
 #define GDT_TSS         5
 #define GDT_ENTRIES     6
 
-#define SEL_KERNEL_CODE (GDT_KERNEL_CODE * 8)        /* 0x08 */
-#define SEL_KERNEL_DATA (GDT_KERNEL_DATA * 8)        /* 0x10 */
-#define SEL_USER_CODE   ((GDT_USER_CODE * 8) | 3)    /* 0x1B, RPL 3 */
-#define SEL_USER_DATA   ((GDT_USER_DATA * 8) | 3)    /* 0x23, RPL 3 */
-#define SEL_TSS         (GDT_TSS * 8)                /* 0x28 */
+#define SEL_KERNEL_CODE (GDT_KERNEL_CODE * 8)     /* 0x08 */
+#define SEL_KERNEL_DATA (GDT_KERNEL_DATA * 8)     /* 0x10 */
+#define SEL_USER_CODE   ((GDT_USER_CODE * 8) | 3) /* 0x1B, RPL 3 */
+#define SEL_USER_DATA   ((GDT_USER_DATA * 8) | 3) /* 0x23, RPL 3 */
+#define SEL_TSS         (GDT_TSS * 8)             /* 0x28 */
 
 struct gdt_entry {
     u16 limit_low;
     u16 base_low;
-    u8  base_mid;
-    u8  access;
-    u8  granularity;
-    u8  base_high;
+    u8 base_mid;
+    u8 access;
+    u8 granularity;
+    u8 base_high;
 } PACKED;
 
 struct gdt_ptr {
@@ -58,12 +58,12 @@ struct tss_entry {
 } PACKED;
 
 /* Access byte bits */
-#define GDT_PRESENT  0x80
-#define GDT_RING0    0x00
-#define GDT_RING3    0x60
-#define GDT_SEGMENT  0x10
-#define GDT_EXEC     0x08
-#define GDT_RW       0x02
+#define GDT_PRESENT    0x80
+#define GDT_RING0      0x00
+#define GDT_RING3      0x60
+#define GDT_SEGMENT    0x10
+#define GDT_EXEC       0x08
+#define GDT_RW         0x02
 
 /* Granularity byte bits */
 #define GDT_GRAN_4K    0x80

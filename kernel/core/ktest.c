@@ -19,8 +19,10 @@
 #include <arch/cpu.h>
 #include <arch/io.h>
 #include <arch/irq.h>
-#include <drivers/vga.h>
+
 #include <drivers/timer.h>
+#include <drivers/vga.h>
+
 #include <kernel/console.h>
 #include <kernel/kernel.h>
 #include <kernel/ktest.h>
@@ -29,6 +31,7 @@
 #include <kernel/sched.h>
 #include <kernel/string.h>
 #include <kernel/syscall.h>
+
 #include <mm/heap.h>
 #include <mm/pmm.h>
 #include <mm/vmm.h>
@@ -89,8 +92,8 @@ static void test_pmm(struct ktest_result *r)
     pmm_get_stats(&before);
     KT_ASSERT(r, before.total_frames > 0);
     KT_ASSERT(r, before.free_frames > 0);
-    KT_ASSERT(r, before.used_frames + before.free_frames ==
-                     before.total_frames);
+    KT_ASSERT(r,
+              before.used_frames + before.free_frames == before.total_frames);
 
     paddr_t a = pmm_alloc_frame();
     KT_ASSERT(r, a != PMM_NO_FRAME);
@@ -335,7 +338,7 @@ static void test_interrupts(struct ktest_result *r)
      * is an end-to-end check of the whole stub -> dispatch -> iret path: if
      * the frame layout in isr.asm and struct regs ever disagree again, the
      * kernel will not survive this line. */
-    __asm__ volatile("int $0x03"); /* non-fatal breakpoint probe */
+    __asm__ volatile("int $0x03");   /* non-fatal breakpoint probe */
     KT_ASSERT(r, timer_ticks() > 0); /* still alive and still ticking */
 
     /* Interrupt save/restore has to nest correctly. */
@@ -373,8 +376,8 @@ static void test_scheduler(struct ktest_result *r)
     u32 switches_before = sched_switch_count();
 
     worker_runs = 0;
-    struct task *w = task_create("ktest-worker", test_worker,
-                                 (void *)(uintptr_t)5);
+    struct task *w =
+        task_create("ktest-worker", test_worker, (void *)(uintptr_t)5);
     KT_ASSERT(r, w != NULL);
 
     if (w) {
@@ -462,15 +465,15 @@ static void test_syscall_guard(struct ktest_result *r)
 /* ---- registry ---------------------------------------------------------- */
 
 static const struct ktest tests[] = {
-    { "string",  "string and formatting primitives", test_string },
-    { "boot",    "boot protocol normalisation",      test_boot },
-    { "cpu",     "CPU identification and mode",      test_cpu },
-    { "pmm",     "physical frame allocator",         test_pmm },
-    { "vmm",     "paging: map, translate, unmap",    test_vmm },
-    { "heap",    "kmalloc/kfree and coalescing",     test_heap },
-    { "irq",     "interrupt delivery and the timer", test_interrupts },
-    { "sched",   "task switching and sleeping",      test_scheduler },
-    { "syscall", "userspace pointer validation",     test_syscall_guard },
+    {"string", "string and formatting primitives", test_string},
+    {"boot", "boot protocol normalisation", test_boot},
+    {"cpu", "CPU identification and mode", test_cpu},
+    {"pmm", "physical frame allocator", test_pmm},
+    {"vmm", "paging: map, translate, unmap", test_vmm},
+    {"heap", "kmalloc/kfree and coalescing", test_heap},
+    {"irq", "interrupt delivery and the timer", test_interrupts},
+    {"sched", "task switching and sleeping", test_scheduler},
+    {"syscall", "userspace pointer validation", test_syscall_guard},
 };
 
 u32 ktest_count(void)
@@ -487,7 +490,7 @@ void ktest_list(void)
 
 static bool run_one(const struct ktest *t)
 {
-    struct ktest_result r = { 0, 0, NULL };
+    struct ktest_result r = {0, 0, NULL};
 
     t->fn(&r);
 

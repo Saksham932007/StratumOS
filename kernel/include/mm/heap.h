@@ -11,7 +11,7 @@
 
 #include <kernel/types.h>
 
-void  heap_init(void);
+void heap_init(void);
 void *kmalloc(size_t size);
 void *kzalloc(size_t size);
 void *kcalloc(size_t n, size_t size);
@@ -19,11 +19,11 @@ void *krealloc(void *ptr, size_t size);
 /* Allocation whose payload starts on a `align`-byte boundary (power of two).
  * Needed for page-aligned structures such as page directories. */
 void *kmalloc_aligned(size_t size, size_t align);
-void  kfree(void *ptr);
+void kfree(void *ptr);
 
 struct heap_stats {
-    u32 region_bytes;   /* virtual bytes committed to the heap */
-    u32 used_bytes;     /* payload + header overhead in use    */
+    u32 region_bytes; /* virtual bytes committed to the heap */
+    u32 used_bytes;   /* payload + header overhead in use    */
     u32 free_bytes;
     u32 block_count;
     u32 free_blocks;

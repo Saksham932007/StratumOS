@@ -10,22 +10,23 @@
 
 #include <arch/cpu.h>
 #include <arch/io.h>
+
 #include <kernel/log.h>
 #include <kernel/string.h>
 
 static struct cpu_info info;
 
 /* Leaf 1 EDX feature bits */
-#define CPUID_FPU  (1u << 0)
-#define CPUID_TSC  (1u << 4)
-#define CPUID_MSR  (1u << 5)
-#define CPUID_PAE  (1u << 6)
-#define CPUID_PSE  (1u << 3)
-#define CPUID_APIC (1u << 9)
-#define CPUID_PGE  (1u << 13)
-#define CPUID_MMX  (1u << 23)
-#define CPUID_SSE  (1u << 25)
-#define CPUID_SSE2 (1u << 26)
+#define CPUID_FPU        (1u << 0)
+#define CPUID_TSC        (1u << 4)
+#define CPUID_MSR        (1u << 5)
+#define CPUID_PAE        (1u << 6)
+#define CPUID_PSE        (1u << 3)
+#define CPUID_APIC       (1u << 9)
+#define CPUID_PGE        (1u << 13)
+#define CPUID_MMX        (1u << 23)
+#define CPUID_SSE        (1u << 25)
+#define CPUID_SSE2       (1u << 26)
 /* Leaf 1 ECX feature bits */
 #define CPUID_SSE3       (1u << 0)
 #define CPUID_HYPERVISOR (1u << 31)
@@ -37,14 +38,14 @@ static bool cpuid_supported(void)
     __asm__ volatile(
         "pushfl\n\t"
         "pushfl\n\t"
-        "popl %0\n\t"           /* original EFLAGS                  */
+        "popl %0\n\t" /* original EFLAGS                  */
         "movl %0, %1\n\t"
         "xorl $0x200000, %1\n\t" /* toggle the ID bit               */
         "pushl %1\n\t"
-        "popfl\n\t"             /* try to write it back             */
+        "popfl\n\t" /* try to write it back             */
         "pushfl\n\t"
-        "popl %1\n\t"           /* read what actually stuck         */
-        "popfl"                 /* restore                          */
+        "popl %1\n\t" /* read what actually stuck         */
+        "popfl"       /* restore                          */
         : "=&r"(before), "=&r"(after)
         :
         : "cc");
@@ -80,8 +81,8 @@ void cpu_detect(void)
         cpuid_raw(1, 0, &a, &b, &c, &d);
 
         info.stepping = (u8)(a & 0xF);
-        info.model    = (u8)((a >> 4) & 0xF);
-        info.family   = (u8)((a >> 8) & 0xF);
+        info.model = (u8)((a >> 4) & 0xF);
+        info.family = (u8)((a >> 8) & 0xF);
 
         /* Extended family/model encoding, used once family reaches 0xF/6. */
         if (info.family == 0xF)
@@ -93,17 +94,17 @@ void cpu_detect(void)
         info.features_ecx = c;
         info.cache_line_size = ((b >> 8) & 0xFF) * 8;
 
-        info.has_fpu        = (d & CPUID_FPU) != 0;
-        info.has_tsc        = (d & CPUID_TSC) != 0;
-        info.has_msr        = (d & CPUID_MSR) != 0;
-        info.has_pae        = (d & CPUID_PAE) != 0;
-        info.has_pse        = (d & CPUID_PSE) != 0;
-        info.has_pge        = (d & CPUID_PGE) != 0;
-        info.has_apic       = (d & CPUID_APIC) != 0;
-        info.has_mmx        = (d & CPUID_MMX) != 0;
-        info.has_sse        = (d & CPUID_SSE) != 0;
-        info.has_sse2       = (d & CPUID_SSE2) != 0;
-        info.has_sse3       = (c & CPUID_SSE3) != 0;
+        info.has_fpu = (d & CPUID_FPU) != 0;
+        info.has_tsc = (d & CPUID_TSC) != 0;
+        info.has_msr = (d & CPUID_MSR) != 0;
+        info.has_pae = (d & CPUID_PAE) != 0;
+        info.has_pse = (d & CPUID_PSE) != 0;
+        info.has_pge = (d & CPUID_PGE) != 0;
+        info.has_apic = (d & CPUID_APIC) != 0;
+        info.has_mmx = (d & CPUID_MMX) != 0;
+        info.has_sse = (d & CPUID_SSE) != 0;
+        info.has_sse2 = (d & CPUID_SSE2) != 0;
+        info.has_sse3 = (c & CPUID_SSE3) != 0;
         info.has_hypervisor = (c & CPUID_HYPERVISOR) != 0;
     }
 
@@ -143,17 +144,28 @@ void cpu_print_info(void)
         kprintf("Cache line  : %u bytes\n", i->cache_line_size);
 
     kprintf("Features    :");
-    if (i->has_fpu)  kprintf(" fpu");
-    if (i->has_tsc)  kprintf(" tsc");
-    if (i->has_msr)  kprintf(" msr");
-    if (i->has_pse)  kprintf(" pse");
-    if (i->has_pae)  kprintf(" pae");
-    if (i->has_pge)  kprintf(" pge");
-    if (i->has_apic) kprintf(" apic");
-    if (i->has_mmx)  kprintf(" mmx");
-    if (i->has_sse)  kprintf(" sse");
-    if (i->has_sse2) kprintf(" sse2");
-    if (i->has_sse3) kprintf(" sse3");
+    if (i->has_fpu)
+        kprintf(" fpu");
+    if (i->has_tsc)
+        kprintf(" tsc");
+    if (i->has_msr)
+        kprintf(" msr");
+    if (i->has_pse)
+        kprintf(" pse");
+    if (i->has_pae)
+        kprintf(" pae");
+    if (i->has_pge)
+        kprintf(" pge");
+    if (i->has_apic)
+        kprintf(" apic");
+    if (i->has_mmx)
+        kprintf(" mmx");
+    if (i->has_sse)
+        kprintf(" sse");
+    if (i->has_sse2)
+        kprintf(" sse2");
+    if (i->has_sse3)
+        kprintf(" sse3");
     kprintf("\n");
 
     kprintf("Running on  : %s\n",
@@ -196,7 +208,7 @@ NORETURN void cpu_reset(void)
     struct {
         u16 limit;
         u32 base;
-    } PACKED null_idt = { 0, 0 };
+    } PACKED null_idt = {0, 0};
 
     __asm__ volatile("lidt %0" : : "m"(null_idt));
     __asm__ volatile("int $0x03");

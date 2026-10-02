@@ -10,8 +10,10 @@
  * discussed in docs/ROADMAP.md, where buffered transmit is the fix.
  */
 #include <arch/io.h>
+
 #include <drivers/serial.h>
 #include <drivers/vga.h>
+
 #include <kernel/console.h>
 
 static unsigned enabled_sinks;

@@ -18,9 +18,11 @@
 #define LOG_TAG "heap"
 
 #include <arch/io.h>
+
 #include <kernel/log.h>
 #include <kernel/panic.h>
 #include <kernel/string.h>
+
 #include <mm/heap.h>
 #include <mm/pmm.h>
 #include <mm/vmm.h>
@@ -31,7 +33,7 @@
 
 /* Every payload is 8-byte aligned, because a u64 or a double stored in a
  * kmalloc'd struct must not straddle a boundary. */
-#define HEAP_ALIGN 8
+#define HEAP_ALIGN       8
 
 struct block {
     u32 magic;
@@ -42,13 +44,13 @@ struct block {
     u32 pad; /* keeps sizeof(struct block) a multiple of HEAP_ALIGN */
 };
 
-#define HDR  ((u32)sizeof(struct block))
+#define HDR         ((u32)sizeof(struct block))
 
 /* The footer holds a 4-byte magic but occupies 8, so that HDR + FTR is a
  * multiple of HEAP_ALIGN. With a 4-byte footer, splitting a block puts the
  * next header 28 bytes along and its payload ends up only 4-byte aligned -
  * which is exactly the bug the alignment assertion in core/ktest.c caught. */
-#define FTR  (8u)
+#define FTR         (8u)
 
 /* Smallest payload worth splitting a block for. Below this, the leftover
  * fragment costs more in metadata than it could ever serve. */
@@ -56,7 +58,7 @@ struct block {
 #define MIN_SPLIT   (HDR + MIN_PAYLOAD + FTR)
 
 static struct block *head;
-static u32 region_bytes;   /* virtual bytes currently mapped */
+static u32 region_bytes; /* virtual bytes currently mapped */
 static u32 alloc_calls, free_calls;
 static bool heap_ready;
 
@@ -198,7 +200,8 @@ static void validate(struct block *b, const char *op, void *ptr)
 
     if (b->magic != HEAP_MAGIC_ALLOC && b->magic != HEAP_MAGIC_FREE)
         panic("%s(%p): block header magic is %08x - not a heap pointer, or "
-              "the header was overwritten", op, ptr, b->magic);
+              "the header was overwritten",
+              op, ptr, b->magic);
 
     if (b->magic != expect)
         panic("%s(%p): header says %s but the free flag says %s", op, ptr,
@@ -207,8 +210,8 @@ static void validate(struct block *b, const char *op, void *ptr)
 
     if (*footer_of(b) != HEAP_FOOTER)
         panic("%s(%p): footer magic is %08x, not %08x - the allocation of %u "
-              "bytes was overrun", op, ptr, *footer_of(b), HEAP_FOOTER,
-              b->size);
+              "bytes was overrun",
+              op, ptr, *footer_of(b), HEAP_FOOTER, b->size);
 }
 
 static void *alloc_from_list(u32 size)

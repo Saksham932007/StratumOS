@@ -13,19 +13,19 @@
 #define PCI_CONFIG_ADDRESS 0xCF8
 #define PCI_CONFIG_DATA    0xCFC
 
-#define PCI_MAX_DEVICES 32
+#define PCI_MAX_DEVICES    32
 
 struct pci_device {
-    u8  bus, slot, func;
+    u8 bus, slot, func;
     u16 vendor_id, device_id;
-    u8  class_code, subclass, prog_if, revision;
-    u8  header_type;
-    u8  irq_line;
+    u8 class_code, subclass, prog_if, revision;
+    u8 header_type;
+    u8 irq_line;
     u32 bar[6];
 };
 
 void pci_init(void);
-u32  pci_device_count(void);
+u32 pci_device_count(void);
 const struct pci_device *pci_device_at(u32 index);
 const char *pci_class_name(u8 class_code, u8 subclass);
 const char *pci_vendor_name(u16 vendor_id);

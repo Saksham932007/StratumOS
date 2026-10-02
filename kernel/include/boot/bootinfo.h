@@ -20,9 +20,9 @@
 
 /* ---- what stage 2 hands us (mirrors the offsets in boot/stage2.asm) ---- */
 
-#define BI_FLAG_E820 0x01
-#define BI_FLAG_E801 0x02
-#define BI_FLAG_LBA  0x04
+#define BI_FLAG_E820                0x01
+#define BI_FLAG_E801                0x02
+#define BI_FLAG_LBA                 0x04
 
 struct stratum_boot_info {
     u32 magic;
@@ -35,8 +35,8 @@ struct stratum_boot_info {
     u32 kernel_sectors;
     u32 loader_name;
     u32 cmdline;
-    u32 mem_lower;  /* KiB between 1 MiB and 16 MiB  */
-    u32 mem_upper;  /* 64 KiB blocks above 16 MiB    */
+    u32 mem_lower; /* KiB between 1 MiB and 16 MiB  */
+    u32 mem_upper; /* 64 KiB blocks above 16 MiB    */
 } PACKED;
 
 struct e820_entry {
@@ -49,11 +49,11 @@ struct e820_entry {
 /* ---- normalised view ---------------------------------------------------- */
 
 enum mem_type {
-    MEM_USABLE        = 1,
-    MEM_RESERVED      = 2,
-    MEM_ACPI_RECLAIM  = 3,
-    MEM_ACPI_NVS      = 4,
-    MEM_BAD           = 5,
+    MEM_USABLE = 1,
+    MEM_RESERVED = 2,
+    MEM_ACPI_RECLAIM = 3,
+    MEM_ACPI_NVS = 4,
+    MEM_BAD = 5,
 };
 
 struct mem_region {

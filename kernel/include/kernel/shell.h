@@ -9,9 +9,9 @@
 
 #include <kernel/types.h>
 
-#define SHELL_LINE_MAX   256
-#define SHELL_MAX_ARGS   16
-#define SHELL_HISTORY    16
+#define SHELL_LINE_MAX 256
+#define SHELL_MAX_ARGS 16
+#define SHELL_HISTORY  16
 
 struct shell_command {
     const char *name;

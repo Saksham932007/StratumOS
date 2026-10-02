@@ -14,10 +14,12 @@
 #define LOG_TAG "user"
 
 #include <arch/gdt.h>
+
 #include <kernel/log.h>
 #include <kernel/panic.h>
 #include <kernel/sched.h>
 #include <kernel/usermode.h>
+
 #include <mm/pmm.h>
 #include <mm/vmm.h>
 
@@ -63,8 +65,8 @@ static bool map_user_payload(void)
         return false;
     }
 
-    pr_info(".user payload mapped %p-%p as ring-3 read/execute",
-            (void *)start, (void *)end);
+    pr_info(".user payload mapped %p-%p as ring-3 read/execute", (void *)start,
+            (void *)end);
     return true;
 }
 
@@ -96,8 +98,7 @@ static void usermode_task(void *arg)
     tss_set_kernel_stack(self->kernel_esp0);
     self->user = true;
 
-    pr_info("pid %u entering ring 3 at %p", self->pid,
-            (void *)user_demo_entry);
+    pr_info("pid %u entering ring 3 at %p", self->pid, (void *)user_demo_entry);
     ran = true;
 
     /* Does not return: the task's remaining life is spent in ring 3, and it

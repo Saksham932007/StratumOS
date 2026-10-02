@@ -10,20 +10,22 @@
 #define LOG_TAG "boot"
 
 #include <boot/bootinfo.h>
+
 #include <kernel/kernel.h>
 #include <kernel/log.h>
 #include <kernel/string.h>
+
 #include <mm/pmm.h>
 
 /* ---- Multiboot2 tag definitions (spec section 3.1) --------------------- */
 
-#define MB_TAG_END            0
-#define MB_TAG_CMDLINE        1
-#define MB_TAG_LOADER_NAME    2
-#define MB_TAG_BASIC_MEMINFO  4
-#define MB_TAG_BOOTDEV        5
-#define MB_TAG_MMAP           6
-#define MB_TAG_FRAMEBUFFER    8
+#define MB_TAG_END           0
+#define MB_TAG_CMDLINE       1
+#define MB_TAG_LOADER_NAME   2
+#define MB_TAG_BASIC_MEMINFO 4
+#define MB_TAG_BOOTDEV       5
+#define MB_TAG_MMAP          6
+#define MB_TAG_FRAMEBUFFER   8
 
 struct mb_tag {
     u32 type;
@@ -66,12 +68,18 @@ static struct boot_params params;
 const char *mem_type_name(u32 type)
 {
     switch (type) {
-    case MEM_USABLE:       return "usable";
-    case MEM_RESERVED:     return "reserved";
-    case MEM_ACPI_RECLAIM: return "ACPI reclaimable";
-    case MEM_ACPI_NVS:     return "ACPI NVS";
-    case MEM_BAD:          return "bad";
-    default:               return "unknown";
+    case MEM_USABLE:
+        return "usable";
+    case MEM_RESERVED:
+        return "reserved";
+    case MEM_ACPI_RECLAIM:
+        return "ACPI reclaimable";
+    case MEM_ACPI_NVS:
+        return "ACPI NVS";
+    case MEM_BAD:
+        return "bad";
+    default:
+        return "unknown";
     }
 }
 
@@ -105,15 +113,15 @@ static bool parse_stratum(u32 info_addr)
         (const struct stratum_boot_info *)info_addr;
 
     if (!info_addr || bi->magic != STRATUM_BOOT_MAGIC) {
-        pr_err("stage2 boot info at %p has bad magic %08x",
-               (void *)info_addr, bi ? bi->magic : 0);
+        pr_err("stage2 boot info at %p has bad magic %08x", (void *)info_addr,
+               bi ? bi->magic : 0);
         return false;
     }
 
     params.protocol = BOOT_PROTO_STRATUM;
     params.protocol_name = "StratumOS native (ELF handoff)";
-    params.loader_name = bi->loader_name ? (const char *)bi->loader_name
-                                         : "stage2";
+    params.loader_name =
+        bi->loader_name ? (const char *)bi->loader_name : "stage2";
     params.cmdline = bi->cmdline ? (const char *)bi->cmdline : "";
     params.boot_device = bi->boot_drive;
 
@@ -128,8 +136,9 @@ static bool parse_stratum(u32 info_addr)
         /* No E820. Synthesise a map from the coarse numbers: 0-640 KiB plus
          * whatever E801 reported above 1 MiB. Crude, but it is what the
          * firmware gave us and it beats refusing to boot. */
-        pr_warn("no E820 map; falling back to E801 (%u KiB low, %u blocks high)",
-                bi->mem_lower, bi->mem_upper);
+        pr_warn(
+            "no E820 map; falling back to E801 (%u KiB low, %u blocks high)",
+            bi->mem_lower, bi->mem_upper);
         region_add(0, 640 * KIB, MEM_USABLE);
         if (bi->mem_lower)
             region_add(1 * MIB, (u64)bi->mem_lower * KIB, MEM_USABLE);
@@ -147,13 +156,11 @@ static bool parse_stratum(u32 info_addr)
      * the whole first mebibyte unconditionally anyway, and naming a range
      * that starts at 0 would make the VMM think a loader structure lives in
      * the null page and map it, costing us NULL-dereference detection. */
-    params.reserved_lo = PAGE_TRUNC(bi->e820_addr ? MIN(info_addr,
-                                                        bi->e820_addr)
-                                                  : info_addr);
-    params.reserved_hi = PAGE_ALIGN(MAX(info_addr + sizeof(*bi),
-                                        bi->e820_addr +
-                                        bi->e820_count *
-                                        sizeof(struct e820_entry)));
+    params.reserved_lo =
+        PAGE_TRUNC(bi->e820_addr ? MIN(info_addr, bi->e820_addr) : info_addr);
+    params.reserved_hi = PAGE_ALIGN(
+        MAX(info_addr + sizeof(*bi),
+            bi->e820_addr + bi->e820_count * sizeof(struct e820_entry)));
 
     return true;
 }
@@ -228,7 +235,8 @@ static bool parse_multiboot2(u32 info_addr)
             }
 
             u32 count = (mm->size - sizeof(struct mb_tag_mmap) +
-                         sizeof(struct mb_mmap_entry)) / mm->entry_size;
+                         sizeof(struct mb_mmap_entry)) /
+                        mm->entry_size;
 
             for (u32 i = 0; i < count; i++) {
                 const struct mb_mmap_entry *e =
@@ -290,7 +298,8 @@ const struct boot_params *boot_parse(u32 magic, u32 info_addr)
         break;
     default:
         pr_err("unrecognised boot magic %08x - was the kernel started by a "
-               "supported loader?", magic);
+               "supported loader?",
+               magic);
         ok = false;
         break;
     }

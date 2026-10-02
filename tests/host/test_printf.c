@@ -9,12 +9,13 @@
  */
 #define _GNU_SOURCE
 #include <stdarg.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
 #include <kernel/printf.h>
 #include <kernel/string.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 static int failures;
 static int checks;
@@ -37,28 +38,28 @@ static void fail(const char *what, const char *expect, const char *got)
 }
 
 /* Compare our ksnprintf against the host's snprintf for the same arguments. */
-#define CHECK_FMT(fmt, ...)                                                   \
-    do {                                                                      \
-        char mine[256], theirs[256];                                          \
-        checks++;                                                             \
-        ksnprintf(mine, sizeof(mine), fmt, __VA_ARGS__);                      \
-        snprintf(theirs, sizeof(theirs), fmt, __VA_ARGS__);                   \
-        if (strcmp(mine, theirs) != 0)                                        \
-            fail(fmt, theirs, mine);                                          \
+#define CHECK_FMT(fmt, ...)                                 \
+    do {                                                    \
+        char mine[256], theirs[256];                        \
+        checks++;                                           \
+        ksnprintf(mine, sizeof(mine), fmt, __VA_ARGS__);    \
+        snprintf(theirs, sizeof(theirs), fmt, __VA_ARGS__); \
+        if (strcmp(mine, theirs) != 0)                      \
+            fail(fmt, theirs, mine);                        \
     } while (0)
 
-#define CHECK_EQ_STR(label, got, expect)                                      \
-    do {                                                                      \
-        checks++;                                                             \
-        if (strcmp((got), (expect)) != 0)                                     \
-            fail(label, expect, got);                                         \
+#define CHECK_EQ_STR(label, got, expect)  \
+    do {                                  \
+        checks++;                         \
+        if (strcmp((got), (expect)) != 0) \
+            fail(label, expect, got);     \
     } while (0)
 
-#define CHECK_TRUE(label, cond)                                               \
-    do {                                                                      \
-        checks++;                                                             \
-        if (!(cond))                                                          \
-            fail(label, "true", "false");                                     \
+#define CHECK_TRUE(label, cond)           \
+    do {                                  \
+        checks++;                         \
+        if (!(cond))                      \
+            fail(label, "true", "false"); \
     } while (0)
 
 static void test_integers(void)
@@ -171,7 +172,7 @@ static void test_truncation(void)
     CHECK_TRUE("always NUL-terminates", buf[7] == '\0');
 
     /* size 0 must not write at all */
-    char guard[4] = { 'A', 'A', 'A', 'A' };
+    char guard[4] = {'A', 'A', 'A', 'A'};
     ksnprintf(guard, 0, "zzzz");
     CHECK_TRUE("size 0 writes nothing", guard[0] == 'A');
 }

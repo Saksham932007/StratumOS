@@ -90,7 +90,7 @@ static void emit_number(struct sink *s, u64 value, unsigned base, bool upper,
         }
     }
 
-    char prefix[3] = { 0, 0, 0 };
+    char prefix[3] = {0, 0, 0};
     int plen = 0;
 
     if (sign && *sign)
@@ -134,8 +134,8 @@ static void emit_string(struct sink *s, const char *str, const struct spec *sp)
     if (!str)
         str = "(null)";
 
-    int len = (int)((sp->prec >= 0) ? strnlen(str, (size_t)sp->prec)
-                                    : strlen(str));
+    int len =
+        (int)((sp->prec >= 0) ? strnlen(str, (size_t)sp->prec) : strlen(str));
     int padding = (sp->width > len) ? sp->width - len : 0;
 
     if (!(sp->flags & FLAG_LEFT))
@@ -157,19 +157,25 @@ static int format(struct sink *s, const char *fmt, va_list ap)
         }
 
         const char *start = fmt;
-        struct spec sp = { 0, 0, -1 };
+        struct spec sp = {0, 0, -1};
         int length = LEN_INT;
 
         fmt++; /* past '%' */
 
         /* --- flags --- */
         for (;; fmt++) {
-            if (*fmt == '-')      sp.flags |= FLAG_LEFT;
-            else if (*fmt == '0') sp.flags |= FLAG_ZERO;
-            else if (*fmt == '+') sp.flags |= FLAG_PLUS;
-            else if (*fmt == ' ') sp.flags |= FLAG_SPACE;
-            else if (*fmt == '#') sp.flags |= FLAG_ALT;
-            else break;
+            if (*fmt == '-')
+                sp.flags |= FLAG_LEFT;
+            else if (*fmt == '0')
+                sp.flags |= FLAG_ZERO;
+            else if (*fmt == '+')
+                sp.flags |= FLAG_PLUS;
+            else if (*fmt == ' ')
+                sp.flags |= FLAG_SPACE;
+            else if (*fmt == '#')
+                sp.flags |= FLAG_ALT;
+            else
+                break;
         }
 
         /* --- width --- */
@@ -203,11 +209,17 @@ static int format(struct sink *s, const char *fmt, va_list ap)
         if (*fmt == 'h') {
             fmt++;
             length = LEN_SHORT;
-            if (*fmt == 'h') { fmt++; length = LEN_CHAR; }
+            if (*fmt == 'h') {
+                fmt++;
+                length = LEN_CHAR;
+            }
         } else if (*fmt == 'l') {
             fmt++;
             length = LEN_LONG;
-            if (*fmt == 'l') { fmt++; length = LEN_LLONG; }
+            if (*fmt == 'l') {
+                fmt++;
+                length = LEN_LLONG;
+            }
         } else if (*fmt == 'z' || *fmt == 't') {
             fmt++;
             length = LEN_SIZE;
@@ -218,12 +230,18 @@ static int format(struct sink *s, const char *fmt, va_list ap)
         case 'd':
         case 'i': {
             i64 v;
-            if (length == LEN_LLONG)      v = va_arg(ap, long long);
-            else if (length == LEN_LONG)  v = va_arg(ap, long);
-            else if (length == LEN_SIZE)  v = (i64)va_arg(ap, intptr_t);
-            else                          v = va_arg(ap, int);
-            if (length == LEN_SHORT) v = (i16)v;
-            if (length == LEN_CHAR)  v = (i8)v;
+            if (length == LEN_LLONG)
+                v = va_arg(ap, long long);
+            else if (length == LEN_LONG)
+                v = va_arg(ap, long);
+            else if (length == LEN_SIZE)
+                v = (i64)va_arg(ap, intptr_t);
+            else
+                v = va_arg(ap, int);
+            if (length == LEN_SHORT)
+                v = (i16)v;
+            if (length == LEN_CHAR)
+                v = (i8)v;
 
             const char *sign = "";
             u64 mag;
@@ -232,8 +250,10 @@ static int format(struct sink *s, const char *fmt, va_list ap)
                 mag = (u64)(-(i64)v);
             } else {
                 mag = (u64)v;
-                if (sp.flags & FLAG_PLUS)       sign = "+";
-                else if (sp.flags & FLAG_SPACE) sign = " ";
+                if (sp.flags & FLAG_PLUS)
+                    sign = "+";
+                else if (sp.flags & FLAG_SPACE)
+                    sign = " ";
             }
             emit_number(s, mag, 10, false, &sp, sign);
             break;
@@ -243,12 +263,18 @@ static int format(struct sink *s, const char *fmt, va_list ap)
         case 'X':
         case 'o': {
             u64 v;
-            if (length == LEN_LLONG)      v = va_arg(ap, unsigned long long);
-            else if (length == LEN_LONG)  v = va_arg(ap, unsigned long);
-            else if (length == LEN_SIZE)  v = va_arg(ap, size_t);
-            else                          v = va_arg(ap, unsigned int);
-            if (length == LEN_SHORT) v = (u16)v;
-            if (length == LEN_CHAR)  v = (u8)v;
+            if (length == LEN_LLONG)
+                v = va_arg(ap, unsigned long long);
+            else if (length == LEN_LONG)
+                v = va_arg(ap, unsigned long);
+            else if (length == LEN_SIZE)
+                v = va_arg(ap, size_t);
+            else
+                v = va_arg(ap, unsigned int);
+            if (length == LEN_SHORT)
+                v = (u16)v;
+            if (length == LEN_CHAR)
+                v = (u8)v;
 
             unsigned base = (*fmt == 'o') ? 8 : (*fmt == 'u' ? 10 : 16);
             emit_number(s, v, base, *fmt == 'X', &sp, NULL);
@@ -304,7 +330,7 @@ static int format(struct sink *s, const char *fmt, va_list ap)
 
 int kvprintf(const char *fmt, va_list ap)
 {
-    struct sink s = { NULL, 0, 0 };
+    struct sink s = {NULL, 0, 0};
     return format(&s, fmt, ap);
 }
 
@@ -321,7 +347,7 @@ int kprintf(const char *fmt, ...)
 
 int kvsnprintf(char *buf, size_t size, const char *fmt, va_list ap)
 {
-    struct sink s = { buf, size, 0 };
+    struct sink s = {buf, size, 0};
     return format(&s, fmt, ap);
 }
 

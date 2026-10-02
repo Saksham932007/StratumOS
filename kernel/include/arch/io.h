@@ -47,9 +47,18 @@ static inline void io_wait(void)
     outb(0x80, 0);
 }
 
-static inline void cli(void) { __asm__ volatile("cli" ::: "memory"); }
-static inline void sti(void) { __asm__ volatile("sti" ::: "memory"); }
-static inline void hlt(void) { __asm__ volatile("hlt"); }
+static inline void cli(void)
+{
+    __asm__ volatile("cli" ::: "memory");
+}
+static inline void sti(void)
+{
+    __asm__ volatile("sti" ::: "memory");
+}
+static inline void hlt(void)
+{
+    __asm__ volatile("hlt");
+}
 
 static inline u32 read_eflags(void)
 {

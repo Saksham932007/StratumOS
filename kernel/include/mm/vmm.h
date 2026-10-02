@@ -13,33 +13,34 @@
 #define _MM_VMM_H
 
 #include <kernel/types.h>
+
 #include <mm/pmm.h>
 
 /* Page table / directory entry flags */
-#define PTE_PRESENT   0x001
-#define PTE_WRITE     0x002
-#define PTE_USER      0x004
-#define PTE_PWT       0x008
-#define PTE_PCD       0x010
-#define PTE_ACCESSED  0x020
-#define PTE_DIRTY     0x040
-#define PTE_PSE       0x080  /* 4 MiB page, in a directory entry */
-#define PTE_GLOBAL    0x100
-#define PTE_ADDR_MASK 0xFFFFF000u
+#define PTE_PRESENT       0x001
+#define PTE_WRITE         0x002
+#define PTE_USER          0x004
+#define PTE_PWT           0x008
+#define PTE_PCD           0x010
+#define PTE_ACCESSED      0x020
+#define PTE_DIRTY         0x040
+#define PTE_PSE           0x080 /* 4 MiB page, in a directory entry */
+#define PTE_GLOBAL        0x100
+#define PTE_ADDR_MASK     0xFFFFF000u
 
 /* Software-only bits (the CPU ignores 9-11), used to track who owns a frame
  * so vmm_unmap() knows whether to return it to the PMM. */
-#define PTE_OWNED     0x200
+#define PTE_OWNED         0x200
 
-#define PDE_INDEX(va) (((u32)(va) >> 22) & 0x3FF)
-#define PTE_INDEX(va) (((u32)(va) >> 12) & 0x3FF)
+#define PDE_INDEX(va)     (((u32)(va) >> 22) & 0x3FF)
+#define PTE_INDEX(va)     (((u32)(va) >> 12) & 0x3FF)
 
 /* The kernel heap's virtual window. Chosen above every plausible identity
  * mapping so a stray heap pointer used as a physical address faults loudly
  * instead of corrupting low memory. */
-#define KHEAP_BASE      0xD0000000u
-#define KHEAP_INIT_SIZE (1 * MIB)
-#define KHEAP_MAX_SIZE  (64 * MIB)
+#define KHEAP_BASE        0xD0000000u
+#define KHEAP_INIT_SIZE   (1 * MIB)
+#define KHEAP_MAX_SIZE    (64 * MIB)
 
 /* How much physical memory is identity-mapped at boot. */
 #define VMM_IDENTITY_SIZE (16 * MIB)

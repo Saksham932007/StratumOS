@@ -3,6 +3,7 @@
 #define _KERNEL_KERNEL_H
 
 #include <boot/bootinfo.h>
+
 #include <kernel/types.h>
 
 #define STRATUM_NAME    "StratumOS"
@@ -23,10 +24,11 @@ const struct boot_params *kernel_boot_params(void);
 
 /* Parsed from the boot command line. */
 struct kernel_cmdline {
-    bool autotest;      /* run self-tests and exit instead of starting a shell */
-    bool quiet;         /* suppress VGA output                                 */
-    bool no_usermode;   /* skip the ring-3 demo                                */
-    bool no_sched_demo; /* skip the demo worker threads                        */
+    bool autotest;    /* run self-tests and exit instead of starting a shell */
+    bool quiet;       /* suppress VGA output                                 */
+    bool no_usermode; /* skip the ring-3 demo                                */
+    bool
+        no_sched_demo; /* skip the demo worker threads                        */
     const char *loglevel;
 };
 
