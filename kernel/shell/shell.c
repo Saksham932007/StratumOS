@@ -190,7 +190,12 @@ static int cmd_meminfo(int argc, char **argv)
 
     kprintf("Virtual memory\n");
     kprintf("  paging    : %s\n", vmm_is_enabled() ? "enabled" : "disabled");
-    kprintf("  identity  : 0x00000000 - %p\n", (void *)VMM_IDENTITY_SIZE);
+    kprintf("  kernel at : %p\n", (void *)KERNEL_VIRT_BASE);
+    kprintf("  linear map: %p - %p (%u MiB of physical memory)\n",
+            (void *)KERNEL_VIRT_BASE,
+            (void *)(KERNEL_VIRT_BASE + VMM_LINEAR_SIZE),
+            (unsigned)(VMM_LINEAR_SIZE / MIB));
+    kprintf("  user space: 0x00001000 - %p\n", (void *)KERNEL_VIRT_BASE);
     kprintf("  tables    : %u page tables, %u pages mapped\n", vm.page_tables,
             vm.mapped_pages);
     kprintf("  faults    : %u\n", vm.page_faults);

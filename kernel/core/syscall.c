@@ -19,6 +19,7 @@
 #include <drivers/timer.h>
 
 #include <kernel/console.h>
+#include <kernel/layout.h>
 #include <kernel/log.h>
 #include <kernel/sched.h>
 #include <kernel/syscall.h>
@@ -40,9 +41,11 @@ bool user_range_ok(vaddr_t base, size_t len)
     if (base + len < base)
         return false;
 
-    /* Kernel-only windows are off limits regardless of what the page tables
-     * happen to say. */
-    if (base >= KHEAP_BASE)
+    /* The kernel owns everything at and above KERNEL_VIRT_BASE. With the
+     * kernel in the higher half this is the whole boundary check - no need to
+     * enumerate individual kernel windows, which is exactly the simplification
+     * the relocation bought. */
+    if (is_kernel_address(base) || is_kernel_address(base + len - 1))
         return false;
 
     vaddr_t first = PAGE_TRUNC(base);

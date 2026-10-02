@@ -2,11 +2,17 @@
 #ifndef _DRIVERS_VGA_H
 #define _DRIVERS_VGA_H
 
+#include <kernel/layout.h>
 #include <kernel/types.h>
 
 #define VGA_WIDTH  80
 #define VGA_HEIGHT 25
+
+/* The text framebuffer's physical address, and where the kernel reaches it.
+ * With the kernel in the higher half there is no identity mapping of low
+ * memory, so every access goes through the linear map. */
 #define VGA_PHYS   0xB8000u
+#define VGA_VIRT   (VGA_PHYS + KERNEL_VIRT_BASE)
 
 typedef enum {
     VGA_BLACK = 0,

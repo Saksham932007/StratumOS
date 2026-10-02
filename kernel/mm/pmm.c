@@ -25,6 +25,7 @@
 #include <kernel/string.h>
 
 #include <mm/pmm.h>
+#include <mm/vmm.h>
 
 #define BITS_PER_WORD 32
 
@@ -108,10 +109,12 @@ void pmm_init(const struct boot_params *bp)
     bitmap_words = ALIGN_UP(total_frames, BITS_PER_WORD) / BITS_PER_WORD;
     bitmap_bytes = bitmap_words * sizeof(u32);
 
-    /* Park the bitmap just above the kernel. Paging is not on yet, so this
-     * physical address is directly writable. */
-    bitmap_phys = PAGE_ALIGN((u32)__kernel_end);
-    bitmap = (u32 *)bitmap_phys;
+    /* Park the bitmap just above the kernel image, physically. Paging is
+     * already on by the time this runs - _start enabled it - so the bitmap is
+     * written through the kernel's linear map rather than at its physical
+     * address. It must therefore fit inside the window _start mapped. */
+    bitmap_phys = PAGE_ALIGN((u32)__kernel_phys_end);
+    bitmap = (u32 *)phys_to_virt(bitmap_phys);
 
     /* Everything used, then open up what the firmware vouched for. */
     memset(bitmap, 0xFF, bitmap_bytes);
@@ -143,8 +146,8 @@ void pmm_init(const struct boot_params *bp)
      * is not worth the class of bug it prevents. */
     pmm_reserve_range(0, 1 * MIB);
 
-    /* The kernel image. */
-    pmm_reserve_range((paddr_t)__kernel_start, (paddr_t)__kernel_end);
+    /* The kernel image, by physical address. */
+    pmm_reserve_range((paddr_t)__kernel_phys_start, (paddr_t)__kernel_phys_end);
 
     /* The bitmap itself - allocating over it would be memorable. */
     pmm_reserve_range(bitmap_phys, bitmap_phys + bitmap_bytes);
@@ -156,7 +159,14 @@ void pmm_init(const struct boot_params *bp)
     search_hint = PFN(1 * MIB);
     alloc_calls = free_calls = 0;
 
-    pr_info("%u frames total (%llu MiB), %u free (%u MiB), bitmap %u KiB at %p",
+    if (bitmap_phys + bitmap_bytes > VMM_BOOT_MAPPED)
+        panic("the frame bitmap needs %u KiB at %p, which is outside the "
+              "%u MiB that _start mapped",
+              bitmap_bytes / KIB, (void *)bitmap_phys,
+              (unsigned)(VMM_BOOT_MAPPED / MIB));
+
+    pr_info("%u frames total (%llu MiB), %u free (%u MiB), bitmap %u KiB at "
+            "phys %p",
             total_frames, highest_addr / MIB, total_frames - used_frames,
             ((total_frames - used_frames) * (PAGE_SIZE / KIB)) / KIB,
             bitmap_bytes / KIB, (void *)bitmap_phys);

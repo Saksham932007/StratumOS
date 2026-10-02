@@ -52,10 +52,11 @@ out of sequence.
 
 | # | Step | Why here |
 | --- | --- | --- |
+| 0 | `_start` (assembly) | Builds early page tables, enables paging, and jumps from 1 MiB to `0xC0100000`. Everything below runs in the higher half - see [MEMORY.md](MEMORY.md). |
 | 1 | `serial_init` | Needs no memory manager, no interrupts and no display, so it is the only channel that can report a failure in any of them. |
 | 2 | `vga_init`, `console_init` | The display is useful but optional; serial comes first so a VGA bug is still diagnosable. |
 | 3 | `cpu_detect` | Before any CPU feature is relied on. CPUID's own presence is probed by trying to flip `EFLAGS.ID`, because a 386 has no CPUID and executing it would fault. |
-| 4 | `boot_parse` | Everything downstream needs the memory map. Without one there is nothing to do but panic. |
+| 4 | `boot_parse` | Everything downstream needs the memory map. Without one there is nothing to do but panic. It also *copies* the loader's strings, because the memory they live in stops being addressable at step 12. |
 | 5 | `parse_cmdline` | Must follow `boot_parse`, because the command line arrives through it. Affects log level and which demos run. |
 | 6 | `gdt_init` | The IDT's gates reference the kernel code selector, so the GDT must be live first. Also loads the TSS, which ring 3 will need. |
 | 7 | `idt_init` | Fills all 256 vectors. Deliberately does **not** enable interrupts. |
@@ -63,7 +64,7 @@ out of sequence.
 | 9 | `timer_init`, `keyboard_init`, `serial_console_init` | Each installs its handler and only then unmasks its own line, so an interrupt can never arrive before someone is ready for it. |
 | 10 | **`sti()`** | The first moment this is safe. See below. |
 | 11 | `pmm_init` | Needs the memory map and the kernel's own extent. Places its bitmap above the kernel image. |
-| 12 | `vmm_init` | Needs the PMM for the page directory and page tables. Enables paging. |
+| 12 | `vmm_init` | Adopts the page directory `_start` built, widens the linear map, and drops the boot identity mapping. Needs the PMM for the new page tables. |
 | 13 | `heap_init` | Needs paging, because the heap is a virtual window backed on demand. |
 | 14 | `rtc_init`, `pci_init` | Non-essential hardware. A failure is logged, not fatal. |
 | 15 | `sched_init` | Needs the heap for task stacks. Adopts the boot context as pid 0. |
@@ -190,5 +191,7 @@ cleanly instead of walking off into the heap.
 ## Reading further
 
 - [BOOT.md](BOOT.md) — both boot paths, instruction by instruction
-- [MEMORY.md](MEMORY.md) — the address space and the three allocators
+- [MEMORY.md](MEMORY.md) — the address space, the higher-half transition, the allocators
+- [USERSPACE.md](USERSPACE.md) — the user program, the ELF loader, the privilege boundary
+- [PERFORMANCE.md](PERFORMANCE.md) — benchmarks, the profiler, the symbol table
 - [DESIGN-DECISIONS.md](DESIGN-DECISIONS.md) — the trade-offs behind the above

@@ -65,6 +65,35 @@ struct mb_tag_mmap {
 
 static struct boot_params params;
 
+/* The loader's command line and name live in low physical memory, which stops
+ * being addressable once vmm_init() drops the identity mapping. They are
+ * therefore copied out rather than pointed at - the alternative is a pointer
+ * that works during boot and dangles for the rest of the kernel's life. */
+#define BOOT_STRING_MAX 192
+static char cmdline_copy[BOOT_STRING_MAX];
+static char loader_copy[BOOT_STRING_MAX];
+
+/* Copy a NUL-terminated string out of the loader's memory.
+ *
+ * The length is bounded because the source is a loader's buffer and its
+ * terminator is not this kernel's responsibility. */
+static const char *copy_boot_string(const char *src, char *dst,
+                                    const char *fallback)
+{
+    if (!src)
+        return fallback;
+
+    size_t i = 0;
+
+    while (i < BOOT_STRING_MAX - 1 && src[i])
+        i++;
+
+    memcpy(dst, src, i);
+    dst[i] = '\0';
+
+    return dst;
+}
+
 const char *mem_type_name(u32 type)
 {
     switch (type) {
@@ -109,8 +138,9 @@ static void region_add(u64 base, u64 length, u32 type)
 
 static bool parse_stratum(u32 info_addr)
 {
-    const struct stratum_boot_info *bi =
-        (const struct stratum_boot_info *)info_addr;
+    /* The loader handed over a physical address; the kernel runs in the
+     * higher half, so every dereference goes through the linear map. */
+    const struct stratum_boot_info *bi = phys_to_virt(info_addr);
 
     if (!info_addr || bi->magic != STRATUM_BOOT_MAGIC) {
         pr_err("stage2 boot info at %p has bad magic %08x", (void *)info_addr,
@@ -120,13 +150,18 @@ static bool parse_stratum(u32 info_addr)
 
     params.protocol = BOOT_PROTO_STRATUM;
     params.protocol_name = "StratumOS native (ELF handoff)";
+    /* These point into stage 2's memory, below 1 MiB, reached through the
+     * linear map. They are copied rather than kept, because the identity
+     * mapping they were written for disappears in vmm_init(). */
     params.loader_name =
-        bi->loader_name ? (const char *)bi->loader_name : "stage2";
-    params.cmdline = bi->cmdline ? (const char *)bi->cmdline : "";
+        copy_boot_string(bi->loader_name ? phys_to_virt(bi->loader_name) : NULL,
+                         loader_copy, "stage2");
+    params.cmdline = copy_boot_string(
+        bi->cmdline ? phys_to_virt(bi->cmdline) : NULL, cmdline_copy, "");
     params.boot_device = bi->boot_drive;
 
     if (bi->flags & BI_FLAG_E820) {
-        const struct e820_entry *e = (const struct e820_entry *)bi->e820_addr;
+        const struct e820_entry *e = phys_to_virt(bi->e820_addr);
 
         for (u32 i = 0; i < bi->e820_count && i < BOOT_MAX_REGIONS; i++)
             region_add(e[i].base, e[i].length, e[i].type);
@@ -180,9 +215,13 @@ static bool parse_multiboot2(u32 info_addr)
     params.loader_name = "unknown";
     params.cmdline = "";
 
+    /* GRUB's info block is at a physical address, and the kernel runs in the
+     * higher half, so it is read through the linear map. */
+    u32 info_base = (u32)phys_to_virt(info_addr);
+
     /* The info block starts with total_size and a reserved word, then a
      * sequence of 8-byte-aligned tags terminated by a type-0 tag. */
-    u32 total_size = *(const u32 *)info_addr;
+    u32 total_size = *(const u32 *)info_base;
     u32 offset = 8;
 
     if (total_size < 8 || total_size > 64 * KIB) {
@@ -194,7 +233,7 @@ static bool parse_multiboot2(u32 info_addr)
     u32 mem_lower = 0, mem_upper = 0;
 
     while (offset < total_size) {
-        const struct mb_tag *tag = (const struct mb_tag *)(info_addr + offset);
+        const struct mb_tag *tag = (const struct mb_tag *)(info_base + offset);
 
         if (tag->size < 8) {
             pr_err("multiboot2 tag at +%u has size %u", offset, tag->size);
@@ -207,11 +246,14 @@ static bool parse_multiboot2(u32 info_addr)
             continue;
 
         case MB_TAG_CMDLINE:
-            params.cmdline = ((const struct mb_tag_string *)tag)->string;
+            params.cmdline = copy_boot_string(
+                ((const struct mb_tag_string *)tag)->string, cmdline_copy, "");
             break;
 
         case MB_TAG_LOADER_NAME:
-            params.loader_name = ((const struct mb_tag_string *)tag)->string;
+            params.loader_name =
+                copy_boot_string(((const struct mb_tag_string *)tag)->string,
+                                 loader_copy, "unknown");
             break;
 
         case MB_TAG_BASIC_MEMINFO: {

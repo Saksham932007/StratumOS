@@ -1,23 +1,30 @@
 /* StratumOS - virtual memory manager (two-level x86 paging).
  *
- * The interesting part of this file is how it edits page tables *after* paging
- * is enabled. Once CR0.PG is set, a page table can only be written through a
- * virtual address, and the frames holding page tables come from the physical
- * allocator - which may hand back a frame nowhere near the identity-mapped
- * window. Identity-mapping all of RAM to work around that does not scale.
+ * Paging is already enabled before this file runs: kernel/arch/x86/boot.asm
+ * builds a page directory with an identity map of the first 4 MiB, a mapping
+ * of 0xC0000000 onto physical 0, and a recursive entry, then jumps into the
+ * higher half. The VMM adopts that directory, widens the linear map, and
+ * drops the identity mapping it no longer needs.
  *
- * The solution is the recursive mapping: the last page directory entry points
- * at the page directory itself. The hardware then resolves
+ * The recursive mapping
+ * ---------------------
+ * Once CR0.PG is set, a page table can only be written through a virtual
+ * address - but page tables come from the physical allocator, which can hand
+ * back a frame anywhere in RAM, including far outside the linear map. Mapping
+ * all of physical memory to work around that does not scale and is impossible
+ * on a 4 GiB machine in a 32-bit address space.
+ *
+ * So the last page directory entry points at the directory itself. The
+ * hardware walk then resolves
  *
  *     0xFFFFF000            -> the page directory
  *     0xFFC00000 + i*4096   -> the page table for directory entry i
  *
- * because the walk uses the directory as both levels. Every page table in the
- * system becomes addressable at a computable virtual address, at the cost of
- * one 4 MiB slot at the very top of the address space.
+ * because it uses the directory as both levels. Every page table in the
+ * system becomes addressable at a computable address, at the cost of one
+ * 4 MiB slot at the very top.
  *
- * See docs/MEMORY.md for the full address-space map and for why the kernel is
- * identity-mapped rather than relocated to the higher half.
+ * See docs/MEMORY.md for the full address-space layout.
  */
 #define LOG_TAG "vmm"
 
@@ -36,27 +43,32 @@
 #define PD_VADDR       0xFFFFF000u
 #define PT_VADDR(pdi)  (0xFFC00000u + ((u32)(pdi) << PAGE_SHIFT))
 
-#define CR0_PG         0x80000000u
-#define CR0_WP         0x00010000u
+/* Built by _start; its symbol value is a physical address, because .boot is
+ * linked at its load address. */
+extern u8 boot_page_directory[];
 
-static paddr_t pd_phys;
-static bool paging_on;
+static paddr_t kernel_pd_phys;
+static bool initialised;
 static u32 stat_page_tables;
 static u32 stat_mapped_pages;
 static u32 stat_page_faults;
 
-/* Before paging is enabled, physical == virtual and we address the tables
- * directly. Afterwards, everything goes through the recursive window. */
-static u32 *pd_entries(void)
+/* Page tables are always reached through the recursive window. Before the
+ * higher-half jump there was a physical path as well; there no longer is,
+ * because C never runs with paging off. */
+static inline u32 *pd_entries(void)
 {
-    return paging_on ? (u32 *)PD_VADDR : (u32 *)pd_phys;
+    return (u32 *)PD_VADDR;
 }
 
-static u32 *pt_entries(u32 pdi)
+static inline u32 *pt_entries(u32 pdi)
 {
-    if (paging_on)
-        return (u32 *)PT_VADDR(pdi);
-    return (u32 *)(pd_entries()[pdi] & PTE_ADDR_MASK);
+    return (u32 *)PT_VADDR(pdi);
+}
+
+paddr_t vmm_kernel_pd_phys(void)
+{
+    return kernel_pd_phys;
 }
 
 /* Create the page table for a directory slot if it is missing. */
@@ -65,7 +77,7 @@ static bool ensure_table(u32 pdi, u32 flags)
     u32 *pd = pd_entries();
 
     if (pd[pdi] & PTE_PRESENT) {
-        /* A directory entry's USER bit gates the whole 4 MiB range, so it has
+        /* A directory entry's USER bit gates its whole 4 MiB range, so it has
          * to be widened if any page inside it becomes user-accessible. */
         if (flags & PTE_USER)
             pd[pdi] |= PTE_USER;
@@ -81,11 +93,10 @@ static bool ensure_table(u32 pdi, u32 flags)
     pd[pdi] = frame | PTE_PRESENT | PTE_WRITE | (flags & PTE_USER);
     stat_page_tables++;
 
-    /* The new table is reachable through the recursive window as soon as the
-     * directory entry is live, but the TLB may still hold the old (absent)
-     * translation for that window address. */
-    if (paging_on)
-        invlpg(PT_VADDR(pdi));
+    /* The new table becomes reachable through the recursive window as soon as
+     * the directory entry is live, but the TLB may still hold the old
+     * (not-present) translation for that window address. */
+    invlpg(PT_VADDR(pdi));
 
     memset(pt_entries(pdi), 0, PAGE_SIZE);
     return true;
@@ -98,7 +109,7 @@ bool vmm_map(vaddr_t va, paddr_t pa, u32 flags)
 
     if (pdi == RECURSIVE_SLOT)
         panic("vmm_map(%p): refusing to map over the recursive page-table "
-              "window",
+              "window - every page table would become unreachable",
               (void *)va);
 
     if (!ensure_table(pdi, flags))
@@ -107,8 +118,8 @@ bool vmm_map(vaddr_t va, paddr_t pa, u32 flags)
     u32 *pt = pt_entries(pdi);
 
     if (pt[pti] & PTE_PRESENT) {
-        /* Silently replacing a live mapping hides bugs; say so. The mapping
-         * is still replaced, because remapping is legitimate. */
+        /* Silently replacing a live mapping hides bugs, so say so. The
+         * mapping is still replaced, because remapping is legitimate. */
         pr_warn("remapping %p (was frame %p, now %p)", (void *)va,
                 (void *)(pt[pti] & PTE_ADDR_MASK), (void *)pa);
         if (pt[pti] & PTE_OWNED)
@@ -119,9 +130,7 @@ bool vmm_map(vaddr_t va, paddr_t pa, u32 flags)
     pt[pti] = (pa & PTE_ADDR_MASK) | (flags & 0xFFF) | PTE_PRESENT;
     stat_mapped_pages++;
 
-    if (paging_on)
-        invlpg(va);
-
+    invlpg(va);
     return true;
 }
 
@@ -133,9 +142,9 @@ bool vmm_alloc_at(vaddr_t va, u32 flags)
         return false;
 
     /* PTE_OWNED records that this mapping allocated its own frame, so
-     * vmm_unmap() knows it is responsible for returning it. Without this,
-     * unmapping either leaks every frame or frees frames it does not own -
-     * for instance the VGA framebuffer. */
+     * vmm_unmap() knows it is responsible for returning it. Without the
+     * distinction, unmapping either leaks every frame or frees frames it does
+     * not own - the VGA framebuffer being the memorable example. */
     if (!vmm_map(va, frame, flags | PTE_OWNED)) {
         pmm_free_frame(frame);
         return false;
@@ -157,8 +166,6 @@ bool vmm_protect(vaddr_t va, u32 flags)
     if (!(pt[pti] & PTE_PRESENT))
         return false;
 
-    /* A directory entry's USER bit gates its whole 4 MiB range, so widening a
-     * single page to user access means widening the directory entry too. */
     if (flags & PTE_USER)
         pd[pdi] |= PTE_USER;
 
@@ -166,9 +173,7 @@ bool vmm_protect(vaddr_t va, u32 flags)
     u32 keep = pt[pti] & (PTE_ADDR_MASK | PTE_OWNED);
     pt[pti] = keep | (flags & 0xFFF) | PTE_PRESENT;
 
-    if (paging_on)
-        invlpg(va);
-
+    invlpg(va);
     return true;
 }
 
@@ -203,8 +208,7 @@ void vmm_unmap(vaddr_t va)
     pt[pti] = 0;
     stat_mapped_pages--;
 
-    if (paging_on)
-        invlpg(va);
+    invlpg(va);
 }
 
 bool vmm_map_range(vaddr_t va, paddr_t pa, size_t bytes, u32 flags)
@@ -213,7 +217,7 @@ bool vmm_map_range(vaddr_t va, paddr_t pa, size_t bytes, u32 flags)
 
     for (size_t i = 0; i < pages; i++) {
         if (!vmm_map(va + i * PAGE_SIZE, pa + i * PAGE_SIZE, flags)) {
-            /* Roll back so a partial failure does not leave a half-mapped
+            /* Roll back, so a partial failure does not leave a half-mapped
              * range behind for someone else to trip over. */
             for (size_t j = 0; j < i; j++)
                 vmm_unmap(va + j * PAGE_SIZE);
@@ -256,39 +260,41 @@ bool vmm_translate(vaddr_t va, paddr_t *out)
 
 /* ------------------------------------------------------------------------- */
 
+/* Naming the region a fault landed in is most of the diagnosis: the same
+ * "page fault at 0x..." means very different things in the heap window and at
+ * address zero. */
+static const char *fault_region(u32 addr)
+{
+    if (addr < PAGE_SIZE)
+        return "the null page - almost certainly a NULL dereference";
+    if (addr < USER_IMAGE_BASE)
+        return "low user space (unmapped by design)";
+    if (addr < KERNEL_VIRT_BASE)
+        return "user space";
+    if (addr >= KERNEL_VIRT_BASE && addr < KERNEL_VIRT_BASE + VMM_LINEAR_SIZE)
+        return "the kernel's linear map of low physical memory";
+    if (addr >= (u32)__kernel_start && addr < (u32)__kernel_end)
+        return "the kernel image";
+    if (addr >= KHEAP_BASE && addr < KHEAP_BASE + KHEAP_MAX_SIZE)
+        return "the kernel heap window - a bad heap pointer, or a task stack "
+               "overflow";
+    if (addr >= 0xFFC00000u)
+        return "the recursive page-table window";
+    return "no region the kernel maps - a wild pointer";
+}
+
 static void page_fault_handler(struct regs *r)
 {
     u32 addr = read_cr2();
+    const char *where = fault_region(addr);
 
     stat_page_faults++;
 
-    /* Nothing here grows a mapping on demand yet - every fault is a real bug,
-     * so the job is to report it as precisely as possible. Demand paging and
-     * copy-on-write are the natural extensions and are in docs/ROADMAP.md. */
+    /* Nothing grows a mapping on demand yet, so every fault is a real bug and
+     * the job is to report it as precisely as possible. Demand paging and
+     * copy-on-write are the natural extensions - see docs/ROADMAP.md. */
     kprintf("\n");
     page_fault_describe(r);
-
-    /* Naming the region a fault landed in is most of the diagnosis: the same
-     * "page fault at 0x..." means very different things in the heap window
-     * and at address zero. */
-    const char *where;
-
-    if (addr < PAGE_SIZE)
-        where = "the null page - almost certainly a NULL dereference";
-    else if (addr < 1 * MIB)
-        where = "low memory (BIOS, IVT, VGA)";
-    else if (addr >= (u32)__kernel_start && addr < (u32)__kernel_end)
-        where = "the kernel image";
-    else if (addr < VMM_IDENTITY_SIZE)
-        where = "the identity-mapped window";
-    else if (addr >= KHEAP_BASE && addr < KHEAP_BASE + KHEAP_MAX_SIZE)
-        where = "the kernel heap window - a bad heap pointer, or a task "
-                "stack overflow";
-    else if (addr >= 0xFFC00000u)
-        where = "the recursive page-table window";
-    else
-        where = "no region the kernel maps - a wild pointer";
-
     kprintf("  region          : %s\n", where);
 
     panic_with_regs(r, "page fault at %p in %s", (void *)addr, where);
@@ -296,64 +302,64 @@ static void page_fault_handler(struct regs *r)
 
 void vmm_init(void)
 {
-    ASSERT(!paging_on);
+    ASSERT(!initialised);
 
-    pd_phys = pmm_alloc_frame();
-    if (pd_phys == PMM_NO_FRAME)
-        panic("cannot allocate the page directory");
+    /* Adopt the directory _start built. Its symbol value is already a
+     * physical address: .boot is linked at its load address, which is the
+     * whole reason that section exists. */
+    kernel_pd_phys = (paddr_t)boot_page_directory;
 
-    memset((void *)pd_phys, 0, PAGE_SIZE);
+    /* _start mapped the first 4 MiB and set up the recursive entry; sanity
+     * check that we really are running on that directory before trusting it. */
+    if (read_cr3() != kernel_pd_phys)
+        panic("CR3 is %p but the boot page directory is at %p",
+              (void *)read_cr3(), (void *)kernel_pd_phys);
 
-    /* Identity-map the low region. This covers the kernel image, the PMM
-     * bitmap, the VGA framebuffer at 0xB8000 and the bootloader's structures,
-     * so every physical address the kernel already holds keeps working after
-     * CR0.PG is set - which is what makes enabling paging a non-event rather
-     * than a cliff.
-     *
-     * The mapping deliberately starts at the *second* page. Leaving the first
-     * one unmapped turns every NULL dereference into an immediate, precisely
-     * located page fault instead of a silent write to the interrupt vector
-     * table - which is the single cheapest bug-catching measure available to
-     * a kernel. The first page holds only the real-mode IVT and the BIOS data
-     * area, neither of which a protected-mode kernel has any use for. */
-    if (!vmm_map_range(PAGE_SIZE, PAGE_SIZE, VMM_IDENTITY_SIZE - PAGE_SIZE,
-                       PTE_PRESENT | PTE_WRITE))
-        panic("cannot build the identity mapping");
+    if (!(pd_entries()[RECURSIVE_SLOT] & PTE_PRESENT))
+        panic("the recursive page-directory entry is missing; page tables "
+              "would be unreachable");
 
-    /* ...unless a loader put something we still need down there. No loader in
-     * practice does, but failing loudly beats faulting mysteriously. */
-    const struct boot_params *bp = kernel_boot_params();
-    if (bp && bp->reserved_hi > bp->reserved_lo &&
-        bp->reserved_lo < PAGE_SIZE) {
-        pr_warn("the loader's info block overlaps the null page; mapping it "
-                "and giving up NULL-dereference detection");
-        if (!vmm_map(0, 0, PTE_PRESENT | PTE_WRITE))
-            panic("cannot map the loader's info block");
-    }
-
-    /* The recursive entry. Must be installed before paging is enabled,
-     * because afterwards there is no other way to reach the tables. */
-    pd_entries()[RECURSIVE_SLOT] = pd_phys | PTE_PRESENT | PTE_WRITE;
+    stat_page_tables = 1; /* the one _start created */
+    stat_mapped_pages = VMM_BOOT_MAPPED / PAGE_SIZE;
 
     isr_install_handler(14, page_fault_handler);
 
-    write_cr3(pd_phys);
+    /* Widen the linear map beyond what _start could reach with its single
+     * page table. Everything the kernel addresses physically must be inside
+     * this window. */
+    if (!vmm_map_range(KERNEL_VIRT_BASE + VMM_BOOT_MAPPED, VMM_BOOT_MAPPED,
+                       VMM_LINEAR_SIZE - VMM_BOOT_MAPPED,
+                       PTE_PRESENT | PTE_WRITE))
+        panic("cannot extend the kernel's linear map to %u MiB",
+              (unsigned)(VMM_LINEAR_SIZE / MIB));
 
-    /* CR0.WP makes ring-0 writes respect the read-only bit too. Without it,
-     * the kernel can scribble over pages it marked read-only and the
-     * protection is decorative. */
-    write_cr0(read_cr0() | CR0_PG | CR0_WP);
+    /* Drop the identity mapping of the first 4 MiB. It existed only to keep
+     * the handful of instructions between `mov cr0` and the higher-half jump
+     * fetchable. Removing it is what makes the bottom of the address space
+     * available to user processes - and what makes a NULL dereference fault
+     * rather than landing on the interrupt vector table.
+     *
+     * Nothing may hold a low pointer at this point. Low physical memory is
+     * still reachable, through the linear map at KERNEL_VIRT_BASE. */
+    pd_entries()[0] = 0;
 
-    paging_on = true;
+    /* The directory changed, so the whole TLB has to go - invlpg would only
+     * cover one page, and this invalidated 1024 of them. */
+    write_cr3(kernel_pd_phys);
 
-    pr_info("paging enabled: %u MiB identity-mapped, directory at %p, "
-            "%u page tables",
-            VMM_IDENTITY_SIZE / MIB, (void *)pd_phys, stat_page_tables);
+    initialised = true;
+
+    pr_info("paging: kernel at %p, linear map %u MiB, identity map dropped",
+            (void *)KERNEL_VIRT_BASE, (unsigned)(VMM_LINEAR_SIZE / MIB));
+    pr_debug("page directory at phys %p, %u page tables",
+             (void *)kernel_pd_phys, stat_page_tables);
 }
 
 bool vmm_is_enabled(void)
 {
-    return paging_on;
+    /* Paging is on from _start onwards; this reports whether the VMM has
+     * taken ownership of the directory. */
+    return initialised;
 }
 
 void vmm_get_stats(struct vmm_stats *out)

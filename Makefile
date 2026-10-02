@@ -47,6 +47,7 @@ BUILD     := build
 KSRC      := kernel
 INCLUDE   := $(KSRC)/include
 BOOTSRC   := boot
+USERSRC   := user
 TOOLS     := tools
 
 # Two kernels from one link: the bootable image is stripped of debug info so
@@ -110,12 +111,19 @@ ASM_SOURCES := $(sort $(wildcard $(KSRC)/arch/x86/*.asm))
 C_OBJECTS   := $(C_SOURCES:%.c=$(BUILD)/%.o)
 ASM_OBJECTS := $(ASM_SOURCES:%.asm=$(BUILD)/%.o)
 
+# The ring-3 program is a separate ELF, linked for user space and embedded in
+# the kernel image as a blob. Defined here, before LINK_ORDER, because that is
+# expanded immediately.
+USER_ELF  := $(BUILD)/user/init.elf
+USER_BLOB := $(BUILD)/user/init_blob.o
+
 # boot.asm must be linked first so that .multiboot lands at the start of the
 # image, where the Multiboot2 specification requires the header to be.
 BOOT_OBJ    := $(BUILD)/$(KSRC)/arch/x86/boot.o
-LINK_ORDER  := $(BOOT_OBJ) $(filter-out $(BOOT_OBJ),$(ASM_OBJECTS)) $(C_OBJECTS)
+LINK_ORDER  := $(BOOT_OBJ) $(filter-out $(BOOT_OBJ),$(ASM_OBJECTS)) \
+               $(C_OBJECTS) $(USER_BLOB)
 
-OBJECTS := $(ASM_OBJECTS) $(C_OBJECTS)
+OBJECTS := $(ASM_OBJECTS) $(C_OBJECTS) $(USER_BLOB)
 DEPS    := $(C_OBJECTS:.o=.d)
 
 # ---- top-level targets ------------------------------------------------------
@@ -204,10 +212,68 @@ $(KERNEL_DEBUG): $(OBJECTS) $(BUILD)/ksyms_b.o linker/kernel.ld
 $(KERNEL_ELF): $(KERNEL_DEBUG) $(TOOLS)/check-kernel.py
 	@echo "  STRIP   $@"
 	@$(OBJCOPY) --strip-debug --strip-unneeded $< $@
-	@echo "  CHECK   multiboot2 header, ELF type, section layout"
-	@$(PYTHON) $(TOOLS)/check-kernel.py $@
+	@# Validated against the unstripped ELF, because some checks need its
+	@# symbol table (locating the embedded user program). --matches then
+	@# proves the stripped image a loader sees is byte-for-byte identical,
+	@# rather than assuming --strip-debug only touched debug sections.
+	@echo "  CHECK   multiboot2 header, higher-half split, embedded program"
+	@$(PYTHON) $(TOOLS)/check-kernel.py $(KERNEL_DEBUG) --matches $@
 	@printf "  SIZE    %s bytes bootable, %s bytes with debug info\n" \
 		"$$(stat -c%s $@)" "$$(stat -c%s $<)"
+
+# ---- the ring-3 program -----------------------------------------------------
+#
+# Built as a genuinely separate program: its own ELF, linked at a *user*
+# address (see user/user.ld), with no kernel headers beyond the syscall ABI.
+#
+# That separation is not cosmetic. A program linked at a kernel address and
+# then mapped elsewhere would have every absolute reference - every string
+# literal - pointing into the kernel's half, where ring 3 cannot read. Linking
+# it for user space is the only way its own addresses are usable by it.
+#
+# objcopy then turns the ELF into an object file with three symbols
+# (_binary_init_elf_start/_end/_size) so the kernel can embed and load it. The
+# `cd` keeps those symbol names short and independent of the build path.
+
+USER_CFLAGS := $(ARCHFLAG) -std=gnu11 -O2 -g3 \
+               -ffreestanding -nostdlib -fno-builtin \
+               -fno-pie -fno-pic -fno-stack-protector \
+               -fno-asynchronous-unwind-tables \
+               -mgeneral-regs-only -march=i686 \
+               -I$(INCLUDE) -I$(USERSRC) $(WARNINGS)
+
+$(BUILD)/user/init.o: $(USERSRC)/init.c $(USERSRC)/syscall.h
+	@mkdir -p $(dir $@)
+	@echo "  CC      $< (ring 3)"
+	@$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_ELF): $(BUILD)/user/init.o $(USERSRC)/user.ld
+	@echo "  LD      $@ (ring 3)"
+	@$(LD) -m elf_i386 -T $(USERSRC)/user.ld -nostdlib \
+		--no-warn-rwx-segments --build-id=none $< -o $@
+
+# Stripped before embedding: the debug info is three times the size of the
+# program, and it would be carried inside the kernel image for no benefit.
+$(BUILD)/user/init.stripped.elf: $(USER_ELF)
+	@$(OBJCOPY) --strip-all $< $@
+
+$(USER_BLOB): $(BUILD)/user/init.stripped.elf
+	@echo "  BLOB    $@"
+	@cd $(dir $<) && $(OBJCOPY) -I binary -O elf32-i386 -B i386 \
+		--rename-section .data=.rodata.userblob,alloc,load,readonly,data,contents \
+		--set-section-alignment .rodata.userblob=4 \
+		init.stripped.elf $(notdir $@)
+	@# objcopy derives the blob's symbol names from the input filename, so
+	@# rename them back to the stable _binary_init_elf_* the kernel expects.
+	@$(OBJCOPY) \
+		--redefine-sym _binary_init_stripped_elf_start=_binary_init_elf_start \
+		--redefine-sym _binary_init_stripped_elf_end=_binary_init_elf_end \
+		--redefine-sym _binary_init_stripped_elf_size=_binary_init_elf_size \
+		$@
+
+.PHONY: user
+user: $(USER_ELF)
+	@$(OBJDUMP) -h $<
 
 # ---- bootloader -------------------------------------------------------------
 
@@ -358,7 +424,8 @@ disasm: $(KERNEL_DEBUG)
 sections: $(KERNEL_ELF)
 	@$(OBJDUMP) -h $<
 	@echo
-	@$(PYTHON) $(TOOLS)/check-kernel.py --verbose $<
+	@$(PYTHON) $(TOOLS)/check-kernel.py --verbose $(KERNEL_DEBUG) \
+		--matches $(KERNEL_ELF)
 
 .PHONY: symbols
 symbols: $(KERNEL_DEBUG)

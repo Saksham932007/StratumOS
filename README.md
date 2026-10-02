@@ -2,8 +2,8 @@
 
 A 32-bit x86 kernel and bootloader, written from scratch in C and assembly.
 It takes a machine from the BIOS's first instruction in 16-bit real mode all
-the way to a preemptively scheduled, paged kernel running an interactive shell
-and executing code in ring 3.
+the way to a preemptively scheduled, higher-half, paged kernel running an
+interactive shell and a separate user-space program in ring 3.
 
 [![CI](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml/badge.svg)](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml)
 ![language](https://img.shields.io/badge/C11%20%2B%20NASM-11k%20lines-blue)
@@ -16,10 +16,10 @@ every push, including three QEMU boot scenarios.
 
 ```
 BIOS ─► stage 1 (512 B MBR) ─► stage 2 ─► 32-bit protected mode ─► kernel ─► ring 3
-         LBA/CHS disk I/O      A20 gate    flat GDT                 paging    syscalls
-         retry + verify        E820 map    ELF32 loader              heap     int 0x80
-                                                                 scheduler
-                        GRUB ─► Multiboot2 ─────────────────────────┘
+         LBA/CHS disk I/O      A20 gate    flat GDT              higher half  separate
+         retry + verify        E820 map    ELF32 loader           @0xC0000000   ELF
+                                                                   paging    syscalls
+                        GRUB ─► Multiboot2 ─────────────────────► heap, sched  int 0x80
 ```
 
 ---
@@ -55,18 +55,23 @@ Concretely, from power-on:
    32 KiB chunks, loads a flat GDT, sets `CR0.PE`, and then, in 32-bit code,
    **parses the kernel's ELF program headers** and copies each segment to its
    physical address.
-4. **The kernel** detects which protocol loaded it from the magic in `EAX`,
+4. **`_start`** builds a page directory, enables paging, and jumps from 1 MiB
+   to `0xC0100000` — the kernel is *loaded* low and *linked* high, so the top
+   gigabyte of every address space is the kernel's and the bottom three are
+   free for user processes.
+5. **The kernel** detects which protocol loaded it from the magic in `EAX`,
    normalises the memory map, installs 256 interrupt vectors, remaps the PIC
    off the CPU's exception vectors, brings up the timer and keyboard, *then*
-   enables interrupts, builds a physical frame allocator from the firmware map,
-   turns on paging with a recursive page directory, creates a guarded kernel
-   heap, enumerates PCI, starts a round-robin scheduler, and drops a demo task
-   into ring 3.
-5. **The shell** runs as a scheduled task, reachable from the VGA console or
+   enables interrupts, builds a physical frame allocator from the firmware
+   map, widens its linear map and drops the boot identity mapping, creates a
+   guarded kernel heap, enumerates PCI, and starts a round-robin scheduler.
+6. **A user program** — a genuinely separate ELF, linked for user space — is
+   loaded into user-accessible pages and entered at ring 3, where it probes
+   the syscall boundary from the untrusted side.
+7. **The shell** runs as a scheduled task, reachable from the VGA console or
    over a serial line, with line editing and command history.
 
-It is about 11,000 lines, and every subsystem listed above is implemented and
-tested rather than announced.
+Every subsystem listed above is implemented and tested rather than announced.
 
 ---
 
@@ -235,6 +240,9 @@ Everything marked ✅ is implemented and covered by a test.
 | | |
 | --- | --- |
 | ✅ | Multiboot2 and native boot protocols behind one normalised interface |
+| ✅ | Higher-half: loaded at 1 MiB, linked at `0xC0100000`, via `AT()` |
+| ✅ | Early page tables in assembly, then an absolute jump into the higher half |
+| ✅ | Linear map of low physical memory; boot identity map dropped |
 | ✅ | Flat GDT with ring-0/ring-3 descriptors, plus a TSS |
 | ✅ | All 256 IDT vectors filled from a generated stub table |
 | ✅ | Full register dump, page-fault error decoding, EBP backtrace |
@@ -245,6 +253,8 @@ Everything marked ✅ is implemented and covered by a test.
 | ✅ | Kernel heap: first-fit, coalescing, guard magics, grows on demand |
 | ✅ | Preemptive round-robin scheduler, per-task stacks, sleep/yield/exit |
 | ✅ | Ring 3 via a forged IRET frame; `int 0x80` with pointer validation |
+| ✅ | A real user program: separate ELF, linked for user space, own pages |
+| ✅ | Defensive ELF32 loader — no segment may reach into kernel space |
 | ✅ | Drivers: 16550 (in and out), VGA text, PIT, PS/2 keyboard, CMOS RTC, PCI |
 | ✅ | `kprintf` with width/precision/64-bit support, levelled logging |
 | ✅ | 64-bit division helpers — the kernel links against nothing at all |
@@ -459,11 +469,14 @@ hardware walk resolves `0xFFFFF000` to the directory and
 `0xFFC00000 + i*4096` to the table for entry *i*. Every page table in the
 system becomes addressable, at the cost of one 4 MiB slot.
 
-**The null page is left unmapped.**
-The identity map starts at the *second* page. The first one holds only the
-real-mode IVT and BIOS data area, which a protected-mode kernel has no use
-for, and leaving it unmapped converts every NULL dereference into a precisely
-located page fault. It is the cheapest bug-catching measure available.
+**The kernel is linked high and loaded low.**
+`_start` cannot run at `0xC0100000` — nothing is mapped there yet — so it
+lives in a section whose virtual address equals its load address, builds a
+page directory with a temporary identity map, enables paging, and jumps.
+`vmm_init` then drops that identity map, which is what frees the bottom of
+every address space for user processes and makes a NULL dereference fault for
+free. `check-kernel.py` verifies the arrangement at build time rather than
+trusting it.
 
 **Preemption happens after the PIC's end-of-interrupt, not before.**
 The timer handler only *requests* a reschedule; the switch happens at the tail
@@ -512,14 +525,13 @@ Being clear about scope is more useful than a longer feature list.
 - **No filesystem.** Nothing is read from disk after the kernel itself.
 - **No SMP.** Uniprocessor only; `spinlock.c` is honest about being an
   interrupt mask rather than a spin, and says what it will become.
-- **No higher-half kernel.** The kernel is identity-mapped at 1 MiB. This is a
-  trade-off, not an oversight — [docs/MEMORY.md](docs/MEMORY.md) explains what
-  it buys and what it costs.
+- **One address space.** The kernel is in the higher half, which is the
+  precondition for per-process address spaces, but `context_switch` does not
+  yet touch `CR3` — so two user programs would share a view of memory, and
+  only one can be loaded at a time. This is the next thing to build.
+- **No `fork`, `exec` or `wait`.** A task enters ring 3 once and exits.
 - **No demand paging or copy-on-write.** Every page fault is currently a bug,
   and is reported as one.
-- **No user-space processes.** Ring 3 runs a payload linked into the kernel
-  image; there is no ELF loader for userspace, because the bootloader already
-  demonstrates ELF loading.
 - **Serial transmit is polled**, which holds interrupts off for the duration of
   a write. The fix is a transmit ring buffer, in
   [docs/ROADMAP.md](docs/ROADMAP.md).
@@ -534,7 +546,8 @@ Being clear about scope is more useful than a longer feature list.
 | --- | --- |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | subsystem map, initialisation order and why it is forced |
 | [docs/BOOT.md](docs/BOOT.md) | both boot paths instruction by instruction |
-| [docs/MEMORY.md](docs/MEMORY.md) | address-space layout, the three allocators, the recursive mapping |
+| [docs/MEMORY.md](docs/MEMORY.md) | address-space layout, the higher-half transition, the three allocators |
+| [docs/USERSPACE.md](docs/USERSPACE.md) | the user program, the ELF loader, and the privilege boundary |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | benchmark methodology, results with analysis, the profiler and its limits |
 | [docs/TESTING.md](docs/TESTING.md) | the four test layers and how to add to each |
 | [docs/DEBUGGING.md](docs/DEBUGGING.md) | GDB against QEMU, reading a panic, common symptoms |

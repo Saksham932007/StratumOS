@@ -38,7 +38,7 @@ CODE_TYPES = set("tTwW")
 # Symbols that describe the table itself, or that the linker invents. Excluding
 # them keeps a backtrace from blaming the symbol machinery.
 EXCLUDE_PREFIXES = ("ksym_", "__bss", "__text", "__rodata", "__data",
-                    "__kernel", "__user")
+                    "__kernel", "__boot", "_binary_")
 EXCLUDE_EXACT = {"_start.hang", "stack_bottom", "stack_top"}
 
 

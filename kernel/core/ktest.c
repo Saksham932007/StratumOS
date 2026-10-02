@@ -24,6 +24,7 @@
 #include <drivers/vga.h>
 
 #include <kernel/console.h>
+#include <kernel/elf.h>
 #include <kernel/kernel.h>
 #include <kernel/ksyms.h>
 #include <kernel/ktest.h>
@@ -138,16 +139,19 @@ static void test_vmm(struct ktest_result *r)
 
     KT_ASSERT(r, vmm_is_enabled());
 
-    /* The identity mapping must hold for an address the kernel relies on. */
-    KT_ASSERT(r, vmm_translate(VGA_PHYS, &phys) && phys == VGA_PHYS);
+    /* The kernel reaches low physical memory through its linear map at
+     * KERNEL_VIRT_BASE, not through an identity mapping. */
+    KT_ASSERT(r, vmm_translate(VGA_VIRT, &phys) && phys == VGA_PHYS);
+    KT_ASSERT(r, vmm_translate(KERNEL_VIRT_BASE + PAGE_SIZE, &phys) &&
+                     phys == PAGE_SIZE);
     KT_ASSERT(r, !vmm_translate(scratch, NULL));
 
-    /* The null page must stay unmapped so that a NULL dereference faults
-     * rather than scribbling on the interrupt vector table. The page right
-     * after it must be mapped, which proves the identity range really does
-     * start at the second page rather than having been skipped entirely. */
+    /* The identity mapping _start installed must be gone. If it survived,
+     * user space would be unusable and a NULL dereference would land on the
+     * real-mode interrupt vector table instead of faulting. */
     KT_ASSERT(r, !vmm_translate(0, NULL));
-    KT_ASSERT(r, vmm_translate(PAGE_SIZE, &phys) && phys == PAGE_SIZE);
+    KT_ASSERT(r, !vmm_translate(PAGE_SIZE, NULL));
+    KT_ASSERT(r, !vmm_translate(KERNEL_PHYS_BASE, NULL));
 
     /* A user pointer to the null page must be refused too. */
     KT_ASSERT(r, !user_range_ok(0, 4));
@@ -395,12 +399,20 @@ static void test_scheduler(struct ktest_result *r)
         KT_ASSERT(r, sched_switch_count() > switches_before);
     }
 
-    /* Sleeping must actually take about as long as asked. */
+    /* Sleeping must not return early, and must return.
+     *
+     * Only the lower bound is a real correctness property: a sleep that wakes
+     * before its deadline is a broken sleep. The upper bound exists purely to
+     * catch a hang, so it is deliberately loose. An earlier version capped it
+     * at 600 ms, which turned host contention - several QEMU instances sharing
+     * a CI runner - into an intermittent failure. A tight wall-clock bound
+     * inside an emulator is not a test of the kernel; it is a test of the
+     * machine the emulator is running on. */
     u64 before_ms = timer_ms();
     task_sleep_ms(60);
     u64 elapsed = timer_ms() - before_ms;
     KT_ASSERT(r, elapsed >= 50);
-    KT_ASSERT(r, elapsed < 600); /* generous: this runs under emulation */
+    KT_ASSERT(r, elapsed < 30000);
 }
 
 /* ---- boot protocol ----------------------------------------------------- */
@@ -421,10 +433,41 @@ static void test_boot(struct ktest_result *r)
     KT_ASSERT(r, bp->protocol_name != NULL);
     KT_ASSERT(r, bp->loader_name != NULL);
 
+    /* The loader's strings must live in kernel memory, not in the loader's.
+     * Merely pointing at them works for exactly as long as the identity
+     * mapping survives, and then faults the first time anything prints them -
+     * which is the bug this assertion exists to catch. */
+    KT_ASSERT(r, is_kernel_address((u32)bp->protocol_name));
+    KT_ASSERT(r, is_kernel_address((u32)bp->loader_name));
+    KT_ASSERT(r, is_kernel_address((u32)bp->cmdline));
+
+    /* ...and must still be readable, which is the part a pointer check
+     * alone would not establish. */
+    KT_ASSERT(r, strlen(bp->loader_name) > 0);
+    KT_ASSERT(r, strlen(bp->loader_name) < 192);
+    KT_ASSERT(r, strlen(bp->cmdline) < 192);
+
     /* The kernel's own linker symbols must be sane and ordered. */
-    KT_ASSERT(r, (u32)__kernel_start >= 1 * MIB);
     KT_ASSERT(r, (u32)__kernel_end > (u32)__kernel_start);
     KT_ASSERT(r, (u32)__bss_end >= (u32)__bss_start);
+
+    /* The kernel is linked in the higher half and loaded low. Both halves of
+     * that statement are checkable at run time. */
+    KT_ASSERT(r, (u32)__kernel_start >= KERNEL_VIRT_BASE);
+    KT_ASSERT(r, (u32)__text_start >= KERNEL_VIRT_BASE);
+    KT_ASSERT(r, (u32)__kernel_phys_start == KERNEL_PHYS_BASE);
+    KT_ASSERT(r, (u32)__kernel_phys_end > (u32)__kernel_phys_start);
+    /* .boot is the one section that is not relocated, because it runs with
+     * paging off. */
+    KT_ASSERT(r, (u32)__boot_start == KERNEL_PHYS_BASE);
+    KT_ASSERT(r, (u32)__boot_end > (u32)__boot_start);
+    KT_ASSERT(r, (u32)__boot_end < KERNEL_VIRT_BASE);
+
+    /* phys/virt translation must round-trip across the linear map. */
+    KT_ASSERT(r, virt_to_phys(phys_to_virt(0x1234000)) == 0x1234000);
+    KT_ASSERT(r, phys_to_virt(0) == (void *)KERNEL_VIRT_BASE);
+    KT_ASSERT(r, is_kernel_address(KERNEL_VIRT_BASE));
+    KT_ASSERT(r, !is_kernel_address(KERNEL_VIRT_BASE - 1));
 }
 
 /* ---- CPU identification ------------------------------------------------ */
@@ -460,8 +503,15 @@ static void test_syscall_guard(struct ktest_result *r)
     KT_ASSERT(r, !user_range_ok(0xFFFFFFF0u, 64)); /* wraps the address space */
     KT_ASSERT(r, user_range_ok(0x1000, 0));        /* empty range is fine */
 
-    /* An unmapped address must be refused. */
+    /* Anything at or above KERNEL_VIRT_BASE is the kernel's. */
+    KT_ASSERT(r, !user_range_ok(KERNEL_VIRT_BASE, 4));
     KT_ASSERT(r, !user_range_ok(0xC8000000u, 4));
+
+    /* A range that *straddles* the boundary must be refused on the strength
+     * of its end, not just its start - otherwise a user pointer a few bytes
+     * below the kernel becomes a kernel write of arbitrary length. */
+    KT_ASSERT(r, !user_range_ok(KERNEL_VIRT_BASE - 2, 8));
+    KT_ASSERT(r, !user_range_ok(KERNEL_VIRT_BASE - PAGE_SIZE, 2 * PAGE_SIZE));
 }
 
 /* ---- symbol table and profiler ---------------------------------------- */
@@ -570,6 +620,74 @@ static void test_profile(struct ktest_result *r)
     profile_reset();
 }
 
+/* ---- the user ELF loader ---------------------------------------------- */
+
+extern const u8 _binary_init_elf_start[];
+extern const u8 _binary_init_elf_end[];
+
+static void test_elf(struct ktest_result *r)
+{
+    const char *why = NULL;
+    size_t size = (size_t)(_binary_init_elf_end - _binary_init_elf_start);
+
+    /* The program the kernel actually ships must validate. */
+    KT_ASSERT(r, size > sizeof(struct elf32_header));
+    KT_ASSERT(r, elf_validate(_binary_init_elf_start, size, &why));
+
+    /* Rejections. Each of these is a shape of malformed or hostile image the
+     * loader must refuse rather than index into. */
+    KT_ASSERT(r, !elf_validate(NULL, 0, &why));
+    KT_ASSERT(r, !elf_validate(_binary_init_elf_start, 8, &why));
+
+    /* A copy we can corrupt. */
+    struct elf32_header *bad = kmalloc(sizeof(*bad) + 256);
+    KT_ASSERT(r, bad != NULL);
+    if (!bad)
+        return;
+
+    memcpy(bad, _binary_init_elf_start, sizeof(*bad));
+
+    u32 saved = bad->magic;
+    bad->magic = 0xDEADBEEF;
+    KT_ASSERT(r, !elf_validate(bad, sizeof(*bad) + 256, &why));
+    bad->magic = saved;
+
+    bad->class = 2; /* ELFCLASS64 */
+    KT_ASSERT(r, !elf_validate(bad, sizeof(*bad) + 256, &why));
+    bad->class = 1;
+
+    bad->machine = 0x3E; /* EM_X86_64 */
+    KT_ASSERT(r, !elf_validate(bad, sizeof(*bad) + 256, &why));
+    bad->machine = EM_386;
+
+    bad->type = 3; /* ET_DYN - a PIE needs a dynamic loader */
+    KT_ASSERT(r, !elf_validate(bad, sizeof(*bad) + 256, &why));
+    bad->type = ET_EXEC;
+
+    /* A program header table that claims to extend past the image. This is
+     * the classic way a loader is made to read out of bounds. */
+    bad->phnum = 60000;
+    KT_ASSERT(r, !elf_validate(bad, sizeof(*bad) + 256, &why));
+
+    bad->phnum = 1;
+    bad->phoff = 0xFFFF0000u;
+    KT_ASSERT(r, !elf_validate(bad, sizeof(*bad) + 256, &why));
+
+    bad->phoff = 52;
+    bad->phentsize = 4; /* smaller than a program header */
+    KT_ASSERT(r, !elf_validate(bad, sizeof(*bad) + 256, &why));
+
+    /* Valid again, to confirm the checks above were the only objections. */
+    bad->phentsize = sizeof(struct elf32_phdr);
+    KT_ASSERT(r, elf_validate(bad, sizeof(*bad) + 256, &why));
+
+    kfree(bad);
+
+    /* Every rejection must have produced a reason; a loader that refuses an
+     * image without saying why is a loader nobody can debug. */
+    KT_ASSERT(r, why != NULL);
+}
+
 /* ---- registry ---------------------------------------------------------- */
 
 static const struct ktest tests[] = {
@@ -582,6 +700,7 @@ static const struct ktest tests[] = {
     {"irq", "interrupt delivery and the timer", test_interrupts},
     {"sched", "task switching and sleeping", test_scheduler},
     {"syscall", "userspace pointer validation", test_syscall_guard},
+    {"elf", "user ELF validation and rejection", test_elf},
     {"ksyms", "embedded symbol table lookup", test_ksyms},
     {"profile", "sampling profiler attribution", test_profile},
 };

@@ -18,20 +18,14 @@ int ksym_index(u32 addr)
     if (ksym_count == 0)
         return -1;
 
-    /* Only addresses inside an executable section can belong to a function.
-     * Checking this first means a stack value that happens to look like a
-     * small integer does not get attributed to whatever function sits lowest
-     * in memory.
+    /* Only addresses inside .text can belong to a kernel function. Checking
+     * this first means a stack value that happens to look like a small
+     * integer is not attributed to whatever function sits lowest in memory.
      *
-     * Both executable sections count. .user holds the ring-3 payload, and the
-     * generator emits its symbols too, so a panic that arrives from ring 3
-     * resolves to a name rather than a bare address. Omitting .user here is
-     * what the ksyms self-test caught: those symbols could not resolve to
-     * themselves. */
-    bool in_text = addr >= (u32)__text_start && addr < (u32)__text_end;
-    bool in_user = addr >= (u32)__user_start && addr < (u32)__user_end;
-
-    if (!in_text && !in_user)
+     * User programs are separate ELFs with their own symbols, so a ring-3
+     * address resolves to nothing here - which is correct, rather than
+     * blaming whichever kernel function shares that address. */
+    if (addr < (u32)__text_start || addr >= (u32)__text_end)
         return -1;
 
     /* Binary search for the last symbol whose address is <= addr. The table is

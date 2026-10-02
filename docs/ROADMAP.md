@@ -8,19 +8,25 @@ most of these in mind.
 
 ## Next
 
-### 1. Relocate the kernel to the higher half
+### 1. Per-process address spaces, fork, exec, wait
 
-The single most structurally significant change, and a prerequisite for real
-user processes. See [MEMORY.md](MEMORY.md) for why it was deferred.
+The kernel moved to the higher half in v0.4.0, which was the
+precondition. What remains is the part that makes "user space" mean more
+than one program: a page directory per task, a CR3 switch in
+`context_switch`, an address-space clone, and copy-on-write `fork`.
 
-Needs: a link script using `AT()` to separate virtual from load addresses;
-early page tables built in assembly before C runs; a jump to the virtual entry
-point; `KERNEL_VIRT_BASE` subtracted wherever a physical address is computed
-from a symbol. Both boot paths need checking, since stage 2 copies to
-`p_paddr` and would need the physical addresses to stay correct while the
-virtual ones move.
+Copy-on-write is where it gets interesting - mark both copies read-only
+and have the page-fault handler duplicate on write. The handler is already
+structured to distinguish a resolvable fault from a fatal one; right now
+it reports every fault as fatal, with a comment marking where demand
+paging goes.
 
-Roughly: a weekend, and the boot tests will earn their keep.
+`exec` is half done already: `kernel/core/elf.c` maps PT_LOAD segments
+into the current address space with user permissions, validated against a
+hostile image. It needs to tear down the old address space first, and to
+read its input from a file rather than an embedded blob (item 5).
+
+Roughly two to three weekends, and the boot tests will earn their keep.
 
 ### 2. Interrupt-driven serial transmit
 
@@ -39,52 +45,40 @@ per-table mapped-page count, decremented in `vmm_unmap`, freeing the frame and
 clearing the directory entry at zero — and a `tlb` flush of the recursive
 window entry for that slot.
 
-### 4. A real ELF loader for userspace
+### 4. Symbolising the profiler's call graph
 
-Ring 3 currently runs a payload linked into the kernel image. Loading a
-separate binary needs per-process address spaces (which wants item 1 first), a
-`CR3` switch in `context_switch`, and a loader that maps `PT_LOAD` segments
-with `PTE_USER` — the logic stage 2 already has, applied to virtual rather
-than physical addresses.
+Samples are attributed to the leaf function only, so a helper called from
+several places aggregates all of its callers together. Walking the
+frame-pointer chain at sample time would fix it, and the backtrace code
+already exists - see [PERFORMANCE.md](PERFORMANCE.md).
 
-### 5. `fork` and `exec`
-
-Follows from 1 and 4. Copy-on-write makes `fork` interesting: mark both copies
-read-only, and have the page-fault handler duplicate on write. The handler is
-already structured to tell a resolvable fault from a fatal one — right now it
-reports every fault as fatal, with a comment saying where demand paging goes.
-
----
-
-## After that
-
-### 6. A block device and a filesystem
+### 5. A block device and a filesystem
 
 ATA PIO first, because it needs no DMA and no interrupts. Then FAT16 read-only,
 which is enough to load an init binary and is well documented. The existing
 `pci.c` already finds the IDE controller.
 
-### 7. A slab allocator over the heap
+### 6. A slab allocator over the heap
 
 The heap is one arena, so a long-lived small allocation can keep a large region
 from coalescing. Per-size caches for the common fixed-size objects (`struct
 task`, page-table wrappers) would fix the fragmentation and speed up the common
 path. `heap_check()` already exists to validate the result.
 
-### 8. APIC and the HPET
+### 7. APIC and the HPET
 
 The 8259 and 8254 are legacy. The local APIC timer and the I/O APIC are what
 real hardware uses, and the local APIC is a prerequisite for SMP. `cpu.c`
 already detects the APIC feature bit.
 
-### 9. SMP
+### 8. SMP
 
 Needs: ACPI MADT parsing to find the other cores, a trampoline to bring them
 out of reset in real mode, per-CPU data, and — at last — `spinlock_t` becoming
 a real spinlock. `kernel/core/spinlock.c` is written so that this is a change
 of implementation rather than a change of every call site.
 
-### 10. A proper VFS and a `/proc`
+### 9. A proper VFS and a `/proc`
 
 Once there is a filesystem, the introspection the shell does through direct
 calls (`ps`, `meminfo`, `irq`) belongs behind readable files instead.
@@ -103,7 +97,6 @@ calls (`ps`, `meminfo`, `irq`) belongs behind readable files instead.
 | PS/2 mouse | IRQ 12, and the 8042 is already driven for A20 |
 | `cpuid` leaf 4 cache topology | `cpu.c` reports only the line size |
 | Stack canaries for task stacks | a magic at the low end of each, checked on switch, would catch overflow before it corrupts the heap |
-| Symbol table in the image | would let `backtrace()` print names instead of needing `addr2line` |
 
 ---
 

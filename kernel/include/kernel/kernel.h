@@ -4,21 +4,30 @@
 
 #include <boot/bootinfo.h>
 
+#include <kernel/layout.h>
 #include <kernel/types.h>
 
 #define STRATUM_NAME    "StratumOS"
-#define STRATUM_VERSION "0.3.0"
+#define STRATUM_VERSION "0.4.0"
+
+/* Address-space constants and phys/virt translation live in
+ * kernel/layout.h, which this header re-exports. */
 
 /* Provided by the linker script. */
 extern u8 __kernel_start[];
 extern u8 __kernel_end[];
+/* The image's *physical* extent. The frame allocator needs this, and it
+ * cannot be derived from __kernel_start by subtraction because .boot is not
+ * relocated. */
+extern u8 __kernel_phys_start[];
+extern u8 __kernel_phys_end[];
+/* .boot: the low window that runs with paging off. VMA == LMA. */
+extern u8 __boot_start[];
+extern u8 __boot_end[];
 extern u8 __text_start[], __text_end[];
 extern u8 __rodata_start[], __rodata_end[];
 extern u8 __data_start[], __data_end[];
 extern u8 __bss_start[], __bss_end[];
-/* The ring-3 payload. Executable, but a separate section from .text so that
- * exactly these pages can be made user-accessible. */
-extern u8 __user_start[], __user_end[];
 
 /* The C entry point, called from arch/x86/boot.asm. */
 void kmain(u32 magic, u32 info_addr);

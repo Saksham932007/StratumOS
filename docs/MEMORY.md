@@ -17,35 +17,84 @@ pmm_alloc_frame          ← 4 KiB physical frames, from the firmware map
 
 ## Address space
 
+The kernel occupies the top gigabyte of every address space; the bottom three
+belong to user processes.
+
 ```
-0x00000000 ─ 0x00000FFF   UNMAPPED — the null page, deliberately
-0x00001000 ─ 0x0009FFFF   identity: low memory, BIOS data, EBDA
-0x000B8000 ─ 0x000BFFFF   identity: VGA text framebuffer
-0x00100000 ─ 0x0011xxxx   identity: the kernel image
-0x0011xxxx ─ 0x0012xxxx   identity: the PMM bitmap (just above the kernel)
-0x00120000 ─ 0x00FFFFFF   identity: free physical memory, directly addressable
+-- user space ----------------------------------------------------------
+0x00000000 - 0x00000FFF   UNMAPPED - the null page, deliberately
+0x00001000 - 0x003FFFFF   unmapped by design (catches low wild pointers)
+0x00400000 - ...          a user program's image, from its own ELF
 ...
-0xAFFFE000 ─ 0xB0000000   the ring-3 demo's user stack (2 pages, USER|WRITE)
+0xAFFFC000 - 0xB0000000   user stack (4 pages, USER|WRITE)
 ...
-0xD0000000 ─ 0xD4000000   kernel heap window, backed on demand, 64 MiB max
+-- kernel space --------------------------------------------------------
+0xC0000000 - 0xC0FFFFFF   linear map of the first 16 MiB of physical memory
+  0xC0000000              physical 0
+  0xC00B8000              the VGA text framebuffer (physical 0xB8000)
+  0xC0100000              the kernel image (loaded at physical 0x100000)
+  0xC012E000              the frame-allocator bitmap
+0xD0000000 - 0xD4000000   kernel heap window, backed on demand, 64 MiB max
 ...
-0xFFC00000 ─ 0xFFFFEFFF   recursive window: every page table
-0xFFFFF000 ─ 0xFFFFFFFF   recursive window: the page directory itself
+0xFFC00000 - 0xFFFFEFFF   recursive window: every page table
+0xFFFFF000 - 0xFFFFFFFF   recursive window: the page directory itself
 ```
 
-The first 16 MiB of physical memory is identity-mapped
-(`VMM_IDENTITY_SIZE`). That covers the kernel, the PMM bitmap, the VGA
-framebuffer and the bootloader's structures, so every physical address the
-kernel is already holding keeps working the instant `CR0.PG` is set — which is
-what makes enabling paging a non-event rather than a cliff.
+The kernel is **loaded** at 1 MiB physical but **linked** at `0xC0100000`.
+`linker/kernel.ld` expresses that with `AT()`: a section's VMA is where its
+code expects to be, its LMA is where the loader must put it.
+
+That same `KERNEL_VIRT_BASE` offset doubles as a **linear map**: physical
+address P is reachable at `P + 0xC0000000` for the first `VMM_LINEAR_SIZE`
+(16 MiB). It is how the kernel reaches the VGA framebuffer, the loader's
+tables and its own page frames, and it is why `phys_to_virt()` is one addition
+rather than a page-table walk.
+
+### Getting there: the chicken-and-egg problem
+
+`_start` cannot run at `0xC0100000`, because nothing is mapped there yet. So it
+lives in its own `.boot` section whose **VMA equals its LMA**, at 1 MiB - an
+address valid both with paging off and, through the identity map it installs,
+immediately after paging is on.
+
+```asm
+; .boot has VMA == LMA, so these symbols are already physical addresses.
+mov     edi, boot_page_table
+...
+mov     [edi], eax                         ; PDE 0    identity, temporary
+mov     [edi + KERNEL_PDE_INDEX * 4], eax  ; PDE 768  the kernel's window
+mov     [edi + RECURSIVE_SLOT * 4], eax    ; PDE 1023 the directory itself
+mov     cr3, eax
+mov     eax, cr0
+or      eax, CR0_PG | CR0_WP
+mov     cr0, eax
+lea     eax, [higher_half]
+jmp     eax                                ; absolute: a relative jump would
+                                           ; stay down here
+```
+
+One page table serves both windows, deliberately: the identity map covers
+`0x00000000-0x003FFFFF` and the kernel window maps `0xC0000000-0xC03FFFFF` to
+the same physical range, so the same 1024 entries do both jobs.
+
+`vmm_init()` then widens the linear map to 16 MiB and **drops PDE 0**. That
+removal is what frees the bottom of the address space for user processes, and
+it is why `e_entry` in the kernel ELF is a low address - both loaders jump to
+it with paging off.
+
+`check-kernel.py` verifies the whole arrangement at build time:
+
+```
+boot segment runs where it loads (0x100000)
+3 higher-half segment(s), all at +0xc0000000
+```
 
 ### Why the null page is unmapped
 
-The identity mapping starts at the *second* page. The first one holds the
-real-mode interrupt vector table and the BIOS data area, neither of which a
-protected-mode kernel has any use for. Leaving it unmapped converts every
-NULL dereference from a silent write into an immediate, precisely located
-page fault:
+Once the boot identity mapping is dropped, the whole bottom of the address
+space is empty until a process maps something into it - so a NULL dereference
+faults for free. User images are additionally refused below 4 MiB, so a small
+wild pointer faults too rather than landing in a program's own text.
 
 ```
 stratum> fault null
@@ -55,20 +104,23 @@ stratum> fault null
   region          : the null page - almost certainly a NULL dereference
 ```
 
-There is one guard. If a loader ever placed its information block inside the
-first page, `vmm_init()` maps it and says so, because losing the boot info is
-worse than losing the check:
+Nothing of the loader's survives the transition: `boot_parse()` **copies** the
+command line and loader name into kernel buffers rather than pointing at them.
+That is not fastidiousness - pointing at them works for exactly as long as the
+identity map lasts, and then faults the first time anything prints them. It
+did, during this work:
 
-```c
-if (bp && bp->reserved_hi > bp->reserved_lo && bp->reserved_lo < PAGE_SIZE) {
-    pr_warn("the loader's info block overlaps the null page; mapping it "
-            "and giving up NULL-dereference detection");
-    ...
-}
+```
+ page fault at 0x00008400 in low user space (unmapped by design)
+  at  strlen+0x6
+Call trace:
+  [0] emit_number+0xd67
+  [1] kprintf+0x29
+  [2] cmd_version+0x5c
 ```
 
-No real loader does this. The warning exists so that if one ever does, the
-reason the check stopped working is in the log instead of being a mystery.
+A test now asserts that those strings live at kernel addresses and are still
+readable, so the bug cannot return quietly.
 
 ---
 
@@ -336,29 +388,30 @@ critical sections are short and bounded.
 
 ---
 
-## Design trade-off: identity-mapped, not higher-half
+## Historical note: this was once identity-mapped
 
-The kernel lives at 1 MiB in both the physical and virtual address space,
-rather than being relocated to `0xC0000000` as a production kernel would be.
+Until v0.4.0 the kernel was linked and loaded at 1 MiB, with virtual addresses
+equal to physical ones. That kept both boot paths trivially simple, but it
+meant every process had to share the bottom of its address space with the
+kernel - so there was no clean way to give userspace a private 3 GiB, and no
+real isolation beyond the `USER` bit.
 
-**What that buys.** Both boot paths stay simple: stage 2 copies ELF segments
-to their physical addresses and jumps, with no early page tables and no
-assembly trampoline that has to run at a different address than it was linked
-for. Physical addresses from the firmware remain directly usable. The
-`CR0.PG` transition changes nothing observable, which makes it debuggable.
+The relocation cost a link script using `AT()`, about forty instructions of
+early assembly, and an audit of every place that assumed virtual equals
+physical: the frame-allocator bitmap, the VGA framebuffer, the boot
+information block. What it bought is the precondition for per-process address
+spaces - and a kernel/user boundary that is now a single comparison:
 
-**What it costs.** Every process would have to share the bottom of its address
-space with the kernel, so there is no clean way to give userspace a full
-private 3 GiB. There is no guard between the kernel image and user mappings
-beyond the `USER` bit. It is the main structural reason this kernel cannot
-grow real processes without being relocated first.
+```c
+/* core/syscall.c - this used to have to enumerate individual kernel windows */
+if (is_kernel_address(base) || is_kernel_address(base + len - 1))
+    return false;
+```
 
-Moving to the higher half means a linker script using `AT()` to separate
-virtual and load addresses, early page tables built before C runs, and a jump
-to the virtual entry point — a contained change, and the first item in
-[ROADMAP.md](ROADMAP.md).
-
----
+It also moved the ring-3 payload from a section of the kernel to a genuinely
+separate ELF, because a program linked at a kernel address and mapped
+elsewhere has every string literal pointing where ring 3 cannot read. See
+[USERSPACE.md](USERSPACE.md).
 
 ## Current limitations
 
@@ -371,3 +424,10 @@ to the virtual entry point — a contained change, and the first item in
   large region from coalescing. Slab caches are the usual answer.
 - **64 MiB heap ceiling** (`KHEAP_MAX_SIZE`), chosen to keep the window well
   clear of the recursive mapping.
+- **One address space.** The kernel is in the higher half, which is the
+  precondition for per-process address spaces, but there is still a single
+  page directory: `context_switch` does not touch CR3, and two user programs
+  would share a view of memory. That is the next thing to build.
+- **The linear map is capped at 16 MiB**, so the frame bitmap and anything
+  else the kernel addresses physically must fit below it. `pmm_init()` panics
+  with an explicit message rather than corrupting memory if it does not.

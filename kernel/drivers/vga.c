@@ -27,7 +27,7 @@
 /* The top row is a status bar; normal output lives below it. */
 #define TEXT_TOP          1
 
-static volatile u16 *const fb = (volatile u16 *)VGA_PHYS;
+static volatile u16 *const fb = (volatile u16 *)VGA_VIRT;
 static size_t cur_x, cur_y;
 static u8 attr;
 static bool cursor_visible = true;

@@ -1,20 +1,25 @@
 /* StratumOS - dropping to ring 3.
  *
- * The user payload is compiled into the kernel image in its own `.user`
- * section (see core/user_demo.c and linker/kernel.ld). At boot its pages are
- * re-mapped with the USER bit set - read-only and executable - and a separate
- * writable user stack is allocated. Then usermode_enter() forges an
- * inter-privilege IRET frame and the CPU drops to ring 3.
+ * The user program is a separate ELF, built from user/ and embedded in the
+ * kernel image as a blob. At boot its segments are loaded into
+ * user-accessible pages by kernel/core/elf.c, a stack is allocated, and
+ * usermode_enter() forges an inter-privilege IRET frame.
  *
- * Shipping the payload inside the kernel rather than loading it from a
- * filesystem is a deliberate scoping decision: there is no filesystem yet, and
- * the point of the exercise is the privilege transition, not ELF loading -
- * which the bootloader already demonstrates.
+ * Building it separately rather than as a section of the kernel is not
+ * cosmetic. A program linked at a kernel address and then mapped somewhere
+ * else would have every absolute reference - every string literal - pointing
+ * into the kernel's half, where ring 3 cannot read. Linking it for user space
+ * is the only way its own addresses are addresses it can use.
+ *
+ * Embedding the blob rather than reading it from a filesystem is a scoping
+ * decision: there is no filesystem yet, and the loader is written so that
+ * swapping the blob for a file read is the only change needed.
  */
 #define LOG_TAG "user"
 
 #include <arch/gdt.h>
 
+#include <kernel/elf.h>
 #include <kernel/kernel.h>
 #include <kernel/log.h>
 #include <kernel/panic.h>
@@ -24,47 +29,27 @@
 #include <mm/pmm.h>
 #include <mm/vmm.h>
 
-/* The user stack. Placed well away from both the identity map and the kernel
- * heap window so that a stack overflow lands on an unmapped page and faults
- * instead of quietly corrupting something. */
+/* Produced by objcopy from build/user/init.elf - see the Makefile. */
+extern const u8 _binary_init_elf_start[];
+extern const u8 _binary_init_elf_end[];
+
+/* The user stack. Placed well below the kernel boundary and well above the
+ * program image, so that an overflow in either direction lands on an unmapped
+ * page and faults rather than quietly corrupting the other. */
 #define USER_STACK_TOP   0xB0000000u
-#define USER_STACK_PAGES 2
+#define USER_STACK_PAGES 4
 
 static bool ran;
+static struct elf_load_info loaded;
 
 bool usermode_ran(void)
 {
     return ran;
 }
 
-static bool map_user_payload(void)
+static size_t payload_size(void)
 {
-    u32 start = (u32)__user_start;
-    u32 end = (u32)__user_end;
-
-    if (end <= start) {
-        pr_err("the .user section is empty - nothing to run in ring 3");
-        return false;
-    }
-
-    if (!IS_ALIGNED(start, PAGE_SIZE)) {
-        pr_err(".user section is not page aligned (%p)", (void *)start);
-        return false;
-    }
-
-    /* The payload is already identity-mapped as part of the kernel image; all
-     * that changes is its permissions. USER is added so ring 3 can read and
-     * execute it, and WRITE is deliberately left off so it cannot patch its
-     * own code. vmm_protect() keeps the existing frame, which is why this is
-     * not a vmm_map() call. */
-    if (!vmm_protect_range(start, end - start, PTE_PRESENT | PTE_USER)) {
-        pr_err("cannot change the .user section's permissions");
-        return false;
-    }
-
-    pr_info(".user payload mapped %p-%p as ring-3 read/execute", (void *)start,
-            (void *)end);
-    return true;
+    return (size_t)(_binary_init_elf_end - _binary_init_elf_start);
 }
 
 static bool map_user_stack(void)
@@ -74,6 +59,8 @@ static bool map_user_stack(void)
 
         if (!vmm_alloc_at(page, PTE_PRESENT | PTE_WRITE | PTE_USER)) {
             pr_err("cannot allocate the user stack");
+            for (u32 j = 1; j < i; j++)
+                vmm_unmap(USER_STACK_TOP - j * PAGE_SIZE);
             return false;
         }
     }
@@ -91,24 +78,42 @@ static void usermode_task(void *arg)
     struct task *self = task_current();
 
     /* The CPU finds the ring-0 stack to switch to on a trap in the TSS, so it
-     * must point at *this* task's kernel stack before we leave ring 0. */
+     * must point at *this* task's kernel stack before we leave ring 0. Get
+     * this wrong and a ring-3 interrupt corrupts another task's stack. */
     tss_set_kernel_stack(self->kernel_esp0);
     self->user = true;
 
-    pr_info("pid %u entering ring 3 at %p", self->pid, (void *)user_demo_entry);
+    pr_info("pid %u entering ring 3 at %p", self->pid, (void *)loaded.entry);
     ran = true;
 
-    /* Does not return: the task's remaining life is spent in ring 3, and it
-     * leaves via the exit syscall. */
-    usermode_enter((vaddr_t)user_demo_entry, USER_STACK_TOP);
+    /* Does not return: the task spends the rest of its life in ring 3 and
+     * leaves through the exit syscall. */
+    usermode_enter(loaded.entry, USER_STACK_TOP);
 }
 
 bool usermode_spawn_demo(void)
 {
-    if (!map_user_payload())
+    size_t size = payload_size();
+
+    if (size == 0) {
+        pr_err("the embedded user program is empty");
         return false;
-    if (!map_user_stack())
+    }
+
+    pr_debug("embedded user program: %u bytes", (unsigned)size);
+
+    if (!elf_load_user(_binary_init_elf_start, size, &loaded))
         return false;
 
-    return task_create("usermode", usermode_task, NULL) != NULL;
+    if (!map_user_stack()) {
+        elf_unload_user(&loaded);
+        return false;
+    }
+
+    if (!task_create("init", usermode_task, NULL)) {
+        elf_unload_user(&loaded);
+        return false;
+    }
+
+    return true;
 }
