@@ -21,6 +21,7 @@
 #include <arch/io.h>
 #include <arch/irq.h>
 
+#include <drivers/ata.h>
 #include <drivers/timer.h>
 #include <drivers/vga.h>
 
@@ -40,6 +41,9 @@
 #include <mm/heap.h>
 #include <mm/pmm.h>
 #include <mm/vmm.h>
+
+#include <fs/blockdev.h>
+#include <fs/fat16.h>
 
 void ktest_check(struct ktest_result *r, bool ok, const char *what)
 {
@@ -1081,6 +1085,383 @@ static void test_hardening(struct ktest_result *r)
     KT_ASSERT(r, (vmm_pde_raw(0) & PTE_PRESENT) == 0);
 }
 
+/* ---- the disk, the partition table and the filesystem ------------------
+ *
+ * These run against whatever the kernel actually booted from, which is the
+ * point: the raw disk image has an ATA drive with a real MBR and a FAT16
+ * partition, and the GRUB ISO has an ATAPI CD-ROM and no partition at all.
+ * One suite has to pass on both, so each group checks either the real thing
+ * or the absence of it - never "skip", which is how a test suite quietly
+ * stops testing anything.
+ */
+static void test_storage(struct ktest_result *r)
+{
+    struct ata_stats as;
+
+    ata_get_stats(&as);
+
+    /* Nothing should have failed getting this far: the kernel read sector 0
+     * of every drive during the partition scan. */
+    KT_EQ(r, as.errors, 0u);
+    KT_EQ(r, as.timeouts, 0u);
+
+    KT_ASSERT(r, ata_drive_count() <= ATA_MAX_DRIVES);
+    KT_ASSERT(r, ata_get_drive(ATA_MAX_DRIVES) == NULL);
+
+    if (ata_drive_count() == 0) {
+        /* The ISO path. The CD-ROM is ATAPI, which IDENTIFY refuses, so
+         * there is no block device to read - and the block layer has to say
+         * so rather than registering something unusable. */
+        KT_EQ(r, blockdev_count(), 0u);
+        KT_ASSERT(r, blockdev_first_fs() == NULL);
+        KT_ASSERT(r, !fat16_mounted());
+        return;
+    }
+
+    /* --- the drive ------------------------------------------------------ */
+    const struct ata_drive *d = NULL;
+    u32 found = 0;
+
+    for (u32 i = 0; i < ATA_MAX_DRIVES; i++)
+        if (ata_get_drive(i)) {
+            found++;
+            if (!d)
+                d = ata_get_drive(i);
+        }
+
+    KT_EQ(r, found, ata_drive_count());
+    KT_ASSERT(r, d != NULL);
+    KT_ASSERT(r, d->sectors > 0);
+    KT_ASSERT(r, d->model[0] != '\0');
+
+    /* --- reading --------------------------------------------------------- */
+    u8 *buf = kmalloc(2 * ATA_SECTOR_SIZE);
+
+    KT_ASSERT(r, buf != NULL);
+    if (!buf)
+        return;
+
+    /* Sector 0 is the MBR this kernel booted from, so its signature is known
+     * before the read - which makes this a test of the read rather than of
+     * whatever happened to be on the disk. */
+    memset(buf, 0, ATA_SECTOR_SIZE);
+    KT_ASSERT(r, ata_read(0, 0, 1, buf));
+    KT_EQ(r, buf[510], 0x55);
+    KT_EQ(r, buf[511], 0xAA);
+
+    /* A multi-sector read must agree with two single-sector reads. Getting
+     * the per-sector DRQ handshake wrong is the classic PIO bug, and it
+     * shows up as the second sector being a copy of the first. */
+    u8 *one = kmalloc(ATA_SECTOR_SIZE);
+
+    if (one) {
+        KT_ASSERT(r, ata_read(0, 0, 2, buf));
+        KT_ASSERT(r, ata_read(0, 1, 1, one));
+        KT_ASSERT(r, memcmp(buf + ATA_SECTOR_SIZE, one, ATA_SECTOR_SIZE) == 0);
+        /* ...and the two sectors must differ, or the comparison above would
+         * pass on a driver that returned the same sector twice. */
+        KT_ASSERT(r, memcmp(buf, one, ATA_SECTOR_SIZE) != 0);
+        kfree(one);
+    }
+
+    /* Refusals. Each of these is a request a corrupt filesystem could
+     * generate, and each must be refused here rather than by the drive.
+     *
+     * Each also logs an error, correctly - and CI treats an unexpected ERROR
+     * line as a failure, also correctly. So the window below counts them
+     * instead, and the count is asserted afterwards: a refusal that happened
+     * silently would be as wrong as one that did not happen. */
+    log_expect_errors(true);
+
+    KT_ASSERT(r, !ata_read(0, d->sectors, 1, buf));     /* past the end */
+    KT_ASSERT(r, !ata_read(0, d->sectors - 1, 2, buf)); /* straddles it */
+    KT_ASSERT(r, !ata_read(0, 0xFFFFFFFFFFFFFFFFull, 2, buf)); /* wraps   */
+    KT_ASSERT(r, !ata_read(ATA_MAX_DRIVES, 0, 1, buf)); /* no such disk */
+    KT_ASSERT(r, !ata_read(0, 0, 1, NULL));             /* no buffer    */
+
+    u32 complaints = log_expected_errors();
+
+    log_expect_errors(false);
+
+    /* Five refusals, five complaints. An exact count rather than "more than
+     * zero", because a driver that refused silently would pass the weaker
+     * check and leave whoever hit it with nothing to read. */
+    KT_EQ(r, complaints, 5u);
+
+    /* Zero sectors is a no-op, not an error - so it must not have logged. */
+    KT_ASSERT(r, ata_read(0, 0, 0, buf));
+
+    /* --- the partition table ------------------------------------------- */
+    KT_ASSERT(r, blockdev_count() >= 1);
+    KT_ASSERT(r, blockdev_find("hd0") != NULL);
+    KT_ASSERT(r, blockdev_find("nonsuch") == NULL);
+    KT_ASSERT(r, blockdev_find(NULL) == NULL);
+
+    const struct blockdev *whole = blockdev_find("hd0");
+
+    if (whole) {
+        KT_EQ(r, whole->first_lba, 0ull);
+        KT_EQ(r, whole->sectors, d->sectors);
+        KT_EQ(r, whole->partition_type, 0);
+
+        log_expect_errors(true);
+        KT_ASSERT(r, !blockdev_read(whole, whole->sectors, 1, buf));
+        KT_ASSERT(r, !blockdev_read(NULL, 0, 1, buf));
+        complaints = log_expected_errors();
+        log_expect_errors(false);
+        KT_EQ(r, complaints, 2u);
+    }
+
+    const struct blockdev *part = blockdev_first_fs();
+
+    if (!part) {
+        /* A disk with no FAT partition. Then nothing may be mounted, and
+         * exec must be falling back to the embedded programs. */
+        KT_ASSERT(r, !fat16_mounted());
+        kfree(buf);
+        return;
+    }
+
+    /* The partition is inside the disk, and its reads are offset by its
+     * start. Forgetting that offset is the bug a single-disk layout exists
+     * to catch: the filesystem would read the kernel's sectors and blame its
+     * own metadata. */
+    KT_ASSERT(r, part->first_lba > 0);
+    KT_ASSERT(r, part->first_lba + part->sectors <= d->sectors);
+
+    KT_ASSERT(r, blockdev_read(part, 0, 1, buf));
+
+    u8 *direct = kmalloc(ATA_SECTOR_SIZE);
+
+    if (direct) {
+        KT_ASSERT(r, ata_read(part->drive, part->first_lba, 1, direct));
+        KT_ASSERT(r, memcmp(buf, direct, ATA_SECTOR_SIZE) == 0);
+        kfree(direct);
+    }
+
+    /* The partition's first sector is the FAT boot sector, not the MBR. */
+    KT_EQ(r, buf[510], 0x55);
+    KT_EQ(r, buf[511], 0xAA);
+    KT_ASSERT(r, memcmp(buf + 54, "FAT16   ", 8) == 0);
+
+    /* And a read past the partition's end must be refused by the block
+     * layer, even though those sectors exist on the disk. This is the check
+     * that keeps a filesystem inside its own partition. */
+    log_expect_errors(true);
+    KT_ASSERT(r, !blockdev_read(part, part->sectors, 1, buf));
+    KT_ASSERT(r, !blockdev_read(part, part->sectors - 1, 2, buf));
+    complaints = log_expected_errors();
+    log_expect_errors(false);
+    KT_EQ(r, complaints, 2u);
+
+    kfree(buf);
+}
+
+static void test_filesystem(struct ktest_result *r)
+{
+    if (!fat16_mounted()) {
+        /* The ISO path again. Everything has to refuse cleanly rather than
+         * dereference a filesystem that was never mounted. */
+        struct fat_dirent e;
+
+        KT_ASSERT(r, !fat16_stat("/", &e));
+        KT_ASSERT(r, !fat16_readdir("/", 0, &e));
+        KT_ASSERT(r, fat16_read_whole("/bin/INIT", 1 * MIB, NULL) == NULL);
+        KT_ASSERT(r, strcmp(fat16_device_name(), "(none)") == 0);
+        return;
+    }
+
+    const struct fat_info *f = fat16_get_info();
+
+    /* --- the geometry the BPB described -------------------------------- */
+    KT_EQ(r, f->bytes_per_sector, (u16)BLOCK_SIZE);
+    KT_ASSERT(r, f->sectors_per_cluster > 0);
+    KT_ASSERT(r, f->cluster_bytes == (u32)f->sectors_per_cluster * BLOCK_SIZE);
+    KT_ASSERT(r, f->fat_start >= f->reserved_sectors);
+    KT_ASSERT(r, f->root_start > f->fat_start);
+    KT_ASSERT(r, f->data_start > f->root_start);
+    KT_ASSERT(r, f->data_start < f->total_sectors);
+    /* FAT16's defining property is the cluster count, not the fs_type
+     * string - which is a comment and is routinely wrong. */
+    KT_ASSERT(r, f->cluster_count >= 4085 && f->cluster_count <= 65524);
+
+    /* --- the root ------------------------------------------------------- */
+    struct fat_dirent root;
+
+    KT_ASSERT(r, fat16_stat("/", &root));
+    KT_ASSERT(r, root.is_dir);
+    KT_EQ(r, root.first_cluster, 0); /* FAT16's root has no cluster number */
+
+    /* --- a directory, and a file inside it ----------------------------- */
+    struct fat_dirent bin, init;
+
+    KT_ASSERT(r, fat16_stat("/bin", &bin));
+    KT_ASSERT(r, bin.is_dir);
+    KT_ASSERT(r, bin.first_cluster >= 2);
+
+    KT_ASSERT(r, fat16_stat("/bin/INIT", &init));
+    KT_ASSERT(r, !init.is_dir);
+    KT_ASSERT(r, init.size > 0);
+    KT_ASSERT(r, init.first_cluster >= 2);
+
+    /* Case-insensitive, because FAT is - and because `exec("/bin/init")`
+     * has to find `INIT`. */
+    struct fat_dirent lower;
+
+    KT_ASSERT(r, fat16_stat("/bin/init", &lower));
+    KT_EQ(r, lower.first_cluster, init.first_cluster);
+    KT_EQ(r, lower.size, init.size);
+
+    /* Redundant separators are not a syntax error. */
+    KT_ASSERT(r, fat16_stat("//bin//INIT", &lower));
+    KT_EQ(r, lower.first_cluster, init.first_cluster);
+
+    /* --- refusals ------------------------------------------------------- */
+    KT_ASSERT(r, !fat16_stat("/nosuchfile", &lower));
+    KT_ASSERT(r, !fat16_stat("/bin/nosuchfile", &lower));
+    KT_ASSERT(r, !fat16_stat("/bin/INIT/nonsense", &lower)); /* not a dir   */
+    KT_ASSERT(r, !fat16_stat("bin/INIT", &lower));           /* relative    */
+    KT_ASSERT(r, !fat16_stat("/averylongnamethatcannotfit", &lower));
+    KT_ASSERT(r, !fat16_stat(NULL, &lower));
+    KT_ASSERT(r, !fat16_stat("/", NULL));
+    /* Reading a directory as a file, and a file as a directory. */
+    KT_ASSERT(r, fat16_read(&bin, 0, &lower, 4) == -1);
+    KT_ASSERT(r, !fat16_readdir("/bin/INIT", 0, &lower));
+
+    /* --- reading --------------------------------------------------------- */
+    u8 *whole = fat16_read_whole("/bin/INIT", 1 * MIB, NULL);
+    u32 size = 0;
+
+    kfree(whole);
+    whole = fat16_read_whole("/bin/INIT", 1 * MIB, &size);
+
+    KT_ASSERT(r, whole != NULL);
+    KT_EQ(r, size, init.size);
+
+    if (whole) {
+        /* It is an ELF, because it is the program this kernel runs. Reading
+         * the right length of the wrong file would pass every check above. */
+        KT_EQ(r, whole[0], 0x7F);
+        KT_ASSERT(r, memcmp(whole + 1, "ELF", 3) == 0);
+
+        /* A chunked read must agree with the whole-file read, including
+         * across a cluster boundary - which is where following the chain
+         * either works or silently repeats a cluster. */
+        u32 chunk_size = 100; /* deliberately not a divisor of anything */
+        u8 *chunked = kmalloc(size);
+
+        KT_ASSERT(r, chunked != NULL);
+
+        if (chunked) {
+            u32 offset = 0;
+            bool ok = true;
+
+            while (offset < size) {
+                u32 want =
+                    size - offset < chunk_size ? size - offset : chunk_size;
+                i32 got = fat16_read(&init, offset, chunked + offset, want);
+
+                if (got != (i32)want) {
+                    ok = false;
+                    break;
+                }
+                offset += (u32)got;
+            }
+
+            KT_ASSERT(r, ok);
+            KT_EQ(r, offset, size);
+            KT_ASSERT(r, memcmp(chunked, whole, size) == 0);
+
+            /* An unaligned read straddling a cluster boundary has to return
+             * the same bytes as the whole-file read at that offset. */
+            if (size > f->cluster_bytes + 8) {
+                u8 straddle[16];
+                u32 at = f->cluster_bytes - 8;
+
+                KT_ASSERT(r,
+                          fat16_read(&init, at, straddle, sizeof(straddle)) ==
+                              (i32)sizeof(straddle));
+                KT_ASSERT(r,
+                          memcmp(straddle, whole + at, sizeof(straddle)) == 0);
+            }
+
+            kfree(chunked);
+        }
+
+        /* Reading at and past the end. A short read at the end is correct; a
+         * read past it is zero bytes, not an error. */
+        u8 tail[8];
+
+        KT_EQ(r, fat16_read(&init, size - 4, tail, sizeof(tail)), 4);
+        KT_EQ(r, fat16_read(&init, size, tail, sizeof(tail)), 0);
+        KT_EQ(r, fat16_read(&init, size + 1000, tail, sizeof(tail)), 0);
+        KT_EQ(r, fat16_read(&init, 0, tail, 0), 0);
+
+        kfree(whole);
+    }
+
+    /* A size bound that the file exceeds must refuse rather than truncate:
+     * the length comes off the disk, and a caller that asked for at most N
+     * bytes cannot be handed a buffer of N+1. */
+    KT_ASSERT(r, fat16_read_whole("/bin/INIT", init.size - 1, &size) == NULL);
+    KT_ASSERT(r, fat16_read_whole("/bin/INIT", init.size, &size) != NULL ||
+                     init.size == 0);
+
+    /* --- readdir -------------------------------------------------------- */
+    u32 entries = 0;
+    bool saw_bin = false;
+
+    for (u32 i = 0; i < 64; i++) {
+        if (!fat16_readdir("/", i, &lower))
+            break;
+
+        entries++;
+        if (strcmp(lower.name, "BIN") == 0) {
+            saw_bin = true;
+            KT_ASSERT(r, lower.is_dir);
+        }
+    }
+
+    KT_ASSERT(r, entries > 0);
+    KT_ASSERT(r, saw_bin);
+    /* The volume label is a root directory entry with ATTR_VOLUME_ID, and it
+     * is not a file. A driver that reported it would list a phantom. */
+    KT_ASSERT(r, !fat16_stat("/STRATUM", &lower));
+
+    /* --- the single-sector cache ---------------------------------------
+     *
+     * Measured rather than asserted in the abstract. Reading a file in
+     * 64-byte chunks touches each 512-byte sector eight times in a row, so
+     * seven of every eight reads must come from the cache. Anything much
+     * below that means the cache is being invalidated between calls, which
+     * is the failure mode that makes a FAT walk one disk read per directory
+     * entry examined.
+     */
+    u32 reads_before = f->reads;
+    u32 hits_before = f->cache_hits;
+    u8 scratch[64];
+    u32 calls = 0;
+
+    for (u32 at = 0; at + sizeof(scratch) <= init.size; at += sizeof(scratch)) {
+        if (fat16_read(&init, at, scratch, sizeof(scratch)) !=
+            (i32)sizeof(scratch))
+            break;
+        calls++;
+    }
+
+    u32 reads = f->reads - reads_before;
+    u32 hits = f->cache_hits - hits_before;
+
+    KT_ASSERT(r, calls > 16); /* the file is big enough for this to mean
+                                 something */
+    KT_ASSERT(r, hits > 0);
+    /* Eight 64-byte reads per 512-byte sector, so misses should be about an
+     * eighth of the calls. Allow a factor of two for the FAT sector reads
+     * that the chain walk mixes in. */
+    KT_ASSERT(r, reads < calls / 4);
+    KT_ASSERT(r, hits > reads * 2);
+}
+
 static const struct ktest tests[] = {
     {"string", "string and formatting primitives", test_string},
     {"boot", "boot protocol normalisation", test_boot},
@@ -1096,6 +1477,8 @@ static const struct ktest tests[] = {
     {"proc", "process table, fork guards, exec namespace", test_processes},
     {"harden", "W^X, guard pages, SMEP/SMAP, kernel/user split",
      test_hardening},
+    {"storage", "ATA PIO reads and the MBR partition table", test_storage},
+    {"fs", "FAT16: geometry, paths, cluster chains", test_filesystem},
     {"ksyms", "embedded symbol table lookup", test_ksyms},
     {"profile", "sampling profiler attribution", test_profile},
 };

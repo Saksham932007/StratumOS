@@ -560,3 +560,143 @@ the resolved symbol and the call trace all arrive after it.
 writable again — exactly the regression that is invisible to every other test
 in the suite. Asserting on the exit code is what makes the scenario a test of
 the CPU rather than of a log line.
+
+---
+
+## 22. One disk, with a real partition table
+
+**Decision.** The kernel and the filesystem share a single disk image. Sector
+0 is both stage 1 and a real MBR partition table, and the FAT16 partition
+starts at LBA 2048 — 1 MiB in, aligned the way every partitioning tool has
+aligned since about 2010.
+
+**Rejected: a second drive.** `-drive index=1` carrying the filesystem would
+have been less work in the Makefile and in the kernel, and it would have
+tested less. A filesystem whose partition starts at LBA 0 works whether or not
+the block layer is adding the partition's offset, so the bug that layer exists
+to prevent would have been invisible. With one disk, the partition table has
+to be parsed correctly and every filesystem read has to be offset, and the
+`storage` suite can assert the two agree: a read of `hd0p1` block 0 must
+return the same bytes as a read of `hd0` at the partition's first LBA.
+
+**Rejected: no partition table, a bare filesystem after the kernel.** Then the
+kernel needs to be told where the filesystem is, which means another field in
+stage 2's header — a private convention where a standard already exists, and
+an image no other tool could read. The current image mounts under `mdir` and
+`mtype` unchanged, which is how the formatter was checked in the first place.
+
+**Cost.** Stage 1 has 446 usable bytes rather than 510, because the table
+starts at 446. It uses 315. Both `mkimage.py` and `check-image.py` verify that
+rather than assuming it, because the assembler cannot: as far as NASM is
+concerned the whole 510 bytes are free.
+
+**Why.** The partition table is the piece that makes this a disk rather than a
+file with a kernel at the front, and parsing one is a thing an operating
+system does. Only the LBA fields are written and only the LBA fields are read;
+the CHS fields exist for pre-1994 BIOSes, cannot describe anything past 8 GiB,
+and are wrong on most real disks.
+
+---
+
+## 23. The FAT driver's cache is split by purpose, because measuring it said so
+
+**Decision.** Two cached sectors: one slot for the allocation table, one for
+directory entries and file contents.
+
+**Rejected: one slot.** This was the first implementation, and it shipped with
+a comment confidently explaining that a second entry would buy nothing for
+either access pattern. The comment was wrong, and the test suite is what said
+so: reading a file in 64-byte chunks touches each 512-byte sector eight times,
+so seven of every eight reads should be hits. Fewer than half were.
+
+The reason, once measured, is obvious in hindsight. Reading a file alternates
+between FAT sectors — to follow the chain — and data sectors, to copy bytes
+out. With one slot each evicted the other on every step. 360 sector reads
+against 321 hits became 150 reads against 1224 hits once the slots were
+separated: 47% to 89% on the identical workload.
+
+**Rejected: an LRU pair.** Two slots with a replacement policy would behave
+the same here and would need the policy. Splitting by *purpose* needs none,
+and it makes it structurally impossible for one stream to starve the other.
+
+**Rejected: more slots.** There is no third stream. A directory entry and a
+file's contents are both "data", and only one is being read at a time.
+
+**Cost.** 1 KiB of static buffer instead of 512 bytes, and a `slot` parameter
+on `read_sector()` that every caller has to get right — which is exactly two
+places: `fat_next()` passes `CACHE_FAT`, everything else passes
+`CACHE_DATA`.
+
+**Why.** It is the one decision in this file that was made by measurement
+rather than by reasoning, and the reasoning had been wrong. The test that
+caught it was written to check the mechanism rather than the outcome: both
+versions read the right bytes, and only one of them was doing a sensible
+amount of work to get them.
+
+---
+
+## 24. ATA by polled programmed I/O
+
+**Decision.** The disk driver moves data through the data register, 256 16-bit
+reads per sector, and spins on the status register rather than sleeping on
+IRQ 14. It even sets `nIEN` so the drive does not assert its interrupt at all.
+
+**Rejected: bus-mastering DMA.** The fast answer, and the one a real kernel
+uses. It needs a physical region descriptor table, a scatter list of physical
+addresses, the controller's own BAR from PCI config space, and a completion
+interrupt — four new things, none of which can be debugged until reading a
+sector works at all.
+
+**Rejected: interrupt-driven PIO.** Halfway, and the worst of both. It needs a
+state machine to remember which sector of which request is in flight, a
+decision about what happens when a request completes while its handler is
+still being installed, and an answer for two channels sharing a line. All of
+that for a driver that is still copying with the CPU.
+
+**Cost.** A read burns the rest of a timeslice. On real hardware that is the
+difference between a disk-bound workload working and not; under emulation it
+is free, which is honest to say rather than hide. Every wait is bounded at 3
+million status reads, because a drive that never clears BSY would otherwise
+hang the kernel at boot with no message — the least debuggable failure a
+driver can have.
+
+**Why.** The read path is a straight line that can be read top to bottom, and
+the two things that are actually easy to get wrong — the 400 ns settling delay
+after a drive select, and one DRQ handshake *per sector* rather than per
+command — are visible in it rather than buried in a state machine. The second
+of those is the nastiest bug available here: transferring every sector after a
+single wait works under emulation and fails on hardware. The test suite
+therefore reads two sectors in one command, requires the result to equal two
+single-sector reads, and requires the two sectors to *differ* — so the
+comparison cannot pass on a driver that returned the same sector twice.
+
+---
+
+## 25. Errors the tests provoke are counted, not silenced
+
+**Decision.** `log_expect_errors(true)` opens a window in which `ERROR`-level
+lines are counted instead of printed. A test asserts the count afterwards.
+
+**Rejected: softening the messages.** A read past the end of a disk, a
+partition read that leaves its partition, an ELF with a corrupt header — each
+of those is a genuine error when it happens for real, and CI is right to treat
+an unexpected `ERROR` line as a failure. Downgrading them to warnings to keep
+the test suite quiet would be letting the tests damage the thing being tested.
+
+**Rejected: a FORBIDDEN exception for the known strings.** Then the exception
+list grows with every test, and it stops distinguishing an error the suite
+provoked from the same error happening somewhere it should not.
+
+**Rejected: suppressing instead of counting.** Simpler, and strictly weaker.
+Five refusals must produce five complaints: a driver that refuses *silently*
+passes a suppression check and fails this one. A refusal nobody can see is
+nearly as bad as no refusal at all.
+
+**Cost.** A global flag and a counter in the logging layer, touched only by
+test code, plus the discipline that a window has to be closed. It covers only
+the two highest levels, and only while a test asks for it.
+
+**Why.** The two requirements — "CI must fail on an unexpected error" and
+"tests must provoke errors" — look like they conflict and do not. The window
+makes the expectation explicit at the call site, and asserting the count turns
+it from an exemption into an additional assertion.

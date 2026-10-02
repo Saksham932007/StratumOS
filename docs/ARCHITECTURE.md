@@ -4,31 +4,33 @@
 
 ```
                          ┌──────────────────────────┐
-                         │   shell (task, ring 0)   │  25 commands, history
+                         │   shell (task, ring 0)   │  29 commands, history
                          └────────────┬─────────────┘
                                       │
    ┌──────────────┐      ┌────────────┴─────────────┐      ┌──────────────┐
    │ init, hello  │      │        scheduler         │      │   ktest      │
-   │ (ring 3)     │◄────►│  round robin, 100 Hz     │      │ 15 suites    │
+   │ (ring 3)     │◄────►│  round robin, 100 Hz     │      │ 17 suites    │
    └──────┬───────┘      └────────────┬─────────────┘      └──────────────┘
           │ int 0x80                  │
-   ┌──────┴───────┐                   │
-   │   syscall    │  pointer          │  fork / exec / wait
-   │   dispatch   │  validation       │  per-process address spaces
+   ┌──────┴───────┐                   │  fork / exec / wait
+   │   syscall    │  pointer          │  per-process address spaces
+   │   dispatch   │  validation       │
    └──────┬───────┘                   │
           │                           │
-   ┌──────┴───────────────────────────┴─────────────────────────────────┐
-   │                        kernel services                            │
-   │   kprintf · log · panic+backtrace · string · div64 · spinlock     │
-   └──────┬──────────────────┬──────────────────┬─────────────────────┬─┘
-          │                  │                  │                     │
-   ┌──────┴──────┐    ┌──────┴──────┐    ┌──────┴──────┐    ┌─────────┴────┐
-   │ heap        │    │    vmm      │    │    pmm      │    │   drivers    │
-   │ kmalloc     │───►│  paging     │───►│  frames     │    │ serial  vga  │
-   │ guarded     │    │  COW, clone │    │  bitmap+ref │    │ pit     kbd  │
-   └─────────────┘    └──────┬──────┘    └──────┬──────┘    │ rtc     pci  │
-                             │                  │           └──────┬───────┘
-   ┌─────────────────────────┴──────────────────┴──────────────────┴───────┐
+   ┌──────┴───────────────────────────┴───────────────────────────────────┐
+   │                        kernel services                              │
+   │   kprintf · log · panic+backtrace · string · div64 · spinlock       │
+   │   elf loader · symbol table · benchmarks · profiler                 │
+   └──┬──────────────┬──────────────┬──────────────┬─────────────────────┬┘
+      │              │              │              │                     │
+ ┌────┴─────┐  ┌─────┴──────┐  ┌────┴─────┐  ┌─────┴──────┐  ┌───────────┴──┐
+ │  heap    │  │    vmm     │  │   pmm    │  │    fs      │  │   drivers    │
+ │ kmalloc  │─►│  paging    │─►│  frames  │  │  fat16     │  │ serial  vga  │
+ │ guarded  │  │ COW, clone │  │ bitmap   │  │  blockdev  │─►│ pit     kbd  │
+ └──────────┘  └─────┬──────┘  │  + refs  │  └────────────┘  │ rtc     pci  │
+                     │         └────┬─────┘                  │ ata (PIO)    │
+                     │              │                        └───────┬──────┘
+   ┌─────────────────┴──────────────┴────────────────────────────────┴──────┐
    │                        arch/x86                                       │
    │   gdt+tss · idt (256 vectors) · irq (8259 PIC) · cpu (CPUID)          │
    │   harden (SMEP/SMAP, W^X, the kernel/user split)                      │
@@ -69,10 +71,11 @@ out of sequence.
 | 13 | `heap_init` | Needs paging, because the heap is a virtual window backed on demand. |
 | 14 | `vmm_protect_kernel_text`, `harden_init` | Must follow paging, and must precede any second address space or any user program. Narrowing the kernel's own text needs one address space to narrow it in, and turning SMAP on afterwards would fault inside code already written without the `stac`/`clac` discipline. |
 | 15 | `rtc_init`, `pci_init` | Non-essential hardware. A failure is logged, not fatal. |
-| 16 | `sched_init` | Adopts the boot context as pid 0. |
-| 17 | `syscall_init` | Needs the IDT; re-installs vector 0x80 with DPL 3. |
-| 18 | task creation | Needs the scheduler, and the stack region the VMM reserved. |
-| 19 | `sched_start` | The boot context becomes the idle task and never returns. |
+| 16 | `ata_init`, `blockdev_init`, `fat16_mount` | Needs the heap, because the filesystem allocates. The ATA driver polls, so it needs nothing from the interrupt layer. Mounting is *allowed to fail*: the GRUB ISO path has no FAT partition, and a kernel that refused to boot without one could not be tested through both of its loaders. |
+| 17 | `sched_init` | Adopts the boot context as pid 0. |
+| 18 | `syscall_init` | Needs the IDT; re-installs vector 0x80 with DPL 3. |
+| 19 | task creation | Needs the scheduler, the stack region the VMM reserved, and - for `init` - the filesystem, which it reads its own image from. |
+| 20 | `sched_start` | The boot context becomes the idle task and never returns. |
 
 ### The `sti()` placement
 
@@ -197,5 +200,6 @@ cleanly instead of walking off into the heap.
 - [USERSPACE.md](USERSPACE.md) — the user programs, the ELF loader, the privilege boundary
 - [PROCESSES.md](PROCESSES.md) — address spaces, fork, copy-on-write, exec, wait
 - [SECURITY.md](SECURITY.md) — the mitigations, how each is enforced, and what is missing
+- [STORAGE.md](STORAGE.md) — the ATA driver, the partition table, FAT16, and where a program comes from
 - [PERFORMANCE.md](PERFORMANCE.md) — benchmarks, the profiler, the symbol table
 - [DESIGN-DECISIONS.md](DESIGN-DECISIONS.md) — the trade-offs behind the above

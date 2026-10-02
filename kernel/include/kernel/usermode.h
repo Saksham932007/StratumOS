@@ -31,4 +31,9 @@ bool usermode_exec(const char *name, struct regs *r);
 const char *usermode_program_name(u32 index);
 u32 usermode_exec_count(void);
 
+/* How many program images came off the disk, and how many from the copies
+ * embedded in the kernel image. The second number being non-zero on a kernel
+ * booted from a disk would mean a file is missing from the filesystem. */
+void usermode_get_load_counts(u32 *disk, u32 *embedded);
+
 #endif /* _KERNEL_USERMODE_H */

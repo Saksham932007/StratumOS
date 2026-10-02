@@ -6,13 +6,13 @@ the way to a preemptively scheduled, higher-half, paged kernel running an
 interactive shell and a separate user-space program in ring 3.
 
 [![CI](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml/badge.svg)](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml)
-![language](https://img.shields.io/badge/C11%20%2B%20NASM-16.2k%20lines-blue)
+![language](https://img.shields.io/badge/C11%20%2B%20NASM-19.5k%20lines-blue)
 ![arch](https://img.shields.io/badge/arch-x86%20(i686)-lightgrey)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 The same kernel binary boots two ways — through a bootloader written for this
-project, and through GRUB via Multiboot2 — and every push runs 385 assertions
-across 92 host unit tests, 15 in-kernel suites, and seven QEMU boot scenarios.
+project, and through GRUB via Multiboot2 — and every push runs 485 assertions
+across 92 host unit tests, 17 in-kernel suites, and seven QEMU boot scenarios.
 
 ```
 BIOS ─► stage 1 (512 B MBR) ─► stage 2 ─► 32-bit protected mode ─► kernel ─► ring 3
@@ -65,12 +65,15 @@ Concretely, from power-on:
    enables interrupts, builds a physical frame allocator from the firmware
    map, widens its linear map and drops the boot identity mapping, creates a
    guarded kernel heap, enumerates PCI, and starts a round-robin scheduler.
-6. **A user program** — a genuinely separate ELF, linked for user space — gets
-   an address space of its own, is loaded into user-accessible pages, and is
-   entered at ring 3, where it probes the syscall boundary from the untrusted
-   side, `fork`s, proves copy-on-write from inside the child, `wait`s for it,
-   and then `exec`s a different image into a second child.
-7. **The shell** runs as a scheduled task, reachable from the VGA console or
+6. **The disk** is probed with ATA IDENTIFY, its MBR partition table parsed
+   out of the same sector stage 1 booted from, and the FAT16 partition that
+   follows the kernel on that disk is mounted at `/`.
+7. **A user program** — a genuinely separate ELF, linked for user space — is
+   read from `/bin/INIT` on that filesystem, given an address space of its
+   own, and entered at ring 3, where it probes the syscall boundary from the
+   untrusted side, `fork`s, proves copy-on-write from inside the child,
+   `wait`s for it, and then `exec`s a different image into a second child.
+8. **The shell** runs as a scheduled task, reachable from the VGA console or
    over a serial line, with line editing and command history.
 
 Along the way the kernel narrows its own permissions: its `.text` and
@@ -130,7 +133,7 @@ StratumOS stage2
   [->] entering protected mode
 
   .-----------------------------------------------------.
-  | StratumOS 0.6.0  -  x86 kernel: real mode to ring 3 |
+  | StratumOS 0.7.0  -  x86 kernel: real mode to ring 3 |
   '-----------------------------------------------------'
 [    0.000] INFO  boot: serial COM1        [ok] 115200 8N1
 [    0.000] INFO  boot: CPU detect         [ok] GenuineIntel
@@ -144,20 +147,24 @@ StratumOS stage2
 [    0.030] INFO  vmm: paging: kernel at 0xc0000000, linear map 16 MiB, identity map dropped
 [    0.030] INFO  vmm: kernel half fully backed: 255 page tables (1020 KiB), so every address space sees identical kernel mappings
 [    0.030] INFO  heap: kernel heap at 0xd0000000, 1024 KiB committed, 64 MiB maximum
-[    0.040] INFO  vmm: kernel .text and .rodata mapped read-only (36 pages); CR0.WP makes that binding on ring 0 too
-[    0.040] INFO  harden: SMEP enabled, SMAP enabled
-[    0.040] INFO  boot: hardening          [ok] W^X, guard pages, SMEP + SMAP
-[    0.050] INFO  pci: 6 PCI devices found
-[    0.050] INFO  sched: scheduler ready; boot context adopted as pid 0 (idle)
-[    0.050] INFO  syscall: syscall gate installed at int 0x80 (11 calls available)
-[    0.060] INFO  boot: StratumOS 0.6.0 is up: 127 MiB RAM, 6 PCI devices, 15 test suites
+[    0.040] INFO  vmm: kernel .text and .rodata mapped read-only (43 pages); CR0.WP makes that binding on ring 0 too
+[    0.050] INFO  harden: SMEP enabled, SMAP enabled
+[    0.050] INFO  boot: hardening          [ok] W^X, guard pages, SMEP + SMAP
+[    0.060] INFO  pci: 6 PCI devices found
+[    0.060] INFO  ata: hd0: QEMU HARDDISK, 36864 sectors (18 MiB), LBA48
+[    0.070] INFO  blk: hd0p1: type 0e (FAT), LBA 2048 + 32768 sectors (16384 KiB)
+[    0.070] INFO  fat: mounted hd0p1: FAT16 "STRATUM", 16384 KiB, 8167 clusters of 2 KiB
+[    0.070] INFO  boot: filesystem         [ok] FAT16 "STRATUM" on hd0p1
+[    0.070] INFO  sched: scheduler ready; boot context adopted as pid 0 (idle)
+[    0.070] INFO  syscall: syscall gate installed at int 0x80 (11 calls available)
+[    0.080] INFO  boot: StratumOS 0.7.0 is up: 127 MiB RAM, 6 PCI devices, 17 test suites
 ```
 
 Ring 3, exercising the syscall boundary from the untrusted side, then
 forking, copying on write, and `exec`ing a different image:
 
 ```
-[    0.060] INFO  user: pid 4 entering ring 3 at 0x004000f0 in its own address space (7 user pages mapped)
+[    0.080] INFO  user: pid 4 entering ring 3 at 0x004000f0 in its own address space (7 user pages mapped, image from the filesystem)
   [ring3] hello from user mode - privilege level 3
   [ring3] getpid() returned 4
   [ring3] slept 50 ms via syscall
@@ -176,7 +183,7 @@ forking, copying on write, and `exec`ing a different image:
   [ring3] my own copy still reads 0x5a5a5a5a - copy-on-write gave the child a private page
   [ring3] exec(): forking a child to replace its own image
     [child] exec("nonexistent") failed cleanly and I am still here
-[    0.140] INFO  user: pid 7 exec("hello"): replacing 7 user pages
+[    0.160] INFO  user: pid 7 exec("hello") from the filesystem: replacing 7 user pages
 [    0.140] INFO  user: pid 7 now running "hello" at 0x00400000, 6 user pages
   [exec] hello: a different image, running in the same process
   [exec] getpid() returned 7 - the pid survived exec, the image did not
@@ -224,11 +231,43 @@ stratum> ps
      3     2  init           zombie    ring3 -                2       4
   4 tasks, 22 context switches total
 
+stratum> disk
+ATA drives
+  DEV  MODEL                           SECTORS    ADDR
+  hd0  QEMU HARDDISK                     36864   LBA48
+  2 read(s), 2 sector(s), 2 command(s), 0 error(s), 0 timeout(s)
+Block devices
+  NAME     TYPE        FIRST LBA      SECTORS
+  hd0      disk                0        36864
+  hd0p1    0e               2048        32768
+
+stratum> mount
+FAT16 "STRATUM" on hd0p1, mounted at /
+  geometry  : 512-byte sectors, 4 per cluster (2 KiB clusters)
+  layout    : 1 reserved, FAT at +1 (2 x 32 sectors), root at +65 (512 entries), data at +97
+  size      : 32768 sectors, 8167 clusters
+  activity  : 52 sector read(s), 30 cache hit(s), 8 lookup(s), 2 file(s) read whole
+
+stratum> ls /bin
+  NAME               SIZE  ATTR
+  .                     0  d---
+  ..                    0  d---
+  HELLO              8752  ----
+  INIT              12524  ----
+  2 file(s), 21276 bytes; 2 director(y|ies)
+
+stratum> cat /etc/MOTD.TXT
+console=vga,serial
+init=/bin/INIT
+
 stratum> programs
 Programs embedded in the kernel image (exec's namespace):
   init   (started at boot)
   hello
-  1 exec() calls so far this boot
+Programs on the filesystem (what exec() prefers):
+  /bin/HELLO            8752 bytes
+  /bin/INIT            12524 bytes
+  1 exec() call(s) this boot; 2 image(s) loaded from disk, 0 from the kernel image
 
 stratum> harden
 Kernel/user separation
@@ -325,10 +364,14 @@ Everything marked ✅ is implemented and covered by a test.
 | ✅ | **SMEP and SMAP**, detected and read back from CR4, with `stac`/`clac` around every deliberate kernel access to user memory |
 | ✅ | **Guard pages** below every kernel stack, plus a canary checked on every switch |
 | ✅ | Every address space sees identical kernel mappings, by construction |
+| ✅ | **ATA PIO disk driver** — IDENTIFY, LBA28 and LBA48, bounded waits, ATAPI recognised and skipped |
+| ✅ | **MBR partition table** parsed from the same sector stage 1 boots from |
+| ✅ | **Read-only FAT16** — BPB validation, cluster chains, subdirectories, 8.3 names, a two-slot sector cache |
+| ✅ | **`/bin/INIT` is read off the disk** before ring 3 is entered; the embedded copies are the fallback for the ISO boot path |
 | ✅ | Drivers: 16550 (in and out), VGA text, PIT, PS/2 keyboard, CMOS RTC, PCI |
 | ✅ | `kprintf` with width/precision/64-bit support, levelled logging |
 | ✅ | 64-bit division helpers — the kernel links against nothing at all |
-| ✅ | 25-command shell with line editing, history, and fault injection |
+| ✅ | 29-command shell with line editing, history, and fault injection |
 | ✅ | Embedded symbol table: panics print `function+0x1c`, no addr2line needed |
 | ✅ | 11 TSC-calibrated microbenchmarks, overhead-subtracted, median of 24 |
 | ✅ | Timer-driven sampling profiler with symbol attribution |
@@ -440,8 +483,9 @@ QEMU.
 | --- | --- | --- |
 | **Host unit tests** | the kernel's real `printf`/`string`/`div64` sources, compiled for the host, diffed against glibc | 92 checks |
 | **Pre-boot validation** | Multiboot2 header and checksum, ELF type, entry point inside a load segment, load address, `.bss` alignment, the higher-half split, every embedded ring-3 program, absence of SSE | 20 failure conditions, every link |
-| **In-kernel suites** | allocator, paging, address spaces, copy-on-write, heap coalescing, interrupts, scheduler, processes, hardening, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 293 checks in 15 suites |
-| **Boot scenarios** | custom bootloader unattended, the same image on a CPU with SMEP and SMAP, GRUB/Multiboot2 unattended, 29 shell commands typed over serial, benchmarks + profile | 5 scenarios |
+| **Image validation** | the boot signature, stage 1 not overlapping its own partition table, the stage 2 header pointing at a real ELF, every partition inside the image, the FAT geometry, and every file in `/BIN` being an i386 ELF with `INIT` among them | every image, every build |
+| **In-kernel suites** | allocator, paging, address spaces, copy-on-write, heap coalescing, interrupts, scheduler, processes, hardening, ATA and partitions, FAT16, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 393 checks in 17 suites |
+| **Boot scenarios** | custom bootloader unattended, the same image on a CPU with SMEP and SMAP, GRUB/Multiboot2 unattended, 39 shell commands typed over serial, benchmarks + profile | 5 scenarios |
 | **Deliberate faults** | a write to the kernel's own `.text`, and a write below a task's stack — each must panic, naming the address, the reason and the region, and exit with the panic code | 2 scenarios |
 
 ```
@@ -502,6 +546,9 @@ kernel/
     pmm.c                  bitmap physical frame allocator
     vmm.c                  paging, recursive page directory, fault reporting
     heap.c                 guarded first-fit kmalloc
+  fs/
+    blockdev.c             MBR partitions, and the bounds check for each
+    fat16.c                read-only FAT16: BPB, chains, 8.3 names
   core/
     bootinfo.c             the two boot protocols, normalised
     sched.c                scheduler, tasks, fork, wait, the zombie reaper
@@ -511,8 +558,8 @@ kernel/
     bench.c profile.c      microbenchmarks and the sampling profiler
     ksyms.c                the embedded symbol table
     printf.c log.c panic.c string.c div64.c spinlock.c ktest.c kmain.c
-  drivers/                 serial, vga, timer, keyboard, rtc, pci
-  shell/shell.c            25 commands, line editing, history
+  drivers/                 serial, vga, timer, keyboard, rtc, pci, ata
+  shell/shell.c            29 commands, line editing, history
   include/                 headers, grouped by subsystem
 
 user/                      ring-3 programs, built as separate ELFs
@@ -524,6 +571,8 @@ user/                      ring-3 programs, built as separate ELFs
 
 tools/
   mkimage.py               assemble a bootable image, patch stage 2's header
+  mkfat.py                 write a FAT16 filesystem from a directory tree
+  check-image.py           validate a built image: MBR, BPB, /BIN contents
   check-kernel.py          validate a linked kernel before it is ever booted
   run-tests.py             the QEMU harness
   grub.cfg grub-test.cfg
@@ -617,7 +666,15 @@ which made it a two-line diagnosis instead of a bisection.
 
 Being clear about scope is more useful than a longer feature list.
 
-- **No filesystem.** Nothing is read from disk after the kernel itself.
+- **The filesystem is read-only.** A correct write allocates from the FAT,
+  updates both copies, extends a directory entry's chain, and survives being
+  interrupted between any two of those — a journalling problem rather than a
+  filesystem-format one.
+- **No long filenames, no `argv`, no file descriptors.** FAT's 8.3 names only;
+  `exec` takes a path and nothing else.
+- **No DMA and no disk interrupts.** The ATA driver is PIO and polled, which
+  burns a timeslice per read on real hardware. The trade-off, and what it
+  buys, is in [docs/STORAGE.md](docs/STORAGE.md#ata-by-programmed-io).
 - **No SMP.** Uniprocessor only; `spinlock.c` is honest about being an
   interrupt mask rather than a spin, and says what it will become.
 - **No `argv`, environment or file descriptors.** `exec` takes a program
@@ -634,9 +691,6 @@ Being clear about scope is more useful than a longer feature list.
   64-bit entries and a three-level walk. That and KASLR are the two largest
   pieces of hardening still outstanding — see
   [docs/SECURITY.md](docs/SECURITY.md#what-is-missing).
-- **`exec`'s namespace is a table, not a filesystem.** The programs a
-  process can `exec` into are the ones embedded in the kernel image. A path
-  lookup is the only change the rest of the call needs.
 - **Serial transmit is polled**, which holds interrupts off for the duration of
   a write. The fix is a transmit ring buffer, in
   [docs/ROADMAP.md](docs/ROADMAP.md).
@@ -655,6 +709,7 @@ Being clear about scope is more useful than a longer feature list.
 | [docs/USERSPACE.md](docs/USERSPACE.md) | the user programs, the ELF loader, and the privilege boundary |
 | [docs/PROCESSES.md](docs/PROCESSES.md) | address spaces, `fork`, copy-on-write, `exec`, `wait` |
 | [docs/SECURITY.md](docs/SECURITY.md) | W^X, SMEP/SMAP, guard pages, and what is deliberately missing |
+| [docs/STORAGE.md](docs/STORAGE.md) | the ATA driver, the partition table, FAT16, and where a program comes from |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | benchmark methodology, results with analysis, the profiler and its limits |
 | [docs/TESTING.md](docs/TESTING.md) | the four test layers and how to add to each |
 | [docs/DEBUGGING.md](docs/DEBUGGING.md) | GDB against QEMU, reading a panic, common symptoms |

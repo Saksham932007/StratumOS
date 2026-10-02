@@ -75,6 +75,13 @@ COMMON_EXPECTED = [
     ("kernel text is read-only",
      r"kernel \.text and \.rodata mapped read-only \(\d+ pages\)"),
     ("hardening reported at boot", r"hardening\s+\[ok\]"),
+    # Storage. The ATA driver and the block layer run on both boot paths; the
+    # filesystem exists only on the raw disk image, so the shared expectation
+    # is only that the step reported cleanly either way.
+    ("ATA probe ran", r"boot: ATA disks\s+\[ok\]"),
+    ("filesystem step reported", r"boot: filesystem\s+\[ok\]"),
+    ("exec of a bogus path is refused",
+     r"\[child\] exec\(\"/bin/NOTHERE\"\) failed cleanly too"),
     ("identity map dropped", r"identity map dropped"),
     ("linear map established", r"linear map \d+ MiB"),
     ("user program loaded as an ELF", r"elf: loaded a \d+-segment program"),
@@ -372,7 +379,24 @@ SHELL_SCRIPT: list[tuple[str, list[str]]] = [
                 r"guard page at 0xe[0-9a-f]+ is unmapped, as it should be",
                 r"all 255 directory slots pre-backed"]),
     ("programs", [r"exec's namespace", r"init\s+\(started at boot\)",
-                  r"\bhello\b"]),
+                  r"\bhello\b", r"/bin/INIT\s+\d+ bytes",
+                  r"image\(s\) loaded from disk"]),
+    ("selftest storage", [r"ktest: storage \.\.\. PASS"]),
+    ("selftest fs", [r"ktest: fs \.\.\. PASS"]),
+    ("disk", [r"DEV\s+MODEL\s+SECTORS\s+ADDR", r"hd0\s+\S",
+              r"0 error\(s\), 0 timeout\(s\)",
+              r"hd0p1\s+0e\s+\d+\s+\d+"]),
+    ("mount", [r"FAT16 \"STRATUM\" on hd0p1, mounted at /",
+               r"512-byte sectors, \d+ per cluster",
+               r"FAT at \+\d+ \(2 x \d+ sectors\)",
+               r"cache hit\(s\)"]),
+    ("ls", [r"README\.TXT\s+\d+", r"BIN\s+0\s+d", r"ETC\s+0\s+d"]),
+    ("ls /bin", [r"INIT\s+\d+", r"HELLO\s+\d+"]),
+    ("cat /README.TXT", [r"StratumOS root filesystem",
+                         r"FAT16, read-only, mounted at boot"]),
+    ("cat /etc/MOTD.TXT", [r"init=/bin/INIT"]),
+    ("cat /nosuchfile", [r"no such file or directory"]),
+    ("cat /bin", [r"is a directory"]),
     ("stress 2 40", [r"heap integrity: consistent"]),
     ("ring3", [r"\[ring3\] hello from user mode",
                r"\[ring3\] calling exit\(0\)"]),
@@ -637,6 +661,22 @@ def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
             ],
             extra_expected=[
                 ("stage 1 ran", r"StratumOS stage1"),
+                # Only this path has a disk, so only this path can assert on
+                # the whole storage stack: IDENTIFY, the partition table the
+                # MBR carries alongside stage 1, the mount, and init being
+                # read out of the filesystem rather than out of the kernel.
+                ("the disk identified itself",
+                 r"ata: hd0: \S.*, \d+ sectors"),
+                ("the MBR partition was parsed",
+                 r"blk: hd0p1: type 0e \(FAT\), LBA \d+ \+ \d+ sectors"),
+                ("the filesystem mounted",
+                 r"fat: mounted hd0p1: FAT16 \"STRATUM\", \d+ KiB, "
+                 r"\d+ clusters"),
+                ("init came off the disk",
+                 r"entering ring 3 at 0x[0-9a-f]+ in its own address space "
+                 r"\(\d+ user pages mapped, image from the filesystem\)"),
+                ("exec read its image from the disk",
+                 r"exec\(\"hello\"\) from the filesystem"),
                 ("stage 2 ran", r"StratumOS stage2"),
                 ("A20 gate enabled", r"\[ok\] A20 gate"),
                 ("BIOS memory map read", r"\[ok\] BIOS memory map"),
@@ -680,6 +720,19 @@ def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
                 ("multiboot2 protocol detected",
                  r"boot protocol\s+\[ok\] Multiboot2"),
                 ("GRUB identified itself", r"booted by GRUB"),
+                # The other half of the storage story. The only drive here is
+                # an ATAPI CD-ROM, which IDENTIFY refuses, so there is no
+                # block device and no filesystem - and the kernel has to fall
+                # back to the programs embedded in its own image. That
+                # fallback is the reason they still exist, and this is what
+                # tests it.
+                ("no ATA drive found", r"ata: no ATA drives found"),
+                ("no block devices", r"blk: no block devices"),
+                ("the fallback was used",
+                 r"boot: filesystem\s+\[ok\] none present; using the "
+                 r"embedded programs"),
+                ("init came from the kernel image",
+                 r"image from the kernel image\)"),
             ],
         ),
     ]

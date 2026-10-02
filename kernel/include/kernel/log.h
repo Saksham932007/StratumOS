@@ -40,4 +40,12 @@ void log_emit(enum log_level level, const char *tag, const char *fmt, ...)
 /* A uniform "doing X ... ok" line for the boot sequence. */
 void log_boot_step(const char *name, bool ok, const char *detail);
 
+/* Open or close a window in which ERROR-level lines are counted rather than
+ * printed. Used only by the test suites, whose job includes provoking the
+ * errors that CI is right to treat as failures when they are not expected.
+ * A test asserts the count afterwards, so a window that swallows nothing is
+ * itself a failure. */
+void log_expect_errors(bool on);
+u32 log_expected_errors(void);
+
 #endif /* _KERNEL_LOG_H */

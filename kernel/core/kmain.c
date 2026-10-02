@@ -26,6 +26,7 @@
 #include <arch/io.h>
 #include <arch/irq.h>
 
+#include <drivers/ata.h>
 #include <drivers/keyboard.h>
 #include <drivers/pci.h>
 #include <drivers/rtc.h>
@@ -50,6 +51,9 @@
 #include <mm/heap.h>
 #include <mm/pmm.h>
 #include <mm/vmm.h>
+
+#include <fs/blockdev.h>
+#include <fs/fat16.h>
 
 /* QEMU `isa-debug-exit` turns a port write into a process exit status of
  * (code << 1) | 1, so these become 3, 5 and 35 respectively. */
@@ -352,6 +356,40 @@ void kmain(u32 magic, u32 info_addr)
 
     pci_init();
     log_boot_step("PCI", true, "legacy 0xCF8 enumeration");
+
+    /* Storage. The ATA driver polls, so it needs nothing from the interrupt
+     * layer; the block layer needs the heap only indirectly, through the
+     * filesystem it hands to. Mounting is attempted and allowed to fail: the
+     * GRUB ISO boot path has no FAT partition at all, and a kernel that
+     * refused to boot without one would be a kernel that could not be
+     * tested through both of its loaders. */
+    ata_init();
+    log_boot_step("ATA disks", true,
+                  ata_drive_count() ? "PIO, polled" : "none found");
+
+    blockdev_init();
+
+    const struct blockdev *fs_dev = blockdev_first_fs();
+
+    if (fs_dev && fat16_mount(fs_dev)) {
+        const struct fat_info *fi = fat16_get_info();
+        char detail[48];
+
+        ksnprintf(detail, sizeof(detail), "FAT16 \"%s\" on %s", fi->label,
+                  fat16_device_name());
+        log_boot_step("filesystem", true, detail);
+    } else if (fs_dev) {
+        /* A partition that claims to hold a filesystem and does not mount is
+         * a real failure, and is reported as one. */
+        log_boot_step("filesystem", false,
+                      "a FAT partition exists but would not mount");
+    } else {
+        /* No partition at all is the GRUB ISO path, where the only drive is
+         * an ATAPI CD-ROM. Not a failure: the kernel runs the programs
+         * embedded in its own image, which is why those still exist. */
+        log_boot_step("filesystem", true,
+                      "none present; using the embedded programs");
+    }
 
     /* 11. Tasks, then the syscall gate they will use. */
     sched_init();

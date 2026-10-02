@@ -11,9 +11,13 @@
  * into the kernel's half, where ring 3 cannot read. Linking it for user space
  * is the only way its own addresses are addresses it can use.
  *
- * Embedding the blob rather than reading it from a filesystem is a scoping
- * decision: there is no filesystem yet, and the loader is written so that
- * swapping the blob for a file read is the only change needed.
+ * There are now two places a program can come from. The filesystem is
+ * preferred: /bin/INIT off the FAT16 partition is what a kernel with a disk
+ * should run. The copies embedded in the kernel image are the fallback, and
+ * they are not vestigial - the GRUB ISO boot path has no FAT partition at
+ * all, so without them that path could not run a user program, and the same
+ * tests could not cover both loaders. load_program() is the one place that
+ * knows the difference.
  *
  * The address space is built *inside* the task rather than by the caller, and
  * that ordering is the whole point. Kernel threads share the kernel's page
@@ -32,12 +36,16 @@
 #include <kernel/layout.h>
 #include <kernel/log.h>
 #include <kernel/panic.h>
+#include <kernel/printf.h>
 #include <kernel/sched.h>
 #include <kernel/string.h>
 #include <kernel/usermode.h>
 
+#include <mm/heap.h>
 #include <mm/pmm.h>
 #include <mm/vmm.h>
+
+#include <fs/fat16.h>
 
 /* Produced by objcopy from the per-program ELFs under build/user - see the
  * Makefile. */
@@ -66,6 +74,8 @@ static const struct {
 
 static bool ran;
 static u32 exec_count;
+static u32 loads_from_disk;
+static u32 loads_embedded;
 
 bool usermode_ran(void)
 {
@@ -77,14 +87,86 @@ u32 usermode_exec_count(void)
     return exec_count;
 }
 
-static size_t payload_size(void)
+void usermode_get_load_counts(u32 *disk, u32 *embedded)
 {
-    return (size_t)(_binary_init_elf_end - _binary_init_elf_start);
+    if (disk)
+        *disk = loads_from_disk;
+    if (embedded)
+        *embedded = loads_embedded;
 }
 
 const char *usermode_program_name(u32 index)
 {
     return index < ARRAY_SIZE(programs) ? programs[index].name : NULL;
+}
+
+/* The largest image that will be read off the disk. The size comes from a
+ * directory entry - data on a disk somebody else may have written - so it is
+ * bounded before it becomes an allocation. 1 MiB is far more than any program
+ * here needs and far less than the heap. */
+#define EXEC_MAX_IMAGE (1 * MIB)
+
+/* Find a program by name, preferring the filesystem.
+ *
+ * `name` is either an absolute path, which is looked for and nowhere else, or
+ * a bare name, which is tried as /bin/<NAME> and then in the embedded table.
+ * On success `*owned` is either NULL (the image is in the kernel's own
+ * .rodata and must not be freed) or a heap buffer the caller must kfree once
+ * the image has been copied into its address space.
+ */
+static bool load_program(const char *name, const u8 **start, size_t *size,
+                         void **owned, const char **source)
+{
+    *start = NULL;
+    *size = 0;
+    *owned = NULL;
+    *source = "nowhere";
+
+    if (fat16_mounted()) {
+        char path[FAT_PATH_MAX];
+
+        if (name[0] == '/')
+            strlcpy(path, name, sizeof(path));
+        else
+            ksnprintf(path, sizeof(path), "/bin/%s", name);
+
+        u32 got = 0;
+        void *buf = fat16_read_whole(path, EXEC_MAX_IMAGE, &got);
+
+        if (buf) {
+            *start = buf;
+            *size = got;
+            *owned = buf;
+            *source = "the filesystem";
+            loads_from_disk++;
+            return true;
+        }
+    }
+
+    /* An absolute path is a request for one specific file. Falling back to
+     * something with a similar name would mean exec("/bin/nothere")
+     * silently running a different program. */
+    if (name[0] == '/') {
+        /* A ring-3 program asking for a program that does not exist is a
+         * failed system call, not a kernel error. It gets SYS_ENOENT; the
+         * syscall dispatcher logs the attempt. */
+        pr_warn("exec(\"%s\"): %s", name,
+                fat16_mounted() ? "no such file" : "no filesystem is mounted");
+        return false;
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(programs); i++) {
+        if (strcmp(name, programs[i].name) != 0)
+            continue;
+
+        *start = programs[i].start;
+        *size = (size_t)(programs[i].end - programs[i].start);
+        *source = "the kernel image";
+        loads_embedded++;
+        return *size > 0;
+    }
+
+    return false;
 }
 
 bool usermode_map_stack(void)
@@ -111,10 +193,13 @@ static void usermode_task(void *arg)
     UNUSED(arg);
 
     struct task *self = task_current();
-    size_t size = payload_size();
+    const u8 *image;
+    size_t size;
+    void *owned;
+    const char *source;
 
-    if (size == 0) {
-        pr_err("the embedded user program is empty");
+    if (!load_program("init", &image, &size, &owned, &source)) {
+        pr_err("there is no init program to run");
         task_exit(1);
     }
 
@@ -135,10 +220,14 @@ static void usermode_task(void *arg)
 
     struct elf_load_info loaded;
 
-    if (!elf_load_user(_binary_init_elf_start, size, &loaded)) {
-        pr_err("the embedded user program failed to load");
+    if (!elf_load_user(image, size, &loaded)) {
+        pr_err("init (%u bytes from %s) failed to load", (unsigned)size,
+               source);
+        kfree(owned);
         task_exit(1);
     }
+
+    kfree(owned);
 
     if (!usermode_map_stack()) {
         elf_unload_user(&loaded);
@@ -156,8 +245,8 @@ static void usermode_task(void *arg)
     self->user = true;
 
     pr_info("pid %u entering ring 3 at %p in its own address space (%u user "
-            "pages mapped)",
-            self->pid, (void *)loaded.entry, vmm_count_user_pages());
+            "pages mapped, image from %s)",
+            self->pid, (void *)loaded.entry, vmm_count_user_pages(), source);
     ran = true;
 
     /* Does not return: the task spends the rest of its life in ring 3 and
@@ -167,13 +256,9 @@ static void usermode_task(void *arg)
 
 bool usermode_spawn_demo(void)
 {
-    if (payload_size() == 0) {
-        pr_err("the embedded user program is empty");
-        return false;
-    }
-
-    pr_debug("embedded user program: %u bytes", (unsigned)payload_size());
-
+    /* Nothing is loaded here. The task builds its own address space and
+     * reads its own image, because both of those can fail and a failure
+     * should kill one process rather than the boot. */
     return task_create("init", usermode_task, NULL) != NULL;
 }
 
@@ -204,18 +289,12 @@ bool usermode_spawn_demo(void)
  */
 bool usermode_exec(const char *name, struct regs *r)
 {
-    const u8 *start = NULL;
-    size_t size = 0;
+    const u8 *start;
+    size_t size;
+    void *from_disk;
+    const char *source;
 
-    for (size_t i = 0; i < ARRAY_SIZE(programs); i++) {
-        if (strcmp(name, programs[i].name) == 0) {
-            start = programs[i].start;
-            size = (size_t)(programs[i].end - programs[i].start);
-            break;
-        }
-    }
-
-    if (!start || size == 0)
+    if (!load_program(name, &start, &size, &from_disk, &source))
         return false;
 
     struct task *self = task_current();
@@ -226,11 +305,12 @@ bool usermode_exec(const char *name, struct regs *r)
     if (!self->page_dir || self->page_dir == vmm_kernel_pd_phys()) {
         pr_err("pid %u called exec() without an address space of its own",
                self->pid);
+        kfree(from_disk);
         return false;
     }
 
-    pr_info("pid %u exec(\"%s\"): replacing %u user pages", self->pid, name,
-            vmm_count_user_pages());
+    pr_info("pid %u exec(\"%s\") from %s: replacing %u user pages", self->pid,
+            name, source, vmm_count_user_pages());
 
     /* Point of no return. */
     vmm_clear_user_space();
@@ -241,13 +321,20 @@ bool usermode_exec(const char *name, struct regs *r)
         pr_err("pid %u exec(\"%s\"): the image failed to load and the old one "
                "is already gone",
                self->pid, name);
+        kfree(from_disk);
         task_exit(1);
     }
 
     if (!usermode_map_stack()) {
         pr_err("pid %u exec(\"%s\"): no stack", self->pid, name);
+        kfree(from_disk);
         task_exit(1);
     }
+
+    /* The image has been copied into the new address space's pages; the
+     * staging buffer has done its job. Freeing it here rather than at the
+     * end keeps the heap flat across an exec of a large program. */
+    kfree(from_disk);
 
     /* Rewrite the frame the syscall path is about to IRET through. The
      * general registers are cleared rather than preserved: a fresh image has

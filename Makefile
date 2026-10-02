@@ -104,6 +104,7 @@ C_SOURCES := $(sort $(wildcard $(KSRC)/core/*.c) \
                     $(wildcard $(KSRC)/arch/x86/*.c) \
                     $(wildcard $(KSRC)/mm/*.c) \
                     $(wildcard $(KSRC)/drivers/*.c) \
+                    $(wildcard $(KSRC)/fs/*.c) \
                     $(wildcard $(KSRC)/shell/*.c))
 
 ASM_SOURCES := $(sort $(wildcard $(KSRC)/arch/x86/*.asm))
@@ -297,19 +298,60 @@ $(STAGE2_BIN): $(BOOTSRC)/stage2.asm
 	@echo "  AS      $< (flat binary)"
 	@$(AS) -f bin -I $(BOOTSRC)/ $< -o $@
 
+# ---- the on-disk filesystem -------------------------------------------------
+#
+# A FAT16 partition carrying the same ring-3 programs that are embedded in the
+# kernel image. Both exist on purpose: `exec` prefers the disk, and falls back
+# to the embedded copy when there is no filesystem - which is the case on the
+# GRUB ISO boot path, and is why the kernel can be tested through both of its
+# loaders.
+#
+# tools/mkfat.py writes the image rather than mformat/mcopy, so the layout is
+# chosen here and the test suite can assert on specific bytes in specific
+# clusters. See its header for the rest of the argument.
+
+FSROOT   := $(BUILD)/fsroot
+FS_IMG   := $(BUILD)/stratum-fs.img
+FS_KIB   := 16384
+
+$(FS_IMG): $(USER_PROGS:%=$(BUILD)/user/%.stripped.elf) $(TOOLS)/mkfat.py
+	@rm -rf $(FSROOT)
+	@mkdir -p $(FSROOT)/bin $(FSROOT)/etc
+	@for p in $(USER_PROGS); do \
+		cp $(BUILD)/user/$$p.stripped.elf $(FSROOT)/bin/$$(echo $$p | tr a-z A-Z); \
+	done
+	@printf 'StratumOS root filesystem\r\nFAT16, read-only, mounted at boot.\r\n' \
+		> $(FSROOT)/README.TXT
+	@printf 'console=vga,serial\r\ninit=/bin/INIT\r\n' > $(FSROOT)/etc/MOTD.TXT
+	@echo "  MKFAT   $@"
+	@$(PYTHON) $(TOOLS)/mkfat.py --root $(FSROOT) --output $@ \
+		--size-kib $(FS_KIB) --quiet
+
+.PHONY: image-check
+image-check: $(DISK_IMG)
+	@$(PYTHON) $(TOOLS)/check-image.py $(DISK_IMG) --verbose
+
+.PHONY: fs
+fs: $(FS_IMG)
+	@$(PYTHON) $(TOOLS)/mkfat.py --root $(FSROOT) --output $(FS_IMG) \
+		--size-kib $(FS_KIB)
+
 # ---- images -----------------------------------------------------------------
 
-$(DISK_IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(TOOLS)/mkimage.py
+$(DISK_IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(FS_IMG) $(TOOLS)/mkimage.py
 	@echo "  IMAGE   $@"
 	@$(PYTHON) $(TOOLS)/mkimage.py \
 		--stage1 $(STAGE1_BIN) --stage2 $(STAGE2_BIN) \
-		--kernel $(KERNEL_ELF) --output $@
+		--kernel $(KERNEL_ELF) --fs $(FS_IMG) --output $@
+	@$(PYTHON) $(TOOLS)/check-image.py $@
 
-$(TEST_IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(TOOLS)/mkimage.py
+$(TEST_IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(FS_IMG) $(TOOLS)/mkimage.py
 	@echo "  IMAGE   $@ (self-test)"
 	@$(PYTHON) $(TOOLS)/mkimage.py --quiet \
 		--stage1 $(STAGE1_BIN) --stage2 $(STAGE2_BIN) \
-		--kernel $(KERNEL_ELF) --output $@ --cmdline "autotest"
+		--kernel $(KERNEL_ELF) --fs $(FS_IMG) --output $@ \
+		--cmdline "autotest"
+	@$(PYTHON) $(TOOLS)/check-image.py $@
 
 $(ISO): $(KERNEL_ELF) $(TOOLS)/grub.cfg
 	@if ! command -v grub-mkrescue >/dev/null 2>&1; then \
@@ -324,19 +366,21 @@ $(ISO): $(KERNEL_ELF) $(TOOLS)/grub.cfg
 	@grub-mkrescue -o $@ $(BUILD)/isoroot >/dev/null 2>&1 || \
 		(echo "  ERROR   grub-mkrescue failed"; exit 1)
 
-$(SHELL_IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(TOOLS)/mkimage.py
+$(SHELL_IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(FS_IMG) $(TOOLS)/mkimage.py
 	@echo "  IMAGE   $@ (interactive)"
 	@$(PYTHON) $(TOOLS)/mkimage.py --quiet \
 		--stage1 $(STAGE1_BIN) --stage2 $(STAGE2_BIN) \
-		--kernel $(KERNEL_ELF) --output $@ \
+		--kernel $(KERNEL_ELF) --fs $(FS_IMG) --output $@ \
 		--cmdline "nodemo nousermode loglevel=warn"
+	@$(PYTHON) $(TOOLS)/check-image.py $@
 
-$(BENCH_IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(TOOLS)/mkimage.py
+$(BENCH_IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(FS_IMG) $(TOOLS)/mkimage.py
 	@echo "  IMAGE   $@ (benchmarks)"
 	@$(PYTHON) $(TOOLS)/mkimage.py --quiet \
 		--stage1 $(STAGE1_BIN) --stage2 $(STAGE2_BIN) \
-		--kernel $(KERNEL_ELF) --output $@ \
+		--kernel $(KERNEL_ELF) --fs $(FS_IMG) --output $@ \
 		--cmdline "autobench nodemo nousermode loglevel=warn"
+	@$(PYTHON) $(TOOLS)/check-image.py $@
 
 $(TEST_ISO): $(KERNEL_ELF) $(TOOLS)/grub-test.cfg
 	@if ! command -v grub-mkrescue >/dev/null 2>&1; then \

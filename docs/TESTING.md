@@ -105,13 +105,13 @@ Checking them takes 30 milliseconds.
 
 ## Layer 3: in-kernel suites
 
-`kernel/core/ktest.c` holds 15 suites and 293 assertions, run against
+`kernel/core/ktest.c` holds 17 suites and 393 assertions, run against
 real hardware state — a bitmap with actual firmware-reported memory in it, real
 page tables, a real heap, a real scheduler.
 
 ```
 stratum> selftest
-ktest: running 15 suites
+ktest: running 17 suites
 ktest: string ... PASS (15 checks)
 ktest: boot ... PASS (26 checks)
 ktest: cpu ... PASS (8 checks)
@@ -125,9 +125,11 @@ ktest: elf ... PASS (14 checks)
 ktest: vmspace ... PASS (42 checks)
 ktest: proc ... PASS (14 checks)
 ktest: harden ... PASS (24 checks)
+ktest: storage ... PASS (44 checks)
+ktest: fs ... PASS (56 checks)
 ktest: ksyms ... PASS (12 checks)
 ktest: profile ... PASS (9 checks)
-ktest: summary 15/15 suites passed
+ktest: summary 17/17 suites passed
 ```
 
 | Suite | What it establishes |
@@ -145,6 +147,8 @@ ktest: summary 15/15 suites passed
 | `vmspace` | a fresh address space has the kernel's half and an empty user half; a clone marks the page read-only and COW in *both* copies; the reference count rises to 2; the first write allocates exactly one new frame and the second does not fault; destroying the clone drops the shared frame to zero references; and the frame count returns to where it started |
 | `proc` | a kernel thread shares the kernel's page directory; `task_fork(NULL)` is refused rather than reading address zero; `wait()` returns a real pid and status for each child and -1 once there are none; `exec`'s program table contains `init` and terminates |
 | `harden` | `CR0.WP` is set; no page of `.text` or `.rodata` is writable or user-accessible and `.data` still is; every kernel directory entry is present and none has the `USER` bit; this task's stack is in the guarded region with its guard page unmapped above and below; CR4 agrees with CPUID about SMEP and SMAP; a declared user access opens a window and an undeclared one is what SMAP exists to refuse |
+| `storage` | IDENTIFY reports a model and a capacity; a two-sector read equals two one-sector reads *and* the two sectors differ, which is the per-sector DRQ handshake; five malformed reads are each refused *and* logged; zero sectors is a no-op that logs nothing; a read of a partition's block 0 equals a read of the disk at the partition's first LBA; a read past the partition's end is refused even though those sectors exist |
+| `fs` | the BPB's four offsets are ordered and inside the device; the cluster count is in FAT16's range; lookup is case-insensitive and tolerates redundant slashes; a missing name, a relative path, an over-long component, a file used as a directory and a directory read as a file are all refused; a chunked read agrees with a whole-file read byte for byte across a cluster boundary; a read at the end is short and past the end is zero; a size bound the file exceeds refuses rather than truncates; the volume label is not reported as a file; and the sector cache's hit rate |
 | `ksyms` | the table is sorted; every symbol resolves to itself; an exact address gives offset 0 and an address inside a function gives the right offset; addresses outside every executable section resolve to nothing |
 | `profile` | synthetic frames are attributed correctly — ring 0 inside a known function counts, ring 3 counts separately, an address outside `.text` counts as unattributed, and a stopped profiler ignores ticks |
 
@@ -210,7 +214,7 @@ build/stratum-test.img    # cmdline "autotest", via stage 2's patchable header
 build/stratum-test.iso    # cmdline "autotest", via grub-test.cfg
 ```
 
-Each scenario then checks 43 expected lines, 9 forbidden patterns, the
+Each scenario then checks 46 expected lines, 9 forbidden patterns, the
 in-kernel summary, and the exit status. The forbidden list is the important
 half:
 
@@ -260,7 +264,7 @@ never declared the user-page write it uses to prove copy-on-write works.
 
 ### The interactive scenario
 
-29 shell commands, sent over the serial console and checked against regular
+39 shell commands, sent over the serial console and checked against regular
 expressions:
 
 ```python
@@ -354,6 +358,37 @@ produced a perfectly-reported `#UD` instead of the page fault and divide error
 they were supposed to demonstrate. The kernel was right; the test was wrong.
 
 ---
+
+### Errors that are supposed to happen
+
+Several checks in the `storage` and `elf` suites work by calling something
+that must fail. Each of those logs an `ERROR`, correctly — and the forbidden
+list above treats an unexpected `ERROR` line as a failure, also correctly.
+
+Rather than soften the messages, a test opens a window in which they are
+counted instead of printed:
+
+```c
+log_expect_errors(true);
+KT_ASSERT(r, !ata_read(0, d->sectors, 1, buf));          /* past the end */
+KT_ASSERT(r, !ata_read(0, d->sectors - 1, 2, buf));      /* straddles it */
+KT_ASSERT(r, !ata_read(0, 0xFFFFFFFFFFFFFFFFull, 2, buf)); /* wraps      */
+KT_ASSERT(r, !ata_read(ATA_MAX_DRIVES, 0, 1, buf));      /* no such disk */
+KT_ASSERT(r, !ata_read(0, 0, 1, NULL));                  /* no buffer    */
+
+u32 complaints = log_expected_errors();
+
+log_expect_errors(false);
+KT_EQ(r, complaints, 5u);
+```
+
+Counting is stronger than suppressing. Five refusals must produce five
+complaints, so a driver that refused *silently* fails this test — and a
+refusal nobody can see is nearly as bad as no refusal at all.
+
+A lookup that fails to find a file is deliberately not in that category: it
+logs at debug level, because a shell that probes for a file would be unusable
+otherwise, and the `fs` suite checks those refusals without a window at all.
 
 ### Scenarios that must panic
 

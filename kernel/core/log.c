@@ -47,10 +47,47 @@ bool log_set_level_by_name(const char *name)
     return false;
 }
 
+/* ---- expected errors --------------------------------------------------
+ *
+ * Several test suites work by calling things that must fail: a read past the
+ * end of a disk, a lookup of a file that is not there, an ELF with a
+ * corrupted header. Each of those logs an error, correctly - and CI treats an
+ * ERROR line as a failure, also correctly.
+ *
+ * Rather than soften the messages, a test can declare a window in which
+ * errors are expected. Inside it, ERROR and PANIC-level lines are counted
+ * instead of printed, and the count is readable afterwards - so a test can
+ * assert that the error it provoked *did* happen, which is stronger than
+ * suppressing it and stronger than not provoking it at all.
+ *
+ * Deliberately narrow: only the two highest levels, only while a test asks
+ * for it, and the count is never reset by anything but the test that opened
+ * the window.
+ */
+static bool expecting_errors;
+static u32 expected_error_count;
+
+void log_expect_errors(bool on)
+{
+    expecting_errors = on;
+    if (on)
+        expected_error_count = 0;
+}
+
+u32 log_expected_errors(void)
+{
+    return expected_error_count;
+}
+
 void log_emit(enum log_level level, const char *tag, const char *fmt, ...)
 {
     va_list ap;
     u64 ms;
+
+    if (expecting_errors && level <= LOG_ERROR) {
+        expected_error_count++;
+        return;
+    }
 
     if (level > current_level)
         return;

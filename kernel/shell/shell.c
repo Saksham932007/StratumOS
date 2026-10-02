@@ -17,6 +17,7 @@
 #include <arch/io.h>
 #include <arch/irq.h>
 
+#include <drivers/ata.h>
 #include <drivers/keyboard.h>
 #include <drivers/pci.h>
 #include <drivers/rtc.h>
@@ -42,6 +43,9 @@
 #include <mm/heap.h>
 #include <mm/pmm.h>
 #include <mm/vmm.h>
+
+#include <fs/blockdev.h>
+#include <fs/fat16.h>
 
 #define PROMPT "stratum> "
 
@@ -437,6 +441,203 @@ static int cmd_selftest(int argc, char **argv)
     return failed == 0 ? 0 : 1;
 }
 
+/* ---- the filesystem ---------------------------------------------------- */
+
+static int cmd_disk(int argc, char **argv)
+{
+    UNUSED(argc);
+    UNUSED(argv);
+
+    struct ata_stats as;
+
+    ata_get_stats(&as);
+
+    kprintf("ATA drives\n");
+
+    if (ata_drive_count() == 0) {
+        kprintf("  none found\n");
+    } else {
+        kprintf("  %-4s %-26s %12s %7s\n", "DEV", "MODEL", "SECTORS", "ADDR");
+        for (u32 i = 0; i < ATA_MAX_DRIVES; i++) {
+            const struct ata_drive *d = ata_get_drive(i);
+
+            if (!d)
+                continue;
+
+            kprintf("  hd%-2u %-26s %12llu %7s\n", i, d->model, d->sectors,
+                    d->lba48 ? "LBA48" : "LBA28");
+        }
+    }
+
+    kprintf("  %u read(s), %u sector(s), %u command(s), %u error(s), "
+            "%u timeout(s)\n",
+            as.reads, as.sectors_read, as.commands, as.errors, as.timeouts);
+
+    kprintf("Block devices\n");
+    kprintf("  %-8s %-8s %12s %12s\n", "NAME", "TYPE", "FIRST LBA", "SECTORS");
+
+    for (u32 i = 0; i < BLOCKDEV_MAX; i++) {
+        const struct blockdev *b = blockdev_get(i);
+
+        if (!b)
+            continue;
+
+        char type[8];
+
+        if (b->partition_type == 0)
+            strlcpy(type, "disk", sizeof(type));
+        else
+            ksnprintf(type, sizeof(type), "%02x", b->partition_type);
+
+        kprintf("  %-8s %-8s %12llu %12llu\n", b->name, type, b->first_lba,
+                b->sectors);
+    }
+
+    return 0;
+}
+
+static int cmd_mount(int argc, char **argv)
+{
+    UNUSED(argc);
+    UNUSED(argv);
+
+    if (!fat16_mounted()) {
+        kprintf("nothing is mounted\n");
+        kprintf("(the GRUB ISO boot path has no FAT partition; the raw disk "
+                "image does)\n");
+        return 1;
+    }
+
+    const struct fat_info *f = fat16_get_info();
+
+    kprintf("FAT16 \"%s\" on %s, mounted at /\n", f->label,
+            fat16_device_name());
+    kprintf("  geometry  : %u-byte sectors, %u per cluster (%u KiB "
+            "clusters)\n",
+            f->bytes_per_sector, f->sectors_per_cluster,
+            f->cluster_bytes / KIB);
+    kprintf("  layout    : %u reserved, FAT at +%u (%u x %u sectors), "
+            "root at +%u (%u entries), data at +%u\n",
+            f->reserved_sectors, f->fat_start, f->num_fats, f->sectors_per_fat,
+            f->root_start, f->root_entries, f->data_start);
+    kprintf("  size      : %u sectors, %u clusters\n", f->total_sectors,
+            f->cluster_count);
+    kprintf("  activity  : %u sector read(s), %u cache hit(s), %u lookup(s), "
+            "%u file(s) read whole\n",
+            f->reads, f->cache_hits, f->lookups, f->opens);
+    return 0;
+}
+
+static int cmd_ls(int argc, char **argv)
+{
+    const char *path = (argc > 1) ? argv[1] : "/";
+
+    if (!fat16_mounted()) {
+        kprintf("nothing is mounted\n");
+        return 1;
+    }
+
+    struct fat_dirent entry;
+
+    if (!fat16_stat(path, &entry)) {
+        kprintf("%s: no such file or directory\n", path);
+        return 1;
+    }
+
+    if (!entry.is_dir) {
+        kprintf("  %-14s %8u\n", entry.name, entry.size);
+        return 0;
+    }
+
+    kprintf("  %-14s %8s  %s\n", "NAME", "SIZE", "ATTR");
+
+    u32 files = 0, dirs = 0, bytes = 0;
+
+    for (u32 i = 0;; i++) {
+        if (!fat16_readdir(path, i, &entry))
+            break;
+
+        kprintf("  %-14s %8u  %s%s%s%s\n", entry.name,
+                entry.is_dir ? 0 : entry.size, entry.is_dir ? "d" : "-",
+                (entry.attr & FAT_ATTR_READ_ONLY) ? "r" : "-",
+                (entry.attr & FAT_ATTR_HIDDEN) ? "h" : "-",
+                (entry.attr & FAT_ATTR_SYSTEM) ? "s" : "-");
+
+        if (entry.is_dir) {
+            dirs++;
+        } else {
+            files++;
+            bytes += entry.size;
+        }
+    }
+
+    kprintf("  %u file(s), %u bytes; %u director(y|ies)\n", files, bytes, dirs);
+    return 0;
+}
+
+static int cmd_cat(int argc, char **argv)
+{
+    if (argc < 2) {
+        kprintf("usage: cat <path>\n");
+        return 1;
+    }
+
+    if (!fat16_mounted()) {
+        kprintf("nothing is mounted\n");
+        return 1;
+    }
+
+    struct fat_dirent entry;
+
+    if (!fat16_stat(argv[1], &entry)) {
+        kprintf("%s: no such file or directory\n", argv[1]);
+        return 1;
+    }
+
+    if (entry.is_dir) {
+        kprintf("%s: is a directory\n", argv[1]);
+        return 1;
+    }
+
+    /* Read in chunks rather than whole, so that `cat` on a large file does
+     * not need a buffer the size of the file - and so the chunked path
+     * through fat16_read(), which is the one exec does not use, gets
+     * exercised by hand as well as by the test suite. */
+    char buf[256];
+    u32 offset = 0;
+    u32 printable = 0, binary = 0;
+
+    for (;;) {
+        i32 got = fat16_read(&entry, offset, buf, sizeof(buf));
+
+        if (got <= 0)
+            break;
+
+        for (i32 i = 0; i < got; i++) {
+            char c = buf[i];
+
+            if (c == '\n' || c == '\t' || (c >= 0x20 && c < 0x7F)) {
+                console_putc(c);
+                printable++;
+            } else if (c == '\r') {
+                /* The files on this image have CRLF line endings, because
+                 * they were written by a tool on a machine that does. */
+            } else {
+                binary++;
+            }
+        }
+
+        offset += (u32)got;
+    }
+
+    if (binary)
+        kprintf("\n[%u of %u bytes were not printable]\n", binary, entry.size);
+    else if (printable == 0)
+        kprintf("[%s is empty]\n", argv[1]);
+
+    return 0;
+}
+
 /* exec()'s namespace. There is no filesystem yet, so the programs a process
  * can exec into are the ones embedded in the kernel image; printing them is
  * how you find out what `exec` will accept. */
@@ -457,7 +658,33 @@ static int cmd_programs(int argc, char **argv)
                 strcmp(name, "init") == 0 ? "   (started at boot)" : "");
     }
 
-    kprintf("  %u exec() calls so far this boot\n", usermode_exec_count());
+    if (fat16_mounted()) {
+        kprintf("Programs on the filesystem (what exec() prefers):\n");
+        struct fat_dirent entry;
+        bool any = false;
+
+        for (u32 i = 0;; i++) {
+            if (!fat16_readdir("/bin", i, &entry))
+                break;
+            if (entry.is_dir)
+                continue;
+            kprintf("  /bin/%-12s %8u bytes\n", entry.name, entry.size);
+            any = true;
+        }
+
+        if (!any)
+            kprintf("  (/bin is empty or missing)\n");
+    } else {
+        kprintf("No filesystem is mounted, so the embedded copies are all "
+                "there is.\n");
+    }
+
+    u32 from_disk = 0, embedded = 0;
+
+    usermode_get_load_counts(&from_disk, &embedded);
+    kprintf("  %u exec() call(s) this boot; %u image(s) loaded from disk, "
+            "%u from the kernel image\n",
+            usermode_exec_count(), from_disk, embedded);
     return 0;
 }
 
@@ -874,6 +1101,11 @@ static const struct shell_command commands[] = {
     {"syms", "syms <address>", "resolve an address to a symbol", cmd_syms},
     {"ring3", "ring3", "run the user-mode demo", cmd_ring3},
     {"programs", "programs", "list the programs exec() can run", cmd_programs},
+    {"disk", "disk", "ATA drives and block devices", cmd_disk},
+    {"mount", "mount", "the mounted filesystem's geometry and activity",
+     cmd_mount},
+    {"ls", "ls [path]", "list a directory", cmd_ls},
+    {"cat", "cat <path>", "print a file", cmd_cat},
     {"stress", "stress [workers] [rounds]",
      "hammer the heap from several tasks", cmd_stress},
     {"harden", "harden", "report the mitigations that are switched on",

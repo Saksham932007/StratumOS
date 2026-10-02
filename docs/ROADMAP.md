@@ -22,8 +22,8 @@ and fifteen new CI expectations. Documented in
 [PROCESSES.md](PROCESSES.md).
 
 What it still lacks: `argv`, file descriptors, signals, and loading the
-image from a file rather than the embedded table — the last of which is
-item 5 below.
+image from a file rather than the embedded table — the last of which the
+filesystem work below has since fixed.
 
 ### Hardening
 
@@ -47,6 +47,30 @@ A new `harden` suite (24 checks) asserts the configuration, and two CI
 scenarios assert the enforcement by requiring a panic — the half of a
 mitigation that a passing test cannot check. Documented in
 [SECURITY.md](SECURITY.md).
+
+### A disk, a partition table and a filesystem
+
+Landed in v0.7.0. An ATA PIO driver (IDENTIFY, LBA28 and LBA48, bounded
+waits, ATAPI recognised and skipped), an MBR partition-table parser reading
+the same sector stage 1 boots from, and a read-only FAT16 driver. `/bin/INIT`
+is read off the disk before ring 3 is entered, and `exec` resolves names
+against the filesystem, falling back to the kernel's embedded copies on the
+GRUB ISO path where there is no partition at all.
+
+`tools/mkfat.py` writes the filesystem image rather than driving mtools, so
+its layout is chosen deliberately and the test suite can assert on specific
+clusters. `tools/check-image.py` validates every built image: the boot
+signature, stage 1 not overlapping its own partition table, the stage 2
+header pointing at a real ELF, the FAT geometry, and every file in `/BIN`
+being an i386 ELF with `INIT` among them.
+
+Two new suites (`storage`, `fs`, 100 assertions between them) and a logging
+facility that counts deliberately-provoked errors instead of printing them,
+so a refusal that happens *silently* fails a test. The `fs` suite also found
+a real design flaw: the FAT driver's single-sector cache thrashed between
+allocation-table and data sectors, halving its hit rate. Splitting it into
+two slots by purpose took the hit rate from 47% to 89%. Documented in
+[STORAGE.md](STORAGE.md).
 
 ---
 
@@ -95,16 +119,18 @@ several places aggregates all of its callers together. Walking the
 frame-pointer chain at sample time would fix it, and the backtrace code
 already exists - see [PERFORMANCE.md](PERFORMANCE.md).
 
-### 5. A block device and a filesystem
+### 5. Writing to the filesystem, and a VFS
 
-ATA PIO first, because it needs no DMA and no interrupts. Then FAT16 read-only,
-which is enough to load an init binary and is well documented. The existing
-`pci.c` already finds the IDE controller.
+Reading is done. Writing means allocating from the FAT, updating both copies
+of it, extending a directory entry's size and cluster chain, and surviving
+being interrupted between any two of those - which is where the interesting
+part is, and it is a journalling discussion rather than a filesystem-format
+one.
 
-This is also what finishes `exec`: its namespace is currently a table of
-programs embedded in the kernel image, and a path lookup is the only change
-the rest of the call needs. See
-[PROCESSES.md](PROCESSES.md#execs-namespace).
+A VFS layer belongs with it rather than before it: one filesystem behind an
+interface is an interface with one implementation, and the second
+implementation is what shows whether the interface was right. Long filenames
+and `argv` for `exec` are the two smaller gaps the current driver leaves.
 
 ### 6. A slab allocator over the heap
 
@@ -126,10 +152,13 @@ out of reset in real mode, per-CPU data, and — at last — `spinlock_t` becomi
 a real spinlock. `kernel/core/spinlock.c` is written so that this is a change
 of implementation rather than a change of every call site.
 
-### 9. A proper VFS and a `/proc`
+### 9. A `/proc`
 
-Once there is a filesystem, the introspection the shell does through direct
-calls (`ps`, `meminfo`, `irq`) belongs behind readable files instead.
+The introspection the shell does through direct calls - `ps`, `meminfo`,
+`irq`, `disk`, `mount`, `harden` - belongs behind readable files instead.
+That needs a VFS with at least two filesystems in it (item 5) and write
+support for the synthetic one, so it follows them rather than preceding
+them.
 
 ---
 

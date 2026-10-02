@@ -177,7 +177,20 @@ static void demo_exec(void)
         u_puts("    [child] exec(\"nonexistent\") failed cleanly and I am "
                "still here\n");
 
-        /* And now the real one. This does not return. */
+        /* An absolute path that does not exist must fail too, and must not
+         * quietly fall back to something with a similar name - which is
+         * exactly what a bare name does on purpose. */
+        if (sys_exec("/bin/NOTHERE") != SYS_ENOENT) {
+            u_puts("    [child] WARNING: exec() of a bogus path did not "
+                   "fail!\n");
+            sys_exit(1);
+        }
+
+        u_puts("    [child] exec(\"/bin/NOTHERE\") failed cleanly too\n");
+
+        /* And now the real one. By bare name, so it resolves through the
+         * filesystem when there is one and through the kernel's embedded
+         * copies when there is not. This does not return. */
         (void)sys_exec("hello");
 
         u_puts("    [child] WARNING: exec(\"hello\") returned!\n");
