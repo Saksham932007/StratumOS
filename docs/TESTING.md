@@ -7,8 +7,8 @@ rather than after an emulator run.
 | --- | --- | --- | --- |
 | Host unit tests | nothing | ~1 s | formatter, string, 64-bit division bugs |
 | Pre-boot validation | the linker | ~0.1 s | unbootable images (20 failure conditions) |
-| In-kernel suites | QEMU | ~5 s | allocator, paging, heap, scheduler, syscall bugs |
-| Boot scenarios | QEMU + GRUB | ~2 min | regressions in either boot path, shell behaviour |
+| In-kernel suites | QEMU | ~5 s | allocator, paging, heap, scheduler, syscall, symbol and profiler bugs |
+| Boot scenarios | QEMU + GRUB | ~2 min | regressions in either boot path, shell behaviour, measurement |
 
 ```bash
 make test        # all of it
@@ -135,6 +135,8 @@ ktest: summary 9/9 suites passed
 | `irq` | the timer is advancing, no spurious interrupts accumulated, `int3` survives a full round trip through the stub and `iret`, `irq_save`/`irq_restore` nests |
 | `sched` | a created task actually runs, switch counts rise, and a 60 ms sleep takes at least 50 ms |
 | `syscall` | `user_range_ok` rejects kernel addresses, the heap window, address-space wraps, and unmapped pages |
+| `ksyms` | the table is sorted; every symbol resolves to itself; an exact address gives offset 0 and an address inside a function gives the right offset; addresses outside every executable section resolve to nothing |
+| `profile` | synthetic frames are attributed correctly — ring 0 inside a known function counts, ring 3 counts separately, an address outside `.text` counts as unattributed, and a stopped profiler ignores ticks |
 
 Tests keep going after a failure, so one run reports everything that is broken
 rather than only the first thing.
@@ -250,6 +252,21 @@ stratum> pagemap 0x100000      ← the first six commands simply vanished
 So the harness drives the shell the way a person does: wait for the prompt,
 send one command, read until the prompt returns, check, repeat. `SerialSession`
 in `run-tests.py` is about 50 lines of `select()`-based expect.
+
+### The benchmark scenario
+
+A fourth image boots with `autobench`, which runs the microbenchmarks and a
+profile and then shuts down. Seventeen expectations cover it, including one
+that asserts the profiler is *useful* rather than merely running:
+
+```python
+# The workload is allocator-dominated, so a profiler that discriminates must
+# put kmalloc at the top. This asserts the profiler is useful, not merely that
+# it runs.
+("profile found the hot path", r"\d+\s+\d+\.\d%\s+kmalloc"),
+```
+
+See [PERFORMANCE.md](PERFORMANCE.md) for the methodology those numbers rest on.
 
 ### Running one scenario
 

@@ -32,12 +32,14 @@
 #include <drivers/timer.h>
 #include <drivers/vga.h>
 
+#include <kernel/bench.h>
 #include <kernel/console.h>
 #include <kernel/kernel.h>
 #include <kernel/ktest.h>
 #include <kernel/log.h>
 #include <kernel/panic.h>
 #include <kernel/printf.h>
+#include <kernel/profile.h>
 #include <kernel/sched.h>
 #include <kernel/shell.h>
 #include <kernel/string.h>
@@ -105,6 +107,7 @@ static void parse_cmdline(const char *cmd)
         return;
 
     cmdline.autotest = cmdline_has(cmd, "autotest");
+    cmdline.autobench = cmdline_has(cmd, "autobench");
     cmdline.quiet = cmdline_has(cmd, "quiet");
     cmdline.no_usermode = cmdline_has(cmd, "nousermode");
     cmdline.no_sched_demo = cmdline_has(cmd, "nodemo");
@@ -180,6 +183,47 @@ static void demo_worker(void *arg)
 
         task_sleep_ms(20 + id * 10);
     }
+}
+
+/* Benchmarks and a profile, then shut down. Separate from autotest so a CI
+ * run can assert on correctness without waiting for measurements, and so the
+ * benchmark numbers are not interleaved with test output. */
+static void autobench_task(void *arg)
+{
+    UNUSED(arg);
+
+    task_sleep_ms(300);
+
+    kprintf("\n");
+    unsigned failed = bench_run_all();
+
+    kprintf("\n");
+    if (profile_start()) {
+        /* The workload has to be CPU-bound. An earlier version slept 5 ms
+         * between short bursts of work, so at a 100 Hz sample rate almost
+         * every sample landed in the idle task - a correct profile of a
+         * machine that was, in fact, idle. */
+        u64 deadline = timer_ms() + 700;
+
+        while (timer_ms() < deadline) {
+            for (int i = 0; i < 250; i++) {
+                void *p = kmalloc(64 + (size_t)(i & 127));
+                kfree(p);
+            }
+
+            char buf[48];
+            for (int i = 0; i < 60; i++)
+                ksnprintf(buf, sizeof(buf), "%d %08x", i, (unsigned)i);
+        }
+
+        profile_stop();
+        profile_report(12);
+    }
+
+    kprintf("\nstratum: autobench complete, shutting down\n");
+    timer_busy_wait_ms(50);
+    cpu_qemu_exit(failed == 0 ? EXIT_TESTS_PASSED : EXIT_TESTS_FAILED);
+    cpu_halt_forever();
 }
 
 static void autotest_task(void *arg)
@@ -319,7 +363,11 @@ void kmain(u32 magic, u32 info_addr)
             pr_warn("the ring-3 demo could not be started");
     }
 
-    if (cmdline.autotest) {
+    if (cmdline.autobench) {
+        pr_info("autobench requested on the command line");
+        if (!task_create("autobench", autobench_task, NULL))
+            panic("could not start the autobench task");
+    } else if (cmdline.autotest) {
         pr_info("autotest requested on the command line");
         if (!task_create("autotest", autotest_task, NULL))
             panic("could not start the autotest task");

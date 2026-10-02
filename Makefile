@@ -63,6 +63,9 @@ TEST_ISO   := $(BUILD)/stratum-test.iso
 # A quiet image for the interactive shell test: no demo tasks and no ring-3
 # payload at boot, so the transcript the harness reads is deterministic.
 SHELL_IMG  := $(BUILD)/stratum-shell.img
+# Benchmarks plus a profile, then shut down. Separate from the self-test image
+# so correctness and measurement are asserted independently.
+BENCH_IMG  := $(BUILD)/stratum-bench.img
 STAGE1_BIN := $(BUILD)/stage1.bin
 STAGE2_BIN := $(BUILD)/stage2.bin
 
@@ -120,7 +123,7 @@ DEPS    := $(C_OBJECTS:.o=.d)
 # Every image is built by `all`. Building only some of them invites the
 # classic confusion of testing a stale artefact and drawing conclusions from it.
 .PHONY: all
-all: $(DISK_IMG) $(ISO) $(TEST_IMG) $(TEST_ISO) $(SHELL_IMG)
+all: $(DISK_IMG) $(ISO) $(TEST_IMG) $(TEST_ISO) $(SHELL_IMG) $(BENCH_IMG)
 	@echo
 	@echo "  StratumOS built with $(TOOLCHAIN)"
 	@printf "  %-22s %s\n" "kernel ELF" "$(KERNEL_ELF)"
@@ -148,10 +151,55 @@ $(BUILD)/%.o: %.asm
 	@echo "  AS      $<"
 	@$(AS) $(ASFLAGS) $< -o $@
 
-$(KERNEL_DEBUG): $(OBJECTS) linker/kernel.ld
+# ---- the symbol table, and the multi-pass link it requires -----------------
+#
+# Embedding a symbol table changes the addresses the table describes, so one
+# link pass cannot produce a correct one. Three passes converge:
+#
+#   A  link against an empty table   -> enumerate the symbol NAMES
+#   B  link against the real table   -> addresses settle, because the table's
+#                                       size depends on names and count only
+#   C  regenerate and relink         -> byte-identical layout to B
+#
+# Pass C then verifies that the embedded table really does describe the kernel
+# it is embedded in, rather than trusting the argument above.
+
+KSYMS_EMPTY := $(BUILD)/ksyms_empty.c
+KSYMS_A     := $(BUILD)/ksyms_a.c
+KSYMS_B     := $(BUILD)/ksyms_b.c
+
+$(KSYMS_EMPTY): $(TOOLS)/gen-ksyms.py
 	@mkdir -p $(dir $@)
-	@echo "  LD      $@"
-	@$(LD) $(LDFLAGS) $(LINK_ORDER) -o $@
+	@$(PYTHON) $(TOOLS)/gen-ksyms.py --empty -o $@
+
+# Generated sources live in $(BUILD), so they need their own rule; the generic
+# $(BUILD)/%.o: %.c pattern would look for them outside the build tree.
+$(BUILD)/ksyms_%.o: $(BUILD)/ksyms_%.c
+	@echo "  CC      $< "
+	@$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/pass_a.elf: $(OBJECTS) $(BUILD)/ksyms_empty.o linker/kernel.ld
+	@mkdir -p $(dir $@)
+	@echo "  LD      pass A (enumerate symbols)"
+	@$(LD) $(LDFLAGS) $(LINK_ORDER) $(BUILD)/ksyms_empty.o -o $@
+
+$(KSYMS_A): $(BUILD)/pass_a.elf $(TOOLS)/gen-ksyms.py
+	@$(PYTHON) $(TOOLS)/gen-ksyms.py $< -o $@
+
+$(BUILD)/pass_b.elf: $(OBJECTS) $(BUILD)/ksyms_a.o linker/kernel.ld
+	@echo "  LD      pass B (addresses settle)"
+	@$(LD) $(LDFLAGS) $(LINK_ORDER) $(BUILD)/ksyms_a.o -o $@
+
+$(KSYMS_B): $(BUILD)/pass_b.elf $(TOOLS)/gen-ksyms.py
+	@$(PYTHON) $(TOOLS)/gen-ksyms.py $< -o $@
+
+$(KERNEL_DEBUG): $(OBJECTS) $(BUILD)/ksyms_b.o linker/kernel.ld
+	@mkdir -p $(dir $@)
+	@echo "  LD      $@ (pass C, final)"
+	@$(LD) $(LDFLAGS) $(LINK_ORDER) $(BUILD)/ksyms_b.o -o $@
+	@echo "  VERIFY  embedded symbol table describes this kernel"
+	@$(PYTHON) $(TOOLS)/gen-ksyms.py $@ -o $(BUILD)/ksyms_check.c \
+		--verify $(KSYMS_B)
 
 $(KERNEL_ELF): $(KERNEL_DEBUG) $(TOOLS)/check-kernel.py
 	@echo "  STRIP   $@"
@@ -206,6 +254,13 @@ $(SHELL_IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(TOOLS)/mkimage.py
 		--stage1 $(STAGE1_BIN) --stage2 $(STAGE2_BIN) \
 		--kernel $(KERNEL_ELF) --output $@ \
 		--cmdline "nodemo nousermode loglevel=warn"
+
+$(BENCH_IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(TOOLS)/mkimage.py
+	@echo "  IMAGE   $@ (benchmarks)"
+	@$(PYTHON) $(TOOLS)/mkimage.py --quiet \
+		--stage1 $(STAGE1_BIN) --stage2 $(STAGE2_BIN) \
+		--kernel $(KERNEL_ELF) --output $@ \
+		--cmdline "autobench nodemo nousermode loglevel=warn"
 
 $(TEST_ISO): $(KERNEL_ELF) $(TOOLS)/grub-test.cfg
 	@if ! command -v grub-mkrescue >/dev/null 2>&1; then \
@@ -263,7 +318,7 @@ $(BUILD)/test_printf: $(HOST_TEST_SRC)
 		-I$(INCLUDE) $(HOST_TEST_SRC) -o $@
 
 .PHONY: test-boot
-test-boot: $(TEST_IMG) $(TEST_ISO) $(SHELL_IMG)
+test-boot: $(TEST_IMG) $(TEST_ISO) $(SHELL_IMG) $(BENCH_IMG)
 	@echo "  RUN     QEMU boot tests (both boot paths)"
 	@$(PYTHON) $(TOOLS)/run-tests.py --build-dir $(BUILD)
 
@@ -273,6 +328,13 @@ test: test-host test-boot
 	@echo "  all tests passed"
 
 # ---- debugging --------------------------------------------------------------
+
+.PHONY: bench
+bench: $(BENCH_IMG)
+	@echo "  RUN     microbenchmarks and a profile under QEMU"
+	@$(QEMU) $(QEMU_COMMON) -display none -serial stdio \
+		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+		-drive format=raw,file=$(BENCH_IMG),index=0,media=disk || true
 
 .PHONY: debug
 debug: $(DISK_IMG)

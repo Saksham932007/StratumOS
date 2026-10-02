@@ -278,6 +278,8 @@ class SerialSession:
 
 # Each entry is (command, [patterns the output must contain]).
 SHELL_SCRIPT: list[tuple[str, list[str]]] = [
+    ("syms", [r"\d+ symbols embedded"]),
+    ("bench vmm-xlate", [r"bench: vmm-xlate\s+min=", r"tsc \d+\.\d+ MHz"]),
     ("version", [r"StratumOS 0\.3", r"boot via",
                  r"StratumOS native|Multiboot2"]),
     ("uptime", [r"up \d+:\d\d:\d\d", r"timer ticks"]),
@@ -363,6 +365,84 @@ def run_interactive(build_dir: Path, keep_logs: Path | None) -> Outcome:
     return Outcome(sc, not failures, exit_code, log, failures, None)
 
 
+# The benchmark image reports measurements and a profile rather than test
+# results, so it gets its own expectation set instead of COMMON_EXPECTED.
+BENCH_EXPECTED = [
+    ("TSC calibrated", r"bench: tsc \d+\.\d+ MHz"),
+    ("platform disclosed", r"bench: (NOTE running under|bare metal)"),
+    ("harness overhead measured", r"bench: harness overhead \d+ cycles"),
+    ("syscall measured", r"bench: syscall\s+min=\d+"),
+    ("context switch measured", r"bench: ctxsw\s+min=\d+"),
+    ("kmalloc measured", r"bench: kmalloc\s+min=\d+"),
+    ("pmm measured", r"bench: pmm\s+min=\d+"),
+    ("page mapping measured", r"bench: vmm-map\s+min=\d+"),
+    ("translation measured", r"bench: vmm-xlate\s+min=\d+"),
+    ("memcpy measured", r"bench: memcpy-4k\s+min=\d+"),
+    ("formatter measured", r"bench: ksnprintf\s+min=\d+"),
+    ("benchmarks completed", r"bench: complete"),
+    ("nanoseconds derived", r"= \d+\.\d+ ns"),
+    ("profile produced", r"Sampling profile"),
+    ("profile attributed samples", r"kernel samples: [1-9]\d* attributed"),
+    # The workload is allocator-dominated, so a profiler that discriminates
+    # must put kmalloc at the top. This asserts the profiler is useful, not
+    # merely that it runs.
+    ("profile found the hot path", r"\d+\s+\d+\.\d%\s+kmalloc"),
+    ("autobench finished", r"stratum: autobench complete"),
+]
+
+
+def run_benchmarks(build_dir: Path, keep_logs: Path | None) -> Outcome:
+    image = build_dir / "stratum-bench.img"
+    sc = Scenario(
+        name="benchmarks",
+        description="microbenchmarks and a sampling profile",
+        image=image,
+        qemu_args=[
+            "-drive",
+            f"format=raw,file={image},index=0,media=disk",
+        ],
+        timeout=180,
+    )
+
+    failures: list[str] = []
+
+    with tempfile.TemporaryDirectory() as tmp:
+        log_path = Path(tmp) / "serial.log"
+        cmd = [
+            QEMU, "-m", "128M", "-no-reboot", "-display", "none",
+            "-serial", f"file:{log_path}",
+            "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+            *sc.qemu_args,
+        ]
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=sc.timeout)
+            qemu_exit: int | None = proc.returncode
+        except subprocess.TimeoutExpired:
+            qemu_exit = None
+            failures.append(f"QEMU did not exit within {sc.timeout}s")
+
+        log = log_path.read_text(errors="replace") if log_path.exists() else ""
+
+    if keep_logs:
+        keep_logs.mkdir(parents=True, exist_ok=True)
+        (keep_logs / "benchmarks.log").write_text(log)
+
+    for label, pattern in BENCH_EXPECTED:
+        if not re.search(pattern, log):
+            failures.append(f"missing: {label}  (no match for /{pattern}/)")
+
+    for label, pattern in FORBIDDEN:
+        if re.search(pattern, log):
+            failures.append(f"forbidden: {label}")
+
+    if qemu_exit is not None and qemu_exit != EXIT_PASS:
+        failures.append(f"unexpected QEMU exit status {qemu_exit}")
+
+    return Outcome(sc, not failures, qemu_exit, log, failures, None)
+
+
 def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
     scenarios = [
         Scenario(
@@ -398,7 +478,7 @@ def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
         ),
     ]
 
-    if only == "interactive-shell":
+    if only in ("interactive-shell", "benchmarks"):
         return []
 
     if only:
@@ -462,6 +542,27 @@ def main() -> int:
                     print("    --- end ---\n")
         else:
             print(f"  [interactive-shell] SKIP ({shell_image} not built)\n")
+
+    if args.only in (None, "benchmarks"):
+        bench_image = args.build_dir / "stratum-bench.img"
+        if bench_image.is_file():
+            print("  [benchmarks] microbenchmarks and a sampling profile")
+            outcome = run_benchmarks(args.build_dir, args.keep_logs)
+            outcomes.append(outcome)
+            print(f"    qemu exit        : {outcome.qemu_exit}")
+            if outcome.passed:
+                print("    result           : PASS\n")
+            else:
+                print("    result           : FAIL")
+                for f in outcome.failures:
+                    print(f"      - {f}")
+                print()
+                print("    --- serial log ---")
+                for line in outcome.log.splitlines():
+                    print(f"    | {line}")
+                print("    --- end of log ---\n")
+        else:
+            print(f"  [benchmarks] SKIP ({bench_image} not built)\n")
 
     for sc in scenarios:
         print(f"  [{sc.name}] {sc.description}")

@@ -16,6 +16,9 @@ extern u8 __text_start[], __text_end[];
 extern u8 __rodata_start[], __rodata_end[];
 extern u8 __data_start[], __data_end[];
 extern u8 __bss_start[], __bss_end[];
+/* The ring-3 payload. Executable, but a separate section from .text so that
+ * exactly these pages can be made user-accessible. */
+extern u8 __user_start[], __user_end[];
 
 /* The C entry point, called from arch/x86/boot.asm. */
 void kmain(u32 magic, u32 info_addr);
@@ -24,11 +27,17 @@ const struct boot_params *kernel_boot_params(void);
 
 /* Parsed from the boot command line. */
 struct kernel_cmdline {
-    bool autotest;    /* run self-tests and exit instead of starting a shell */
-    bool quiet;       /* suppress VGA output                                 */
-    bool no_usermode; /* skip the ring-3 demo                                */
-    bool
-        no_sched_demo; /* skip the demo worker threads                        */
+    /* Run the in-kernel test suites, then shut the machine down. */
+    bool autotest;
+    /* Run the microbenchmarks and a profile, then shut down. */
+    bool autobench;
+    /* Suppress VGA output; serial only. */
+    bool quiet;
+    /* Skip the ring-3 demonstration task. */
+    bool no_usermode;
+    /* Skip the background demo worker threads. */
+    bool no_sched_demo;
+    /* Initial log level, by name. */
     const char *loglevel;
 };
 

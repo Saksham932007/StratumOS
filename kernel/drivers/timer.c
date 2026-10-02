@@ -18,6 +18,7 @@
 #include <drivers/timer.h>
 
 #include <kernel/log.h>
+#include <kernel/profile.h>
 #include <kernel/sched.h>
 
 static volatile u64 ticks;
@@ -27,8 +28,12 @@ static u32 actual_hz_milli; /* real frequency x 1000 */
 
 static void timer_irq(struct regs *r)
 {
-    UNUSED(r);
     ticks++;
+
+    /* The interrupted EIP is already in the frame, so a statistical profile
+     * costs one symbol lookup. See kernel/core/profile.c. */
+    profile_tick(r);
+
     sched_tick();
 }
 

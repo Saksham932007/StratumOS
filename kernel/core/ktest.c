@@ -25,9 +25,11 @@
 
 #include <kernel/console.h>
 #include <kernel/kernel.h>
+#include <kernel/ksyms.h>
 #include <kernel/ktest.h>
 #include <kernel/log.h>
 #include <kernel/printf.h>
+#include <kernel/profile.h>
 #include <kernel/sched.h>
 #include <kernel/string.h>
 #include <kernel/syscall.h>
@@ -462,6 +464,112 @@ static void test_syscall_guard(struct ktest_result *r)
     KT_ASSERT(r, !user_range_ok(0xC8000000u, 4));
 }
 
+/* ---- symbol table and profiler ---------------------------------------- */
+
+/* A function whose address is taken, so the linker cannot discard it and the
+ * symbol table is guaranteed to contain it. */
+static void ktest_known_function(void)
+{
+    __asm__ volatile("" ::: "memory");
+}
+
+static void test_ksyms(struct ktest_result *r)
+{
+    KT_ASSERT(r, ksyms_available());
+    KT_ASSERT(r, ksym_count > 100); /* a real kernel has hundreds */
+
+    /* The table must be sorted by address, or the binary search is wrong. */
+    bool sorted = true;
+    for (u32 i = 1; i < ksym_count; i++)
+        if (ksym_table[i].addr < ksym_table[i - 1].addr)
+            sorted = false;
+    KT_ASSERT(r, sorted);
+
+    /* An exact function address resolves to that function at offset 0. */
+    u32 offset = 0xFFFFFFFFu;
+    const char *name = ksym_lookup((u32)ktest_known_function, &offset);
+    KT_ASSERT(r, name != NULL);
+    KT_ASSERT(r, offset == 0);
+    if (name)
+        KT_ASSERT(r, strcmp(name, "ktest_known_function") == 0);
+
+    /* An address a few bytes in resolves to the same function, at an
+     * offset - this is what makes a backtrace readable. */
+    offset = 0;
+    name = ksym_lookup((u32)ktest_known_function + 2, &offset);
+    KT_ASSERT(r, name != NULL);
+    KT_ASSERT(r, offset == 2);
+
+    /* Addresses outside every executable section belong to no function.
+     * Resolving them anyway would make a backtrace confidently wrong. */
+    KT_ASSERT(r, ksym_lookup(0, NULL) == NULL);
+    KT_ASSERT(r, ksym_lookup(0xFFFFF000u, NULL) == NULL);
+    KT_ASSERT(r, ksym_index((u32)__kernel_start - 0x1000) < 0);
+
+    /* Every symbol must resolve to itself. */
+    bool all_self = true;
+    for (u32 i = 0; i < ksym_count; i++) {
+        int idx = ksym_index(ksym_table[i].addr);
+        if (idx < 0 || ksym_table[idx].addr != ksym_table[i].addr)
+            all_self = false;
+    }
+    KT_ASSERT(r, all_self);
+}
+
+static void test_profile(struct ktest_result *r)
+{
+    struct profile_stats before, after;
+
+    KT_ASSERT(r, profile_start());
+    if (!profile_active())
+        return;
+
+    profile_reset();
+    profile_get_stats(&before);
+    KT_EQ(r, before.samples, 0u);
+
+    /* Feed the attribution path synthetic frames rather than waiting for real
+     * timer ticks: that tests the logic in microseconds instead of seconds,
+     * and makes the expected counts exact. */
+    struct regs fake;
+    memset(&fake, 0, sizeof(fake));
+
+    /* A ring-0 frame inside a known function must be attributed. */
+    fake.cs = 0x08;
+    fake.eip = (u32)ktest_known_function;
+    profile_tick(&fake);
+
+    profile_get_stats(&after);
+    KT_EQ(r, after.samples, 1u);
+
+    /* A ring-3 frame must be counted separately - its EIP means nothing in
+     * the kernel's symbol table. */
+    fake.cs = 0x1B; /* user code selector, RPL 3 */
+    profile_tick(&fake);
+    profile_get_stats(&after);
+    KT_EQ(r, after.user_samples, 1u);
+    KT_EQ(r, after.samples, 1u); /* unchanged */
+
+    /* A ring-0 frame outside .text is unattributable, not misattributed. */
+    fake.cs = 0x08;
+    fake.eip = 0x20;
+    profile_tick(&fake);
+    profile_get_stats(&after);
+    KT_EQ(r, after.unknown, 1u);
+    KT_EQ(r, after.samples, 1u);
+
+    profile_stop();
+    KT_ASSERT(r, !profile_active());
+
+    /* A stopped profiler must ignore ticks entirely. */
+    fake.eip = (u32)ktest_known_function;
+    profile_tick(&fake);
+    profile_get_stats(&after);
+    KT_EQ(r, after.samples, 1u);
+
+    profile_reset();
+}
+
 /* ---- registry ---------------------------------------------------------- */
 
 static const struct ktest tests[] = {
@@ -474,6 +582,8 @@ static const struct ktest tests[] = {
     {"irq", "interrupt delivery and the timer", test_interrupts},
     {"sched", "task switching and sleeping", test_scheduler},
     {"syscall", "userspace pointer validation", test_syscall_guard},
+    {"ksyms", "embedded symbol table lookup", test_ksyms},
+    {"profile", "sampling profiler attribution", test_profile},
 };
 
 u32 ktest_count(void)

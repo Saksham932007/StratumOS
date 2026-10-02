@@ -15,6 +15,7 @@
 
 #include <arch/gdt.h>
 
+#include <kernel/kernel.h>
 #include <kernel/log.h>
 #include <kernel/panic.h>
 #include <kernel/sched.h>
@@ -22,10 +23,6 @@
 
 #include <mm/pmm.h>
 #include <mm/vmm.h>
-
-/* Provided by the linker script, page-aligned on both ends. */
-extern u8 __user_start[];
-extern u8 __user_end[];
 
 /* The user stack. Placed well away from both the identity map and the kernel
  * heap window so that a stack overflow lands on an unmapped page and faults

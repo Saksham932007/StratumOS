@@ -16,6 +16,7 @@
 
 #include <kernel/console.h>
 #include <kernel/kernel.h>
+#include <kernel/ksyms.h>
 #include <kernel/panic.h>
 #include <kernel/printf.h>
 
@@ -54,7 +55,9 @@ void backtrace(u32 ebp, unsigned max_frames)
         if (!plausible_code_address(ret))
             break;
 
-        kprintf("  [%u] %p\n", depth, (void *)ret);
+        kprintf("  [%u] %p  ", depth, (void *)ret);
+        ksym_print(ret);
+        kprintf("\n");
 
         u32 next = frame[0];
         if (next <= ebp) /* must move up the stack, or we would loop forever */

@@ -23,12 +23,15 @@
 #include <drivers/timer.h>
 #include <drivers/vga.h>
 
+#include <kernel/bench.h>
 #include <kernel/console.h>
 #include <kernel/kernel.h>
+#include <kernel/ksyms.h>
 #include <kernel/ktest.h>
 #include <kernel/log.h>
 #include <kernel/panic.h>
 #include <kernel/printf.h>
+#include <kernel/profile.h>
 #include <kernel/sched.h>
 #include <kernel/shell.h>
 #include <kernel/string.h>
@@ -550,6 +553,150 @@ static int cmd_stress(int argc, char **argv)
     return 0;
 }
 
+static int cmd_bench(int argc, char **argv)
+{
+    if (argc > 1) {
+        if (strcmp(argv[1], "list") == 0) {
+            bench_list();
+            return 0;
+        }
+        return (int)bench_run_one(argv[1]);
+    }
+
+    return (int)bench_run_all();
+}
+
+static int cmd_syms(int argc, char **argv)
+{
+    u32 addr;
+
+    if (!ksyms_available()) {
+        kprintf("this kernel has no embedded symbol table\n");
+        return 1;
+    }
+
+    if (argc < 2) {
+        kprintf("%u symbols embedded, covering %p - %p\n", ksym_count,
+                (void *)__text_start, (void *)__text_end);
+        kprintf("usage: syms <address>\n");
+        return 0;
+    }
+
+    if (!str_to_u32(argv[1], &addr)) {
+        kprintf("'%s' is not a valid address\n", argv[1]);
+        return 1;
+    }
+
+    u32 offset = 0;
+    const char *name = ksym_lookup(addr, &offset);
+
+    if (!name) {
+        kprintf("%p is not inside any known function\n", (void *)addr);
+        return 1;
+    }
+
+    kprintf("%p  ", (void *)addr);
+    ksym_print(addr);
+    kprintf("\n");
+    return 0;
+}
+
+/* A mixed workload to profile, so that `profile run` demonstrates something
+ * without the user having to arrange a load by hand. */
+static void profile_workload(void *arg)
+{
+    u32 ms = (u32)(uintptr_t)arg;
+    u64 deadline = timer_ms() + ms;
+
+    while (timer_ms() < deadline) {
+        /* Deliberately lopsided: lots of allocator traffic, some string
+         * formatting, a little page-table work. A flat profile would mean
+         * the profiler is not discriminating. */
+        for (int i = 0; i < 400; i++) {
+            void *p = kmalloc(64 + (size_t)(i & 255));
+            kfree(p);
+        }
+
+        char buf[48];
+        for (int i = 0; i < 100; i++)
+            ksnprintf(buf, sizeof(buf), "%d %08x %s", i, (unsigned)i, "x");
+
+        for (int i = 0; i < 20; i++) {
+            paddr_t out;
+            vmm_translate((vaddr_t)__kernel_start + (u32)i * 4096, &out);
+        }
+    }
+}
+
+static int cmd_profile(int argc, char **argv)
+{
+    const char *action = (argc > 1) ? argv[1] : "show";
+
+    if (strcmp(action, "start") == 0) {
+        if (!profile_start()) {
+            kprintf("could not start the profiler\n");
+            return 1;
+        }
+        kprintf("profiler started; run a workload, then 'profile stop'\n");
+        return 0;
+    }
+
+    if (strcmp(action, "stop") == 0) {
+        profile_stop();
+        kprintf("profiler stopped\n");
+        profile_report(20);
+        return 0;
+    }
+
+    if (strcmp(action, "reset") == 0) {
+        profile_reset();
+        kprintf("counters cleared\n");
+        return 0;
+    }
+
+    if (strcmp(action, "show") == 0) {
+        u32 top = 20;
+        if (argc > 2 && !str_to_u32(argv[2], &top))
+            return 1;
+        profile_report(top);
+        return 0;
+    }
+
+    if (strcmp(action, "run") == 0) {
+        u32 ms = 1500;
+
+        if (argc > 2 && !str_to_u32(argv[2], &ms))
+            return 1;
+        if (ms > 10000)
+            ms = 10000;
+
+        if (!profile_start()) {
+            kprintf("could not start the profiler\n");
+            return 1;
+        }
+
+        kprintf("profiling a mixed workload for %u ms...\n", ms);
+
+        /* Run the load in a task so the shell's own read loop does not
+         * dominate the profile. */
+        if (!task_create("prof-load", profile_workload,
+                         (void *)(uintptr_t)ms)) {
+            profile_stop();
+            kprintf("could not start the workload task\n");
+            return 1;
+        }
+
+        task_sleep_ms(ms + 250);
+        profile_stop();
+        kprintf("\n");
+        profile_report(20);
+        return 0;
+    }
+
+    kprintf("usage: profile <run [ms]|start|stop|show [n]|reset>\n");
+    return 1;
+}
+
 static int cmd_reboot(int argc, char **argv)
 {
     UNUSED(argc);
@@ -586,6 +733,10 @@ static const struct shell_command commands[] = {
     {"log", "log [level]", "show or set the log level", cmd_log},
     {"selftest", "selftest [suite|list]", "run the in-kernel test suite",
      cmd_selftest},
+    {"bench", "bench [name|list]", "measure kernel hot paths", cmd_bench},
+    {"profile", "profile <run|start|stop|show|reset>", "sampling profiler",
+     cmd_profile},
+    {"syms", "syms <address>", "resolve an address to a symbol", cmd_syms},
     {"ring3", "ring3", "run the user-mode demo", cmd_ring3},
     {"stress", "stress [workers] [rounds]",
      "hammer the heap from several tasks", cmd_stress},

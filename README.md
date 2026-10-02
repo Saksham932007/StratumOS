@@ -31,6 +31,7 @@ BIOS ─► stage 1 (512 B MBR) ─► stage 2 ─► 32-bit protected mode ─�
 - [What it looks like running](#what-it-looks-like-running)
 - [Feature matrix](#feature-matrix)
 - [Two boot paths, one kernel](#two-boot-paths-one-kernel)
+- [Performance](#performance)
 - [Testing](#testing)
 - [Repository layout](#repository-layout)
 - [Design decisions worth defending](#design-decisions-worth-defending)
@@ -97,6 +98,7 @@ Other useful targets:
 | `make debug` | start QEMU stopped, waiting for GDB on `:1234` |
 | `make gdb` | attach GDB with symbols, break at `kmain` |
 | `make sections` | dump the image layout and re-run the pre-boot validator |
+| `make bench` | run the microbenchmarks and a profile, then exit |
 | `make test-host` | host unit tests only (no emulator, ~1 second) |
 | `make lines` | line counts by subsystem |
 
@@ -246,7 +248,10 @@ Everything marked ✅ is implemented and covered by a test.
 | ✅ | Drivers: 16550 (in and out), VGA text, PIT, PS/2 keyboard, CMOS RTC, PCI |
 | ✅ | `kprintf` with width/precision/64-bit support, levelled logging |
 | ✅ | 64-bit division helpers — the kernel links against nothing at all |
-| ✅ | 20-command shell with line editing, history, and fault injection |
+| ✅ | 23-command shell with line editing, history, and fault injection |
+| ✅ | Embedded symbol table: panics print `function+0x1c`, no addr2line needed |
+| ✅ | 11 TSC-calibrated microbenchmarks, overhead-subtracted, median of 24 |
+| ✅ | Timer-driven sampling profiler with symbol attribution |
 
 ---
 
@@ -282,6 +287,69 @@ memory layout at each stage and why the A20 gate still matters.
 
 ---
 
+## Performance
+
+The kernel measures itself. `make bench` calibrates the TSC against the PIT,
+runs eleven microbenchmarks, takes a sampling profile, and exits — and CI
+asserts on every figure.
+
+Measured under QEMU TCG at a calibrated 2099 MHz, median of 24 samples, with
+the harness's own overhead subtracted:
+
+| Benchmark | Cycles | Time | |
+|---|---:|---:|---|
+| virtual → physical translation | 60 | 28.6 ns | two loads through the recursive window |
+| heap integrity walk | 155 | 73.7 ns | every block's header and footer magic |
+| physical frame alloc + free | 376 | 179.3 ns | bitmap scan, 32 frames per word |
+| `kmalloc(64)` + `kfree` | 414 | 197.2 ns | first-fit, split, coalesce, guards |
+| map + unmap a 4 KiB page | 495 | 236.0 ns | includes `invlpg` |
+| context switch | 610 | 290.4 ns | stack swap + scheduler bookkeeping |
+| `int 0x80` round trip | 1360 | 647.8 ns | heavily emulation-distorted |
+| `memcpy` 4 KiB | 6060 | 2886.7 ns | 1.48 cycles/byte, dword path |
+
+**These are emulated costs, not silicon timings** — and the harness says so
+itself, detecting the hypervisor via CPUID and printing the caveat with every
+run. The *ratios* hold; the absolute numbers need KVM or real hardware. A
+benchmark that quietly reported QEMU's timings as hardware numbers would be
+worse than no benchmark.
+
+The sampling profiler hooks the timer interrupt, which already has the
+interrupted `EIP` in its frame, and attributes it through an embedded symbol
+table:
+
+```
+stratum> profile run 1500
+
+  SAMPLES   SHARE  FUNCTION
+       40   57.1%  kmalloc
+       16   22.8%  kfree
+       13   18.5%  emit_number      <- the formatter's digit loop
+        1    1.4%  ksnprintf
+```
+
+That workload was allocator traffic plus integer formatting, and the profile
+finds exactly that — including separating `emit_number` from the `ksnprintf`
+that calls it. CI asserts `kmalloc` tops that list, so a regression in
+attribution fails the build instead of producing a quietly flat profile.
+
+The same 559-symbol table makes panics readable with nothing but a serial log:
+
+```
+  EIP 0010cab4  CS  0008      EFLAGS 00000286
+  at  cmd_fault+0x124
+Call trace (return addresses; the faulting frame is EIP above):
+  [0] 0x0010de26  shell_run_line+0xe6
+  [1] 0x0010e3c7  shell_task+0x507
+  [2] 0x00101b02  thread_trampoline+0xb
+```
+
+Embedding that table is circular — it changes the addresses it describes — so
+the build links three times and then **verifies** the table still matches,
+rather than trusting that it does. Full methodology, per-benchmark analysis and
+the profiler's limits are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
+---
+
 ## Testing
 
 An OS that "boots on my machine" is not evidence of much. This project is set
@@ -292,8 +360,8 @@ QEMU.
 | --- | --- | --- |
 | **Host unit tests** | the kernel's real `printf`/`string`/`div64` sources, compiled for the host, diffed against glibc | 92 checks |
 | **Pre-boot validation** | Multiboot2 header and checksum, ELF type, entry point inside a load segment, load address, `.bss`/`.user` alignment, absence of SSE | 20 failure conditions, every link |
-| **In-kernel suites** | allocator, paging, heap coalescing, interrupts, scheduler, syscall pointer validation, run against real hardware state | 157 checks in 9 suites |
-| **Boot scenarios** | custom bootloader unattended, GRUB/Multiboot2 unattended, 21 shell commands typed over serial | 3 scenarios |
+| **In-kernel suites** | allocator, paging, heap coalescing, interrupts, scheduler, syscall pointer validation, symbol lookup, profiler attribution — all against real hardware state | 11 suites |
+| **Boot scenarios** | custom bootloader unattended, GRUB/Multiboot2 unattended, 23 shell commands typed over serial, benchmarks + profile | 4 scenarios |
 
 ```
 $ make test
@@ -302,16 +370,18 @@ $ make test
 
   RUN     QEMU boot tests (both boot paths)
   [interactive-shell] shell driven over the serial console, command by command
-    commands run     : 21
+    commands run     : 23
+    result           : PASS
+  [benchmarks] microbenchmarks and a sampling profile
     result           : PASS
   [custom-bootloader] two-stage BIOS bootloader from a raw disk image
-    in-kernel suites : 9/9 passed
+    in-kernel suites : 11/11 passed
     result           : PASS
   [multiboot2-grub] Multiboot2 via GRUB from an ISO
-    in-kernel suites : 9/9 passed
+    in-kernel suites : 11/11 passed
     result           : PASS
 
-run-tests: all 3 scenario(s) passed
+run-tests: all 4 scenario(s) passed
 ```
 
 Three details that make this work unattended:
@@ -465,6 +535,7 @@ Being clear about scope is more useful than a longer feature list.
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | subsystem map, initialisation order and why it is forced |
 | [docs/BOOT.md](docs/BOOT.md) | both boot paths instruction by instruction |
 | [docs/MEMORY.md](docs/MEMORY.md) | address-space layout, the three allocators, the recursive mapping |
+| [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | benchmark methodology, results with analysis, the profiler and its limits |
 | [docs/TESTING.md](docs/TESTING.md) | the four test layers and how to add to each |
 | [docs/DEBUGGING.md](docs/DEBUGGING.md) | GDB against QEMU, reading a panic, common symptoms |
 | [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md) | the trade-offs, with the alternatives that were rejected |

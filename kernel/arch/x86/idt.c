@@ -17,6 +17,7 @@
 #include <arch/io.h>
 #include <arch/irq.h>
 
+#include <kernel/ksyms.h>
 #include <kernel/log.h>
 #include <kernel/panic.h>
 #include <kernel/sched.h>
@@ -93,6 +94,12 @@ void regs_dump(const struct regs *r)
     kprintf("  ESI %08x  EDI %08x  EBP %08x\n", r->esi, r->edi, r->ebp);
     kprintf("  EIP %08x  CS  %04x      EFLAGS %08x\n", r->eip, r->cs & 0xFFFF,
             r->eflags);
+    /* Naming the faulting instruction's function is the most useful single
+     * line in the dump, so it sits next to EIP rather than down in the
+     * trace - which lists the faulting function's *callers*, not itself. */
+    kprintf("  at  ");
+    ksym_print(r->eip);
+    kprintf("\n");
     kprintf("  DS  %04x      ES  %04x      FS %04x      GS %04x\n",
             r->ds & 0xFFFF, r->es & 0xFFFF, r->fs & 0xFFFF, r->gs & 0xFFFF);
     kprintf("  vector %u (%s)  error %08x\n", r->int_no,
