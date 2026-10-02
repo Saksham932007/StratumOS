@@ -1,0 +1,50 @@
+# StratumOS C style: Linux-kernel derived, 4-space indent, 80 columns.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+
+IndentWidth: 4
+TabWidth: 8
+UseTab: Never
+ColumnLimit: 80
+
+BreakBeforeBraces: Linux
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+
+AlignAfterOpenBracket: Align
+AlignConsecutiveMacros: AcrossEmptyLinesAndComments
+AlignEscapedNewlines: Left
+AlignTrailingComments: true
+
+PointerAlignment: Right
+DerivePointerAlignment: false
+SpaceAfterCStyleCast: false
+SpaceBeforeParens: ControlStatements
+
+IndentCaseLabels: false
+IndentPPDirectives: None
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1
+
+SortIncludes: CaseSensitive
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex:    '^<(stdarg|stdbool|stddef|stdint)\.h>'
+    Priority: 1
+  - Regex:    '^<arch/'
+    Priority: 2
+  - Regex:    '^<boot/'
+    Priority: 3
+  - Regex:    '^<drivers/'
+    Priority: 4
+  - Regex:    '^<kernel/'
+    Priority: 5
+  - Regex:    '^<mm/'
+    Priority: 6
+  - Regex:    '.*'
+    Priority: 7
+
+ReflowComments: false

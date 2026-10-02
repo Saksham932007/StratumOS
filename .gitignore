@@ -1,0 +1,24 @@
+# Build output
+build/
+*.o
+*.d
+*.bin
+*.elf
+*.img
+*.iso
+*.sym
+*.map
+
+# Editor and OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Test artefacts
+logs/
+*.log
+bochsout.txt
