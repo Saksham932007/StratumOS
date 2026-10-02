@@ -105,23 +105,26 @@ Checking them takes 30 milliseconds.
 
 ## Layer 3: in-kernel suites
 
-`kernel/core/ktest.c` holds nine suites, 157 assertions, run against real
-hardware state — a bitmap with actual firmware-reported memory in it, real
+`kernel/core/ktest.c` holds 12 suites and 213 assertions, run against
+real hardware state — a bitmap with actual firmware-reported memory in it, real
 page tables, a real heap, a real scheduler.
 
 ```
 stratum> selftest
-ktest: running 9 suites
+ktest: running 12 suites
 ktest: string ... PASS (15 checks)
-ktest: boot ... PASS (10 checks)
+ktest: boot ... PASS (26 checks)
 ktest: cpu ... PASS (8 checks)
 ktest: pmm ... PASS (13 checks)
-ktest: vmm ... PASS (30 checks)
+ktest: vmm ... PASS (32 checks)
 ktest: heap ... PASS (57 checks)
 ktest: irq ... PASS (9 checks)
 ktest: sched ... PASS (10 checks)
-ktest: syscall ... PASS (5 checks)
-ktest: summary 9/9 suites passed
+ktest: syscall ... PASS (8 checks)
+ktest: elf ... PASS (14 checks)
+ktest: ksyms ... PASS (12 checks)
+ktest: profile ... PASS (9 checks)
+ktest: summary 12/12 suites passed
 ```
 
 | Suite | What it establishes |
@@ -134,7 +137,8 @@ ktest: summary 9/9 suites passed
 | `heap` | payloads are 8-byte aligned; neighbours are not disturbed; coalescing returns merged space; realloc preserves contents; `kmalloc(0)`, `kfree(NULL)` and `krealloc(p, 0)` behave; 32 interleaved allocations freed in a different order leave the arena consistent |
 | `irq` | the timer is advancing, no spurious interrupts accumulated, `int3` survives a full round trip through the stub and `iret`, `irq_save`/`irq_restore` nests |
 | `sched` | a created task actually runs, switch counts rise, and a 60 ms sleep takes at least 50 ms |
-| `syscall` | `user_range_ok` rejects kernel addresses, the heap window, address-space wraps, and unmapped pages |
+| `syscall` | `user_range_ok` rejects kernel addresses, address-space wraps, unmapped pages, and ranges that *straddle* the kernel boundary |
+| `elf` | a deliberately corrupted image is refused for each of eight reasons, each with a stated cause |
 | `ksyms` | the table is sorted; every symbol resolves to itself; an exact address gives offset 0 and an address inside a function gives the right offset; addresses outside every executable section resolve to nothing |
 | `profile` | synthetic frames are attributed correctly — ring 0 inside a known function counts, ring 3 counts separately, an address outside `.text` counts as unattributed, and a stopped profiler ignores ticks |
 

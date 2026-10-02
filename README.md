@@ -6,13 +6,13 @@ the way to a preemptively scheduled, higher-half, paged kernel running an
 interactive shell and a separate user-space program in ring 3.
 
 [![CI](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml/badge.svg)](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml)
-![language](https://img.shields.io/badge/C11%20%2B%20NASM-11k%20lines-blue)
+![language](https://img.shields.io/badge/C11%20%2B%20NASM-13.7k%20lines-blue)
 ![arch](https://img.shields.io/badge/arch-x86%20(i686)-lightgrey)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 The same kernel binary boots two ways — through a bootloader written for this
-project, and through GRUB via Multiboot2 — and 249 automated assertions run on
-every push, including three QEMU boot scenarios.
+project, and through GRUB via Multiboot2 — and every push runs 305 assertions
+across 92 host unit tests, 12 in-kernel suites, and four QEMU boot scenarios.
 
 ```
 BIOS ─► stage 1 (512 B MBR) ─► stage 2 ─► 32-bit protected mode ─► kernel ─► ring 3
@@ -370,7 +370,7 @@ QEMU.
 | --- | --- | --- |
 | **Host unit tests** | the kernel's real `printf`/`string`/`div64` sources, compiled for the host, diffed against glibc | 92 checks |
 | **Pre-boot validation** | Multiboot2 header and checksum, ELF type, entry point inside a load segment, load address, `.bss`/`.user` alignment, absence of SSE | 20 failure conditions, every link |
-| **In-kernel suites** | allocator, paging, heap coalescing, interrupts, scheduler, syscall pointer validation, symbol lookup, profiler attribution — all against real hardware state | 11 suites |
+| **In-kernel suites** | allocator, paging, heap coalescing, interrupts, scheduler, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 213 checks in 12 suites |
 | **Boot scenarios** | custom bootloader unattended, GRUB/Multiboot2 unattended, 23 shell commands typed over serial, benchmarks + profile | 4 scenarios |
 
 ```
@@ -385,10 +385,10 @@ $ make test
   [benchmarks] microbenchmarks and a sampling profile
     result           : PASS
   [custom-bootloader] two-stage BIOS bootloader from a raw disk image
-    in-kernel suites : 11/11 passed
+    in-kernel suites : 12/12 passed
     result           : PASS
   [multiboot2-grub] Multiboot2 via GRUB from an ISO
-    in-kernel suites : 11/11 passed
+    in-kernel suites : 12/12 passed
     result           : PASS
 
 run-tests: all 4 scenario(s) passed
