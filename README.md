@@ -39,6 +39,7 @@ BIOS ─► stage 1 ─────► stage 2 ─────► protected mode
 - [Feature matrix](#feature-matrix)
 - [Two boot paths, one kernel](#two-boot-paths-one-kernel)
 - [Performance](#performance)
+- [Two architectures](#two-architectures)
 - [Networking](#networking)
 - [64-bit long mode](#64-bit-long-mode)
 - [Testing](#testing)
@@ -53,7 +54,7 @@ BIOS ─► stage 1 ─────► stage 2 ─────► protected mode
 
 ## The parts worth looking at
 
-Eight things in here were harder than they look, and each has a document that
+Nine things in here were harder than they look, and each has a document that
 explains the reasoning rather than the code.
 
 **One binary, two boot protocols.** `build/stratum.elf` is a single file.
@@ -93,6 +94,16 @@ touches per sector, so seven of eight should hit — and fewer than half did,
 because FAT sectors and data sectors were evicting each other. Splitting the
 cache by purpose took the hit rate from 47% to 89%.
 → [docs/STORAGE.md](docs/STORAGE.md#the-cache-and-what-measuring-it-changed)
+
+**A second architecture, which found a latent bug in the first.** The kernel
+also runs on RISC-V 64 — machine mode to supervisor mode to Sv39 paging, with
+the formatter, string layer and logger linked from the *same source files*
+the x86 kernel uses. The port's real output is a number: **55% of the kernel
+outside the architecture layer compiles for RISC-V unmodified**, and 88 of
+the 89 failures had one root cause — `paddr_t` and `vaddr_t` were `u32`.
+Invisible on i386, passes all 633 assertions, and only findable by building
+for something wider.
+→ [docs/PORTING.md](docs/PORTING.md)
 
 **A network stack verified against a packet capture.** An e1000 driver,
 Ethernet, ARP, IPv4, ICMP, UDP and a small TCP — the machine answers a ping
@@ -234,7 +245,7 @@ StratumOS stage2
   [->] entering protected mode
 
   .-----------------------------------------------------.
-  | StratumOS 0.11.0  -  x86 kernel: real mode to ring 3 |
+  | StratumOS 0.12.0  -  x86 kernel: real mode to ring 3 |
   '-----------------------------------------------------'
 [    0.000] INFO  boot: serial COM1        [ok] 115200 8N1
 [    0.000] INFO  boot: CPU detect         [ok] GenuineIntel
@@ -261,7 +272,7 @@ StratumOS stage2
 [    0.070] INFO  boot: filesystem         [ok] FAT16 "STRATUM" on hd0p1
 [    0.070] INFO  sched: scheduler ready; boot context adopted as pid 0 (idle)
 [    0.070] INFO  syscall: syscall gate installed at int 0x80 (11 calls available)
-[    0.080] INFO  boot: StratumOS 0.11.0 is up: 127 MiB RAM, 6 PCI devices, 19 test suites
+[    0.080] INFO  boot: StratumOS 0.12.0 is up: 127 MiB RAM, 6 PCI devices, 19 test suites
 ```
 
 Ring 3, exercising the syscall boundary from the untrusted side, then
@@ -612,6 +623,99 @@ Embedding that table is circular — it changes the addresses it describes — s
 the build links three times and then **verifies** the table still matches,
 rather than trusting that it does. Full methodology, per-benchmark analysis and
 the profiler's limits are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
+---
+
+## Two architectures
+
+```bash
+make riscv64 && make run-riscv64     # clang + ld.lld, no new toolchain
+make portability                     # measure how portable the kernel is
+```
+
+```
+  .-----------------------------------------------------.
+  | StratumOS 0.12.0  -  riscv64 (rv64imac) on QEMU virt |
+  '-----------------------------------------------------'
+[    0.004] INFO  boot: machine mode: mtvec installed, CLINT timer at 100 Hz, 10 exception(s) delegated to supervisor mode
+[    0.006] INFO  boot: supervisor mode reached by mret; sstatus 0x00000000
+[    0.007] INFO  paging: Sv39 enabled: root at 0x8000a000, 2 gigapages identity-mapped
+
+rvtest: running the *shared* code, compiled from the same sources the x86 kernel links
+rvtest: core/printf.c ... PASS
+rvtest: core/string.c ... PASS
+rvtest: traps       ... PASS
+rvtest: timer       ... PASS
+rvtest: sv39        ... PASS
+rvtest: summary 58 check(s), 0 failure(s)
+```
+
+The boot arc is the same shape as the x86 one, for the same kind of reason —
+the mode you start in cannot do the thing you need next:
+
+```
+x86:     16-bit real mode  ->  32-bit protected mode  ->  paging
+RISC-V:  machine mode      ->  supervisor mode        ->  paging (Sv39)
+```
+
+A hart comes out of reset in machine mode, which can do anything *except* use
+`satp`: M-mode fetches bypass translation entirely, so paging is not
+something an M-mode kernel can switch on for itself. `mret` is the analogue
+of the far jump that reloads `CS`.
+
+**But the point of the port is the measurement, not the boot.** Every other
+phase added a subsystem; this one tests an assertion about the subsystems
+that already existed — that most of `kernel/core` and `kernel/mm` was free of
+x86. That had been written in the roadmap for several phases, and it was a
+guess.
+
+`make portability` compiles every portable-by-intent source for RISC-V with
+`-Werror` and counts, so the number is generated rather than quoted:
+
+**55% compiles unmodified** — 16 of 29 files — and the whole of this is in it:
+
+| | |
+| --- | --- |
+| the entire network stack above the driver | `net/{net,arp,ipv4,udp,tcp}.c` |
+| the filesystem and block layer | `fs/{fat16,blockdev}.c` |
+| both allocators | `mm/{heap,pmm}.c` |
+| the formatter, strings, 64-bit division, the logger | `core/{printf,string,div64,log}.c` |
+
+Four of those are **linked into the RISC-V kernel and run there**, against
+the same assertions — including `memmove` with overlapping ranges, the
+function the ELF fuzzer caught in phase 7.
+
+**The findings are the valuable part.** Before any fixing, seven files failed
+with 88 errors, and every single one was this:
+
+```
+error: cast to 'void *' from smaller integer type 'u32' (aka 'unsigned int')
+```
+
+`paddr_t` and `vaddr_t` were `typedef u32`. Correct on i386, silently
+truncating on anything wider, invisible to 633 passing assertions, and fixed
+by one line — `uintptr_t` was available the whole time. That is a latent
+correctness bug in shared code that **no amount of testing on one
+architecture could have surfaced**, which is the argument for porting as a
+testing activity rather than a feature one.
+
+Exactly one failure was not a cast, and it is the more interesting one.
+`mm/heap.c` failed on its *include line*: it needs interrupt masking and
+nothing else from the processor, and was getting it from `<arch/io.h>` — the
+x86 **port I/O** header, which does not exist on an architecture with no port
+I/O. Portable code was reaching into the arch layer through a door labelled
+with one architecture's name. Now there is `<kernel/irqflags.h>`.
+
+The whole shared set needs **two** symbols from the architecture:
+`console_putc` and `timer_ms`. Everything else — every `%` conversion, the
+levelled logger, its rate limiter, its expected-error windows — came across
+for free.
+
+What is *not* ported, file by file with reasons, is in
+[docs/PORTING.md](docs/PORTING.md): the scheduler's mechanism, `vmm.c` (x86's
+recursive page-directory trick does not generalise past two levels), ring 3,
+SMP and the e1000, whose reliance on cache-coherent DMA was predicted in a
+comment written before this port existed.
 
 ---
 
@@ -1101,6 +1205,7 @@ Being clear about scope is more useful than a longer feature list.
 | [docs/SMP.md](docs/SMP.md) | ACPI, the APIC, the AP trampoline, real locks, TLB shootdown |
 | [docs/LONGMODE.md](docs/LONGMODE.md) | 32-bit to 64-bit long mode and back, the four-level table, and the boundary of the claim |
 | [docs/NETWORK.md](docs/NETWORK.md) | the e1000, the ring protocol, the checksum's two classic bugs, and what the stack deliberately lacks |
+| [docs/PORTING.md](docs/PORTING.md) | the RISC-V port, the measured portability of the rest, and the two typedefs that were holding it back |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | benchmark methodology, results with analysis, the profiler and its limits |
 | [docs/TESTING.md](docs/TESTING.md) | the five test layers and how to add to each |
 | [docs/FUZZING.md](docs/FUZZING.md) | both fuzzing harnesses, the shim's design, and the six bugs they found |

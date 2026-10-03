@@ -12,11 +12,20 @@ rather than after an emulator run.
 | Fuzzing | clang | ~2 min | what nobody thought to test: the parsers and the syscall boundary |
 
 ```bash
-make test        # layers 1 to 4
-make test-host   # layer 1 only, no emulator
-make test-boot   # layers 3 and 4
-make fuzz        # layer 5, bounded
+make test          # layers 1 to 4
+make test-host     # layer 1 only, no emulator
+make test-boot     # layers 3 and 4
+make fuzz          # layer 5, bounded
+make test-riscv64  # the second architecture, 58 checks
+make portability   # how much of the kernel builds for riscv64
 ```
+
+`make test` covers the x86 kernel. The riscv64 target has its own harness
+(`tools/run-riscv64.py`) for the same reason it has its own build: the x86
+one knows about disk images, two boot protocols and a serial console driven
+command by command, and a kernel started directly from an ELF with no
+firmware underneath has none of those. 17 expectations and an exit status,
+unattended. See [PORTING.md](PORTING.md).
 
 The first four layers test the kernel against inputs someone thought of. The
 fifth tests it against inputs nobody thought of, which is a different claim

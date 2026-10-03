@@ -25,7 +25,7 @@ int ksym_index(u32 addr)
      * User programs are separate ELFs with their own symbols, so a ring-3
      * address resolves to nothing here - which is correct, rather than
      * blaming whichever kernel function shares that address. */
-    if (addr < (u32)__text_start || addr >= (u32)__text_end)
+    if (addr < (uptr)__text_start || addr >= (uptr)__text_end)
         return -1;
 
     /* Binary search for the last symbol whose address is <= addr. The table is
@@ -71,7 +71,7 @@ void ksym_print(u32 addr)
     const char *name = ksym_lookup(addr, &offset);
 
     if (!name) {
-        kprintf("%p", (void *)addr);
+        kprintf("%p", (void *)(uptr)addr);
         return;
     }
 

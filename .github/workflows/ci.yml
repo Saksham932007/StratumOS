@@ -9,9 +9,10 @@
 #
 #   1. host-tests    pure unit tests, no emulator        (~10 s)
 #   2. build         cross-toolchain build + validation  (~1 min)
-#   3. fuzz          libFuzzer over real kernel sources  (~2 min)
-#   4. boot-tests    QEMU, twelve scenarios              (~9 min)
-#   5. analysis      static analysis and style           (~1 min)
+#   3. riscv64       the second architecture, built and booted (~1 min)
+#   4. fuzz          libFuzzer over real kernel sources  (~2 min)
+#   5. boot-tests    QEMU, twelve scenarios              (~9 min)
+#   6. analysis      static analysis and style           (~1 min)
 
 name: CI
 
@@ -83,6 +84,48 @@ jobs:
             build/stratum.iso
           retention-days: 14
           if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # The second architecture. Builds and boots the riscv64 kernel, and reports
+  # how much of the rest of the kernel compiles for it - which is the number
+  # docs/PORTING.md quotes, so it is generated on every push rather than
+  # written down once.
+  #
+  # Needs no new compiler: clang cross-compiles to riscv64 out of the box and
+  # ld.lld links it, which is most of why this port needed no toolchain work.
+  riscv64:
+    name: Second architecture (riscv64)
+    runs-on: ubuntu-latest
+    needs: [host-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang, lld and the riscv64 emulator
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            clang lld llvm python3 qemu-system-misc
+
+      - name: Build for riscv64
+        run: make riscv64
+
+      - name: Boot it and assert
+        run: make test-riscv64
+
+      # Informational, not a gate: a file that does not compile for a second
+      # architecture is a finding to act on, not a build break. See
+      # DESIGN-DECISIONS entry 35.
+      - name: Measure portability
+        run: make portability | tee portability.txt
+
+      - name: Upload the measurement
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portability
+          path: portability.txt
+          retention-days: 14
+          if-no-files-found: warn
 
   # --------------------------------------------------------------------------
   # The four host fuzz targets compile the kernel's own parsers - ELF, FAT16,

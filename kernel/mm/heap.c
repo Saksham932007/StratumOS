@@ -17,8 +17,11 @@
  */
 #define LOG_TAG "heap"
 
-#include <arch/io.h>
-
+/* <kernel/irqflags.h>, not <arch/io.h>. This file needs interrupt masking
+ * and nothing else from the processor; reaching for the x86 port I/O header
+ * to get it is what made the RISC-V port's first build of this file fail on
+ * its include line. */
+#include <kernel/irqflags.h>
 #include <kernel/log.h>
 #include <kernel/panic.h>
 #include <kernel/string.h>
@@ -328,7 +331,7 @@ void *kmalloc_aligned(size_t size, size_t align)
             if (!b->free)
                 continue;
 
-            u32 base = (u32)payload_of(b);
+            vaddr_t base = (vaddr_t)(uptr)payload_of(b);
             u32 aligned = ALIGN_UP(base, (u32)align);
 
             /* The gap left behind has to be big enough to be a block in its
@@ -354,7 +357,7 @@ void *kmalloc_aligned(size_t size, size_t align)
             /* Shrink b to the gap, then the new block starts exactly at
              * `aligned - HDR`, which is what makes `aligned` the payload. */
             u32 total = b->size;
-            struct block *nb = (struct block *)(aligned - HDR);
+            struct block *nb = (struct block *)(uptr)(aligned - HDR);
 
             b->size = gap - HDR - FTR;
             b->free = 1;
@@ -412,9 +415,10 @@ void kfree(void *ptr)
     if (!ptr)
         return; /* free(NULL) is a no-op, as it should be */
 
-    if ((u32)ptr < KHEAP_BASE || (u32)ptr >= KHEAP_BASE + region_bytes)
+    if ((uptr)ptr < KHEAP_BASE || (uptr)ptr >= KHEAP_BASE + region_bytes)
         panic("kfree(%p): pointer is outside the heap window [%p, %p)", ptr,
-              (void *)KHEAP_BASE, (void *)(KHEAP_BASE + region_bytes));
+              (void *)(uptr)KHEAP_BASE,
+              (void *)(uptr)(KHEAP_BASE + region_bytes));
 
     bool irqs = irq_save();
     struct block *b = block_of_payload(ptr);
@@ -524,7 +528,7 @@ unsigned heap_check(void)
             problems++;
         }
 
-        if ((u32)b < KHEAP_BASE || (u32)b >= KHEAP_BASE + region_bytes) {
+        if ((uptr)b < KHEAP_BASE || (uptr)b >= KHEAP_BASE + region_bytes) {
             pr_err("heap_check: block %p is outside the heap window",
                    (void *)b);
             problems++;

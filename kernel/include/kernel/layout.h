@@ -59,10 +59,13 @@ static inline void *phys_to_virt(paddr_t p)
 
 static inline paddr_t virt_to_phys(const void *v)
 {
-    return (paddr_t)((u32)v - KERNEL_VIRT_BASE);
+    /* Through `uptr`, not `u32`. Casting a pointer to a 32-bit integer is
+     * correct on i386 and silently truncating on anything wider, and it was
+     * one of the places the RISC-V port's first build caught. */
+    return (paddr_t)((uptr)v - KERNEL_VIRT_BASE);
 }
 
-static inline bool is_kernel_address(u32 addr)
+static inline bool is_kernel_address(vaddr_t addr)
 {
     return addr >= KERNEL_VIRT_BASE;
 }

@@ -218,7 +218,7 @@ bool elf_load_user(const void *image, size_t size, struct elf_load_info *out)
 
         if (ph->filesz) {
             user_access_begin();
-            memcpy((void *)ph->vaddr, (const u8 *)image + ph->offset,
+            memcpy((void *)(uptr)ph->vaddr, (const u8 *)image + ph->offset,
                    ph->filesz);
             user_access_end();
         }

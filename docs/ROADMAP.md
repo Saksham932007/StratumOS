@@ -360,41 +360,53 @@ separate from the phase that made it testable.
 
 ### A second architecture
 
-RISC-V or AArch64, and the honest statement is that this has not been
-started.
+Landed in v0.12.0: StratumOS runs on RISC-V 64. Machine mode to supervisor
+mode by `mret`, its own trap vectors for both, the CLINT timer, and Sv39
+three-level paging - with the formatter, string layer, 64-bit division and
+levelled logger linked from the *same source files* the x86 kernel uses, and
+58 assertions run against them on the target.
 
-It is a different kind of project from everything else on this list. Every
-other item adds a subsystem to a kernel that exists; this one asks whether
-`kernel/core` and `kernel/mm` are genuinely portable, and the only way to
-find out is to build the sibling of `kernel/arch/x86` and see what breaks.
-What is known so far, from the two phases that pushed hardest on the arch
-boundary:
+The deliverable is the measurement rather than the boot. The claim that used
+to sit in this document - that most of `kernel/core` and `kernel/mm` was free
+of x86 - was a guess, and `make portability` now answers it on every push:
+**55% of the kernel outside the architecture layer compiles for riscv64
+unmodified**, including the entire network stack above the driver, the
+filesystem, the block layer, both allocators and the formatter.
 
-- **Boot.** Nothing is shared. A RISC-V machine starts in S-mode with a
-  device tree in a register; there is no BIOS, no A20 gate, no real mode and
-  no Multiboot. `boot/` and `kernel/arch/x86/boot.asm` have no counterpart -
-  they would be rewritten, not ported.
-- **Paging.** Sv39 is three levels of 512 entries with a different entry
-  format, and the recursive-mapping trick `mm/vmm.c` uses to reach its own
-  page tables is specific to x86's two-level layout. That is a design
-  decision to make again, and the long-mode work (decision 31) already
-  flagged it as not generalising.
-- **Interrupts.** No PIC, no APIC, no IDT: a single trap vector, a cause
-  register, and the PLIC for external sources. `arch/idt.c`, `isr.asm` and
-  `irq.c` are x86 documents.
-- **DMA coherence.** The e1000 driver relies on x86 snooping its caches, and
-  says so in a comment. An architecture without coherent DMA needs explicit
-  cache maintenance in every driver - which is the kind of assumption a port
-  exists to discover, and the kind that is invisible until then.
-- **What probably does port.** The scheduler, the frame allocator, the heap,
-  the ELF loader, FAT16, the network stack above the driver, the formatter
-  and the test harness. That claim is the thing worth testing, and it is
-  untested.
+Two findings made it worth doing:
 
-The value of doing it is exactly that: finding out how much of
-"architecture-independent" is true. The cost is a second toolchain, a second
-emulator target, a second CI matrix, and the discovery that a few dozen
-`u32`s were addresses. It is not a phase.
+- Before any fixing, seven files failed with 88 errors and every single one
+  had the same cause: `paddr_t` and `vaddr_t` were `typedef u32`. Correct on
+  i386, silently truncating on anything wider, invisible to 633 passing
+  assertions, and fixed by one line. A latent correctness bug in shared code
+  that no amount of testing on one architecture could have surfaced.
+- Exactly one failure was structural rather than arithmetic: `mm/heap.c`
+  failed on its include line, because it wanted interrupt masking and was
+  getting it from `<arch/io.h>` - the x86 port I/O header, on an
+  architecture with no port I/O. That is now `<kernel/irqflags.h>`.
+
+What is deliberately not ported, with a reason per file, is in
+[PORTING.md](PORTING.md): the scheduler's mechanism, `mm/vmm.c` (x86's
+recursive page-directory window does not generalise past two levels), ring 3,
+the other harts, and the e1000 - whose reliance on cache-coherent DMA was
+flagged in a comment written before this port existed.
+
+**Follow-up this created**, in order of how much it is worth:
+
+1. Unify the build around an `ARCH` variable. The riscv64 target is a
+   separate tree today, because parameterising the x86 build in the same
+   commit as the first port would have meant changing the thing being
+   measured.
+2. Move the remaining `<arch/io.h>` includes that only want interrupt flags
+   over to `<kernel/irqflags.h>`. Eleven files include it; most legitimately
+   want port I/O, and separating them is mechanical.
+3. Carve `core/ktest.c` into per-subsystem files. It is one translation unit
+   holding every x86 suite, which is why the riscv64 kernel has its own small
+   harness instead of sharing the real one - the single largest piece of
+   shared code that *should* have ported and could not.
+4. A riscv64 frame allocator and VMM, which is what `mm/heap.c` and
+   `mm/pmm.c` need under them before they can be linked rather than merely
+   compiled.
 
 ---
 

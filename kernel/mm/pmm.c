@@ -115,7 +115,7 @@ void pmm_init(const struct boot_params *bp)
      * already on by the time this runs - _start enabled it - so the bitmap is
      * written through the kernel's linear map rather than at its physical
      * address. It must therefore fit inside the window _start mapped. */
-    bitmap_phys = PAGE_ALIGN((u32)__kernel_phys_end);
+    bitmap_phys = PAGE_ALIGN((uptr)__kernel_phys_end);
     bitmap = (u32 *)phys_to_virt(bitmap_phys);
 
     /* The reference counts live immediately after the bitmap, in the same

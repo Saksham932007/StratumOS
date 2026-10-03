@@ -9,6 +9,9 @@
 #   make fuzz         libFuzzer over the real parsers, bounded (needs clang)
 #   make run-x86-64   boot on a CPU that has long mode, for `longmode`
 #   make run-net      boot with an Ethernet card, dumping frames to a pcap
+#   make riscv64      build the second architecture (clang + ld.lld)
+#   make run-riscv64  boot it under qemu-system-riscv64
+#   make portability  measure how much of the kernel builds for riscv64
 #   make debug        start QEMU stopped, waiting for GDB on :1234
 #   make gdb          attach GDB to a waiting QEMU
 #   make clean        remove build output
@@ -116,11 +119,17 @@ ASM_SOURCES := $(sort $(wildcard $(KSRC)/arch/x86/*.asm))
 C_OBJECTS   := $(C_SOURCES:%.c=$(BUILD)/%.o)
 ASM_OBJECTS := $(ASM_SOURCES:%.asm=$(BUILD)/%.o)
 
-# A .c and a .asm with the same base name in the same directory would both
-# compile to the same object path, and whichever rule ran second would
-# silently win - which presents as an undefined reference to a symbol that is
-# plainly there in the source. Caught once, while adding longmode.c beside
-# what is now longmode_tramp.asm; not worth catching twice.
+# A .c and an assembly file with the same base name in the same directory
+# both compile to the same object path. On the x86 side whichever rule ran
+# second silently won, which presents as an undefined reference to a symbol
+# that is plainly there; on the riscv side the same object reaches the linker
+# twice and every symbol in it is a duplicate.
+#
+# Caught twice: once while adding longmode.c beside what is now
+# longmode_tramp.asm, and again immediately afterwards - because that guard
+# only looked at the x86 lists, so the second architecture walked into the
+# same hole with trap.c and trap.S. A check that covers one of two build
+# trees is a check the third will escape, so there is now one per tree.
 OBJECT_COLLISIONS := $(strip $(filter $(ASM_OBJECTS),$(C_OBJECTS)))
 ifneq ($(OBJECT_COLLISIONS),)
 $(error two sources compile to the same object: $(OBJECT_COLLISIONS) - rename one of them, as gdt.c and gdt_flush.asm already do)
@@ -482,6 +491,119 @@ $(BUILD)/test_printf: $(HOST_TEST_SRC)
 	@echo "  CC      $@ (host, 32-bit)"
 	@$(CC) -m32 -std=gnu11 -Wall -Wextra -Werror -g \
 		-I$(INCLUDE) $(HOST_TEST_SRC) -o $@
+
+# ---- riscv64: the second architecture ----------------------------------------
+#
+# A separate target tree rather than a parameterised one. The honest reason is
+# in docs/PORTING.md: unifying the build around an ARCH variable is the right
+# end state and is a refactor of the x86 side, and doing it as part of the
+# first port would have meant changing the thing being measured. These rules
+# build alongside; `make` is untouched.
+#
+# clang rather than gcc, because it is a cross compiler for every target it
+# supports without a separate toolchain per architecture - which is also the
+# reason this port needed no new compiler installed at all. ld.lld links it.
+
+RVCC      ?= clang
+RVLD      ?= ld.lld
+RVOBJCOPY ?= llvm-objcopy
+RVOBJDUMP ?= llvm-objdump
+RVQEMU    ?= qemu-system-riscv64
+
+RVBUILD := $(BUILD)/riscv64
+RVARCH  := $(KSRC)/arch/riscv64
+
+# rv64imac: integer, multiply, atomics, compressed. No floating point, because
+# a kernel that does not use it should not have to save it on a trap - the
+# same reason the x86 build passes -mno-sse.
+#
+# -mcmodel=medany makes every reference PC-relative within +/-2 GiB, which is
+# what lets the kernel be linked at 0x80200000 without relocations. The
+# default (medlow) assumes everything sits in the low 2 GiB and produces
+# relocations the linker cannot resolve for an address this high.
+RVFLAGS := --target=riscv64-unknown-elf \
+           -march=rv64imac -mabi=lp64 -mcmodel=medany \
+           -ffreestanding -fno-builtin -fno-stack-protector -fno-pic \
+           -fno-omit-frame-pointer -O2 -g \
+           -Wall -Wextra -Werror -std=gnu11 \
+           -I$(INCLUDE)
+
+# The point of the exercise: these are the x86 kernel's own source files,
+# compiled unmodified for a different architecture. If this list can grow,
+# the kernel got more portable; if it shrinks, something regressed.
+RV_SHARED := $(KSRC)/core/printf.c \
+             $(KSRC)/core/string.c \
+             $(KSRC)/core/div64.c \
+             $(KSRC)/core/log.c
+
+RV_ARCH_C := $(RVARCH)/main.c \
+             $(RVARCH)/uart.c \
+             $(RVARCH)/trap.c \
+             $(RVARCH)/timer.c \
+             $(RVARCH)/paging.c
+
+# trap_entry.S, not trap.S: it would compile to the same object path as
+# trap.c. See the collision guard near the top of this file.
+RV_ARCH_S := $(RVARCH)/boot.S $(RVARCH)/trap_entry.S
+
+RV_OBJS := $(RV_SHARED:%.c=$(RVBUILD)/%.o) \
+           $(RV_ARCH_C:%.c=$(RVBUILD)/%.o) \
+           $(RV_ARCH_S:%.S=$(RVBUILD)/%.o)
+
+RV_OBJ_COLLISIONS := $(strip $(filter $(RV_ARCH_S:%.S=$(RVBUILD)/%.o), \
+                             $(RV_ARCH_C:%.c=$(RVBUILD)/%.o)))
+ifneq ($(RV_OBJ_COLLISIONS),)
+$(error two riscv64 sources compile to the same object: \
+$(RV_OBJ_COLLISIONS) - rename one of them)
+endif
+
+RV_ELF := $(RVBUILD)/stratum-riscv64.elf
+
+$(RVBUILD)/%.o: %.c
+	@mkdir -p $(dir $@)
+	@echo "  RVCC    $<"
+	@$(RVCC) $(RVFLAGS) -c $< -o $@
+
+$(RVBUILD)/%.o: %.S
+	@mkdir -p $(dir $@)
+	@echo "  RVAS    $<"
+	@$(RVCC) $(RVFLAGS) -c $< -o $@
+
+$(RV_ELF): $(RV_OBJS) $(TOOLS)/link-riscv64.ld
+	@mkdir -p $(dir $@)
+	@echo "  RVLD    $@"
+	@$(RVLD) -T $(TOOLS)/link-riscv64.ld $(RV_OBJS) -o $@
+	@$(RVOBJCOPY) -O binary $@ $@.bin
+	@echo "  RVSIZE  $$(wc -c < $@.bin) bytes loadable, \
+$$(wc -c < $@) bytes with symbols"
+
+.PHONY: riscv64
+riscv64:
+	@command -v $(RVCC) >/dev/null 2>&1 || \
+		{ echo "  SKIP    riscv64 ($(RVCC) is not installed)"; exit 0; }
+	@command -v $(RVLD) >/dev/null 2>&1 || \
+		{ echo "  SKIP    riscv64 ($(RVLD) is not installed)"; exit 0; }
+	@$(MAKE) --no-print-directory $(RV_ELF)
+
+# -bios none: no OpenSBI underneath, so the kernel is started directly in
+# machine mode and owns the whole machine. -machine virt is QEMU's generic
+# RISC-V board: a 16550 UART, a CLINT, a PLIC and virtio devices.
+RVQEMU_ARGS := -machine virt -bios none -nographic -smp 1 -m 128M
+
+.PHONY: run-riscv64
+run-riscv64: riscv64
+	$(RVQEMU) $(RVQEMU_ARGS) -kernel $(RV_ELF)
+
+.PHONY: test-riscv64
+test-riscv64: riscv64
+	@echo "  RUN     riscv64 under $(RVQEMU)"
+	@$(PYTHON) $(TOOLS)/run-riscv64.py --elf $(RV_ELF)
+
+# How much of the kernel compiles for riscv64 as it stands. The number is the
+# measurement docs/PORTING.md reports, so it is generated rather than quoted.
+.PHONY: portability
+portability:
+	@$(PYTHON) $(TOOLS)/portability.py
 
 # ---- fuzzing -----------------------------------------------------------------
 #
