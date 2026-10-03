@@ -106,7 +106,7 @@ def main() -> int:
 
     if not args.elf.is_file():
         print(f"run-riscv64: {args.elf} does not exist - run "
-              f"'make riscv64' first", file=sys.stderr)
+              f"'make ARCH=riscv64' first", file=sys.stderr)
         return 2
 
     cmd = [

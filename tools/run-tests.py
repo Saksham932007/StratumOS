@@ -1280,7 +1280,12 @@ def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--build-dir", type=Path, default=Path("build"))
+    # build/x86, not build: the build is parameterised by ARCH and each
+    # architecture owns a subtree, so that two can be built side by side and
+    # neither can pick up the other's stale objects. This harness is the x86
+    # one - riscv64 has tools/run-riscv64.py, for the reasons in
+    # docs/PORTING.md.
+    ap.add_argument("--build-dir", type=Path, default=Path("build/x86"))
     ap.add_argument("--only", help="run a single scenario by name")
     ap.add_argument("--keep-logs", type=Path,
                     help="write each scenario's serial log to this directory")

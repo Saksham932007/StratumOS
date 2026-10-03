@@ -1222,3 +1222,55 @@ structural: portable code was reaching into the architecture layer through a
 door labelled with one architecture's name. The cast failures were a typo
 repeated 88 times; this one was a design error, and it is the kind a second
 architecture exists to expose.
+
+---
+
+## 38. Each architecture's build lives beside its code, in two phases
+
+**Decision.** `ARCH` selects everything, and the per-architecture build is
+`kernel/arch/<arch>/sources.mk` plus `kernel/arch/<arch>/arch.mk`. Objects and
+artefacts go to `build/$(ARCH)`.
+
+**Rejected: `ifeq ($(ARCH),x86)` blocks in one Makefile.** The obvious
+approach, and it would have worked for two architectures. It also puts every
+architecture's knowledge in a file that belongs to none of them, so adding a
+third means editing a switch statement in the middle of the build system
+rather than adding a directory - which is the same argument that put the
+sources in `kernel/arch/<arch>/` in the first place.
+
+**Rejected: keeping the riscv64 target tree separate.** That was the state
+after the port, and the honest reason it stayed that way was that
+parameterising the x86 build in the same commit would have meant changing the
+thing being measured. It left two build systems, two sets of verbs
+(`make test` versus `make test-riscv64`), and a shared source list defined
+twice - which is how a measurement of "which shared sources does each
+architecture link" quietly becomes two answers.
+
+**Why two files per architecture.** A rule's prerequisites are expanded when
+the rule is *read*, so the shared object list has to exist before `arch.mk`'s
+link rule is seen - and the shared object list depends on which shared
+sources that architecture selected. The first attempt broke the circle by
+including one file twice. It worked, and warned about an overriding recipe
+for every rule in it. `sources.mk` declares what, `arch.mk` defines how, and
+that split is what the dependency actually is rather than a way around it.
+
+**Cost.** Four files instead of one, and `build/stratum.img` became
+`build/x86/stratum.img` - which touched the test harness's default, four CI
+paths and five documents. That churn is the price of the convention being
+uniform rather than the default architecture being special, and a `build/`
+layout where one architecture is at the root and the other in a subdirectory
+is a layout that invites exactly one bug.
+
+**What it fixed on the way.** The object-collision guard had been duplicated
+per build tree, which is how the riscv64 port walked into the very collision
+the x86 guard existed to catch. With one object tree per architecture there
+is one guard, run for whichever architecture is being built - which is what
+the first version should have been, and the second version of a check that
+only covered one of two trees.
+
+**Why.** The shared source list is now defined once, and each architecture
+selects from it by directory or by named file. x86 takes all six directories;
+riscv64 names four files, because `kernel/core` also holds the scheduler and
+the x86 test suite and claiming the directory would overstate the result.
+That asymmetry *is* the portability measurement, and it is now a build
+dependency rather than a number in a document.

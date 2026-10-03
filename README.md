@@ -57,7 +57,7 @@ BIOS ─► stage 1 ─────► stage 2 ─────► protected mode
 Nine things in here were harder than they look, and each has a document that
 explains the reasoning rather than the code.
 
-**One binary, two boot protocols.** `build/stratum.elf` is a single file.
+**One binary, two boot protocols.** `build/x86/stratum.elf` is a single file.
 GRUB finds a Multiboot2 header in it; the bootloader in `boot/` parses its ELF
 program headers and copies the segments itself. The kernel works out which one
 loaded it from the magic in `EAX`, and CI boots both paths on every push — so
@@ -245,7 +245,7 @@ StratumOS stage2
   [->] entering protected mode
 
   .-----------------------------------------------------.
-  | StratumOS 0.12.0  -  x86 kernel: real mode to ring 3 |
+  | StratumOS 0.13.0  -  x86 kernel: real mode to ring 3 |
   '-----------------------------------------------------'
 [    0.000] INFO  boot: serial COM1        [ok] 115200 8N1
 [    0.000] INFO  boot: CPU detect         [ok] GenuineIntel
@@ -272,7 +272,7 @@ StratumOS stage2
 [    0.070] INFO  boot: filesystem         [ok] FAT16 "STRATUM" on hd0p1
 [    0.070] INFO  sched: scheduler ready; boot context adopted as pid 0 (idle)
 [    0.070] INFO  syscall: syscall gate installed at int 0x80 (11 calls available)
-[    0.080] INFO  boot: StratumOS 0.12.0 is up: 127 MiB RAM, 6 PCI devices, 19 test suites
+[    0.080] INFO  boot: StratumOS 0.13.0 is up: 127 MiB RAM, 6 PCI devices, 19 test suites
 ```
 
 Ring 3, exercising the syscall boundary from the untrusted side, then
@@ -522,7 +522,7 @@ Everything marked ✅ is implemented and covered by a test.
 This is the part of the project worth the most scrutiny, because it is where
 the two source projects genuinely merge rather than merely sit side by side.
 
-`build/stratum.elf` is one file. GRUB finds a Multiboot2 header in it and loads
+`build/x86/stratum.elf` is one file. GRUB finds a Multiboot2 header in it and loads
 it. Stage 2, which has never heard of Multiboot, reads the same file off a raw
 disk, walks its ELF program headers, and copies the same segments to the same
 addresses. Both then jump to `_start` with a protocol magic in `EAX` and an
@@ -629,13 +629,13 @@ the profiler's limits are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 ## Two architectures
 
 ```bash
-make riscv64 && make run-riscv64     # clang + ld.lld, no new toolchain
+make ARCH=riscv64 && make ARCH=riscv64 run     # clang + ld.lld, no new toolchain
 make portability                     # measure how portable the kernel is
 ```
 
 ```
   .-----------------------------------------------------.
-  | StratumOS 0.12.0  -  riscv64 (rv64imac) on QEMU virt |
+  | StratumOS 0.13.0  -  riscv64 (rv64imac) on QEMU virt |
   '-----------------------------------------------------'
 [    0.004] INFO  boot: machine mode: mtvec installed, CLINT timer at 100 Hz, 10 exception(s) delegated to supervisor mode
 [    0.006] INFO  boot: supervisor mode reached by mret; sstatus 0x00000000
@@ -710,6 +710,23 @@ The whole shared set needs **two** symbols from the architecture:
 `console_putc` and `timer_ms`. Everything else — every `%` conversion, the
 levelled logger, its rate limiter, its expected-error windows — came across
 for free.
+
+**One variable drives the whole build.** `ARCH` selects the toolchain, the
+flags, the source set, the linker script, the object tree and what `run` and
+`test` mean, and each architecture's build lives beside the code it builds —
+`kernel/arch/<arch>/sources.mk` for *what*, `arch.mk` for *how*. Adding a
+third means adding a directory, not editing a switch statement, and the list
+of available architectures is discovered rather than written down:
+
+```
+$ make ARCH=sparc
+Makefile:47: *** unknown ARCH 'sparc' - available: riscv64 x86.  Stop.
+```
+
+Unifying it also fixed something: the object-collision guard had been
+duplicated per build tree, which is how the RISC-V port walked into the exact
+collision the x86 guard existed to catch. One object tree per architecture
+means one guard.
 
 What is *not* ported, file by file with reasons, is in
 [docs/PORTING.md](docs/PORTING.md): the scheduler's mechanism, `vmm.c` (x86's

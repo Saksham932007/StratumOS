@@ -7,8 +7,8 @@ make debug      # terminal 1: QEMU starts stopped, listening on :1234
 make gdb        # terminal 2: attaches with symbols, breaks at kmain
 ```
 
-`make gdb` loads `build/stratum.debug.elf`, which keeps full DWARF. The
-bootable `build/stratum.elf` is stripped so stage 2 has room to stage it below
+`make gdb` loads `build/x86/stratum.debug.elf`, which keeps full DWARF. The
+bootable `build/x86/stratum.elf` is stripped so stage 2 has room to stage it below
 the EBDA — same link, two outputs.
 
 Useful once attached:
@@ -87,7 +87,7 @@ Read it in this order:
 ### Resolving addresses
 
 ```bash
-addr2line -f -e build/stratum.debug.elf 0x0010c760 0x0010dbb6 0x0010e157
+addr2line -f -e build/x86/stratum.debug.elf 0x0010c760 0x0010dbb6 0x0010e157
 ```
 
 ```
@@ -99,7 +99,7 @@ shell_task       kernel/shell/shell.c:752
 All at once:
 
 ```bash
-grep -oE '0x[0-9a-f]{8}' panic.txt | xargs addr2line -f -e build/stratum.debug.elf | paste - -
+grep -oE '0x[0-9a-f]{8}' panic.txt | xargs addr2line -f -e build/x86/stratum.debug.elf | paste - -
 ```
 
 ### Decoding a page-fault error code
@@ -159,7 +159,7 @@ bootloader stages print. The shell reads from it too.
 ```bash
 make run-serial                                    # interactive, no window
 qemu-system-i386 -display none -serial file:/tmp/boot.log \
-    -drive format=raw,file=build/stratum.img,index=0,media=disk
+    -drive format=raw,file=build/x86/stratum.img,index=0,media=disk
 ```
 
 To script input, wait for the prompt rather than piping — the UART's 16-byte
@@ -207,7 +207,7 @@ volatile u32 *p = (volatile u32 *)0;
 Disassembling settled it:
 
 ```bash
-objdump -d --no-show-raw-insn build/stratum.debug.elf | awk '/<cmd_fault>:/{f=1} f&&/ud2/{print}'
+objdump -d --no-show-raw-insn build/x86/stratum.debug.elf | awk '/<cmd_fault>:/{f=1} f&&/ud2/{print}'
   10c7ec:	ud2
 ```
 

@@ -6,15 +6,15 @@ existing kernel that turned out to be genuinely architecture-independent,
 which is the number this document exists to report.
 
 ```bash
-make riscv64                   # clang + ld.lld, no new toolchain needed
-make run-riscv64               # qemu-system-riscv64, no firmware
-make test-riscv64              # 58 checks, unattended, with an exit code
+make ARCH=riscv64                   # clang + ld.lld, no new toolchain needed
+make ARCH=riscv64 run               # qemu-system-riscv64, no firmware
+make ARCH=riscv64 test-boot              # 58 checks, unattended, with an exit code
 make portability               # measure how much of the kernel builds for it
 ```
 
 ```
   .-----------------------------------------------------.
-  | StratumOS 0.12.0  -  riscv64 (rv64imac) on QEMU virt |
+  | StratumOS 0.13.0  -  riscv64 (rv64imac) on QEMU virt |
   '-----------------------------------------------------'
 [    0.002] INFO  boot: hart 0, device tree at 0x87e00000
 [    0.004] INFO  boot: machine mode: mtvec installed, CLINT timer at 100 Hz, 10 exception(s) delegated to supervisor mode
@@ -320,10 +320,81 @@ result:
 | `shell/shell.c`, `core/kmain.c` | every command reaches into an x86 subsystem. |
 | Userspace, SMP, the e1000 | no ring-3 equivalent set up, the other harts are parked, and the driver assumes cache-coherent DMA — which x86 guarantees and RISC-V does not, so a port needs explicit cache maintenance that this driver does not have. The driver says so in a comment, and that comment was written before this port existed, which is the one prediction that held. |
 
-The build is also a **separate target tree** rather than a parameterised one.
-Unifying it around an `ARCH` variable is the right end state; doing it as part
-of the first port would have meant changing the thing being measured. `make`
-is untouched and all 12 x86 scenarios still pass.
+## The build
+
+One variable selects the toolchain, the flags, the source set, the linker
+script, the object tree, and what `run` and `test` mean:
+
+```bash
+make                     # ARCH=x86, the kernel's home architecture
+make ARCH=riscv64        # rv64imac on QEMU's virt board
+make ARCH=riscv64 test
+make toolchain           # which architecture, and which tools
+```
+
+Each architecture's build lives **beside the code it builds**, for the same
+reason the sources do:
+
+```
+kernel/arch/x86/sources.mk      what it compiles       (30 lines)
+kernel/arch/x86/arch.mk         how                   (489 lines)
+kernel/arch/riscv64/sources.mk                         (39 lines)
+kernel/arch/riscv64/arch.mk                           (123 lines)
+Makefile                        everything shared     (318 lines)
+```
+
+Adding a third architecture means adding a directory, not editing a switch
+statement in the middle of the build system. The list of available
+architectures is **discovered** from `kernel/arch/*/arch.mk` rather than
+written down, so the error message stays true:
+
+```
+$ make ARCH=sparc
+Makefile:47: *** unknown ARCH 'sparc' - available: riscv64 x86.  Stop.
+```
+
+Objects and artefacts go to `build/$(ARCH)`, so both architectures can be
+built side by side and neither can pick up the other's stale objects.
+
+### Two phases, because that is what the dependency is
+
+`sources.mk` declares *what* an architecture compiles; `arch.mk` defines
+*how*. They are separate files for a specific reason: a rule's prerequisites
+are expanded when the rule is **read**, so the shared object list has to
+exist before `arch.mk`'s link rule is seen — and the shared object list
+depends on which shared sources `sources.mk` selected.
+
+The first attempt included one file twice to break that circle. It worked,
+and warned about an overriding recipe for every rule in it. Two phases is
+what the dependency actually is, so saying so is cheaper than working around
+it.
+
+### The asymmetry is the platform, not the effort
+
+`kernel/arch/x86/arch.mk` is 489 lines; the riscv64 one is 123. That is
+worth noticing rather than apologising for: i386 needs a two-stage
+bootloader, a FAT16 image, a GRUB ISO, embedded ring-3 programs and a
+three-pass link to embed a symbol table. A riscv64 kernel is an ELF the
+loader places in RAM.
+
+### What the unification changed, and what it did not
+
+The shared source list is now defined **once**, and an architecture selects
+from it either by directory (`ARCH_SHARED_DIRS`, which x86 uses for all six)
+or by named file (`ARCH_SHARED_FILES`, which riscv64 uses for four). That
+asymmetry is the measurement, expressed as a build dependency: riscv64 names
+files rather than taking `core` because `kernel/core` also holds the
+scheduler and the x86 test suite, and claiming the directory would overstate
+the result.
+
+The object-collision guard also became *one* guard instead of two. It had
+been duplicated per build tree - which is how the riscv64 port walked into
+the same collision the x86 guard existed to catch - and with one object tree
+per architecture there is one check, run for whichever architecture is being
+built. That is what the earlier version should have been.
+
+`make` with no arguments does what it always did, and all 12 x86 scenarios
+still pass.
 
 ---
 
@@ -348,7 +419,7 @@ address in its header, and no output whatsoever.
 
 ## Testing
 
-`make test-riscv64` boots the kernel with no firmware and asserts 17
+`make ARCH=riscv64 test-boot` boots the kernel with no firmware and asserts 17
 expectations against its output, then checks the exit status. Unattended the
 same way the x86 side is: the SiFive test device at `0x100000` terminates the
 machine when written to, which is the role `-device isa-debug-exit` plays on

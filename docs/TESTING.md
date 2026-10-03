@@ -16,7 +16,7 @@ make test          # layers 1 to 4
 make test-host     # layer 1 only, no emulator
 make test-boot     # layers 3 and 4
 make fuzz          # layer 5, bounded
-make test-riscv64  # the second architecture, 58 checks
+make ARCH=riscv64 test-boot  # the second architecture, 58 checks
 make portability   # how much of the kernel builds for riscv64
 ```
 
@@ -255,8 +255,8 @@ build — the same binary is both interactive and CI-testable.
 Two separate images carry the command line, one per boot path:
 
 ```bash
-build/stratum-test.img    # cmdline "autotest", via stage 2's patchable header
-build/stratum-test.iso    # cmdline "autotest", via grub-test.cfg
+build/x86/stratum-test.img    # cmdline "autotest", via stage 2's patchable header
+build/x86/stratum-test.iso    # cmdline "autotest", via grub-test.cfg
 ```
 
 Each scenario then checks 47 expected lines, 9 forbidden patterns, the

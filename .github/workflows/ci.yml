@@ -78,10 +78,10 @@ jobs:
         with:
           name: stratumos-images
           path: |
-            build/stratum.elf
-            build/stratum.debug.elf
-            build/stratum.img
-            build/stratum.iso
+            build/x86/stratum.elf
+            build/x86/stratum.debug.elf
+            build/x86/stratum.img
+            build/x86/stratum.iso
           retention-days: 14
           if-no-files-found: error
 
@@ -106,11 +106,13 @@ jobs:
           sudo apt-get install -y -qq \
             clang lld llvm python3 qemu-system-misc
 
+      # One variable selects the architecture; the verbs are the same ones
+      # the x86 job uses. See kernel/arch/<arch>/arch.mk.
       - name: Build for riscv64
-        run: make riscv64
+        run: make ARCH=riscv64
 
       - name: Boot it and assert
-        run: make test-riscv64
+        run: make ARCH=riscv64 test-boot
 
       # Informational, not a gate: a file that does not compile for a second
       # architecture is a finding to act on, not a build break. See
@@ -215,7 +217,7 @@ jobs:
       # with -cpu max, so long mode is undetectable there. The qemu-system-x86
       # package installed above provides both binaries.
       - name: Boot and assert
-        run: python3 tools/run-tests.py --build-dir build --keep-logs logs
+        run: python3 tools/run-tests.py --build-dir build/x86 --keep-logs logs
 
       - name: Upload the serial transcripts
         if: always()

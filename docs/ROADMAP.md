@@ -391,12 +391,16 @@ recursive page-directory window does not generalise past two levels), ring 3,
 the other harts, and the e1000 - whose reliance on cache-coherent DMA was
 flagged in a comment written before this port existed.
 
-**Follow-up this created**, in order of how much it is worth:
+**Follow-up this created.** The first item is done; the rest are open, in
+order of how much they are worth:
 
-1. Unify the build around an `ARCH` variable. The riscv64 target is a
-   separate tree today, because parameterising the x86 build in the same
-   commit as the first port would have meant changing the thing being
-   measured.
+1. ~~Unify the build around an `ARCH` variable.~~ Done in v0.13.0. One
+   variable selects the toolchain, the flags, the source set, the linker
+   script, the object tree and what `run` and `test` mean, and each
+   architecture's build lives beside its code - `sources.mk` for what,
+   `arch.mk` for how. It also collapsed the object-collision guard from two
+   copies to one, which is what let the riscv64 port walk into the very
+   collision the x86 copy existed to catch.
 2. Move the remaining `<arch/io.h>` includes that only want interrupt flags
    over to `<kernel/irqflags.h>`. Eleven files include it; most legitimately
    want port I/O, and separating them is mechanical.

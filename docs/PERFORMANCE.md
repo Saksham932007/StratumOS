@@ -208,7 +208,7 @@ is embedded in, rather than trusting that argument:
   KSYMS   672 symbols -> build/ksyms_a.c
   LD      pass B (addresses settle)
   KSYMS   672 symbols -> build/ksyms_b.c
-  LD      build/stratum.debug.elf (pass C, final)
+  LD      build/x86/stratum.debug.elf (pass C, final)
   VERIFY  embedded symbol table describes this kernel
 ```
 
@@ -289,7 +289,7 @@ shootdown is expensive, which is why real kernels batch them.
 make bench                                  # under TCG, as above
 qemu-system-i386 -enable-kvm -m 128M \
     -display none -serial stdio \
-    -drive format=raw,file=build/stratum-bench.img,index=0,media=disk
+    -drive format=raw,file=build/x86/stratum-bench.img,index=0,media=disk
 ```
 
 With KVM the figures become real, and the harness drops the emulation note and
