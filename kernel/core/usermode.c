@@ -53,6 +53,8 @@ extern const u8 _binary_init_elf_start[];
 extern const u8 _binary_init_elf_end[];
 extern const u8 _binary_hello_elf_start[];
 extern const u8 _binary_hello_elf_end[];
+extern const u8 _binary_fuzz_elf_start[];
+extern const u8 _binary_fuzz_elf_end[];
 
 /* The programs this kernel can run, by name.
  *
@@ -70,6 +72,7 @@ static const struct {
 } programs[] = {
     {"init", _binary_init_elf_start, _binary_init_elf_end},
     {"hello", _binary_hello_elf_start, _binary_hello_elf_end},
+    {"fuzz", _binary_fuzz_elf_start, _binary_fuzz_elf_end},
 };
 
 static bool ran;
@@ -150,8 +153,11 @@ static bool load_program(const char *name, const u8 **start, size_t *size,
         /* A ring-3 program asking for a program that does not exist is a
          * failed system call, not a kernel error. It gets SYS_ENOENT; the
          * syscall dispatcher logs the attempt. */
-        pr_warn("exec(\"%s\"): %s", name,
-                fat16_mounted() ? "no such file" : "no filesystem is mounted");
+        /* Rate limited: a ring-3 loop calling exec() on absolute paths that
+         * do not exist reaches this line as fast as the disk can answer. */
+        pr_warn_ratelimited("exec(\"%s\"): %s", name,
+                            fat16_mounted() ? "no such file"
+                                            : "no filesystem is mounted");
         return false;
     }
 
@@ -185,12 +191,16 @@ bool usermode_map_stack(void)
     return true;
 }
 
-/* Build this task's address space, load the embedded image into it and leave
- * for ring 3. Runs on the task's own kernel stack, with the task already
- * scheduled, so a failure here is a failed process and not a failed boot. */
+/* Build this task's address space, load its image into it and leave for ring
+ * 3. Runs on the task's own kernel stack, with the task already scheduled, so
+ * a failure here is a failed process and not a failed boot.
+ *
+ * `arg` names the program to load. It arrives through task_create()'s `void *`
+ * and is always a pointer to a string literal - never to anything the task
+ * could outlive. NULL means "init", so the boot path reads unchanged. */
 static void usermode_task(void *arg)
 {
-    UNUSED(arg);
+    const char *program = arg ? (const char *)arg : "init";
 
     struct task *self = task_current();
     const u8 *image;
@@ -198,8 +208,8 @@ static void usermode_task(void *arg)
     void *owned;
     const char *source;
 
-    if (!load_program("init", &image, &size, &owned, &source)) {
-        pr_err("there is no init program to run");
+    if (!load_program(program, &image, &size, &owned, &source)) {
+        pr_err("there is no program called \"%s\" to run", program);
         task_exit(1);
     }
 
@@ -245,8 +255,9 @@ static void usermode_task(void *arg)
     self->user = true;
 
     pr_info("pid %u entering ring 3 at %p in its own address space (%u user "
-            "pages mapped, image from %s)",
-            self->pid, (void *)loaded.entry, vmm_count_user_pages(), source);
+            "pages mapped, \"%s\" from %s)",
+            self->pid, (void *)loaded.entry, vmm_count_user_pages(), program,
+            source);
     ran = true;
 
     /* Does not return: the task spends the rest of its life in ring 3 and
@@ -254,12 +265,19 @@ static void usermode_task(void *arg)
     usermode_enter(loaded.entry, USER_STACK_TOP);
 }
 
-bool usermode_spawn_demo(void)
+u32 usermode_spawn_named(const char *name)
 {
     /* Nothing is loaded here. The task builds its own address space and
      * reads its own image, because both of those can fail and a failure
      * should kill one process rather than the boot. */
-    return task_create("init", usermode_task, NULL) != NULL;
+    struct task *t = task_create(name, usermode_task, (void *)name);
+
+    return t ? t->pid : 0;
+}
+
+bool usermode_spawn_demo(void)
+{
+    return usermode_spawn_named("init") != 0;
 }
 
 /* ---- exec ---------------------------------------------------------------

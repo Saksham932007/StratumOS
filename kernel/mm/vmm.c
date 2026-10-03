@@ -35,6 +35,7 @@
 #include <kernel/kernel.h>
 #include <kernel/log.h>
 #include <kernel/panic.h>
+#include <kernel/sched.h>
 #include <kernel/string.h>
 
 #include <mm/pmm.h>
@@ -879,11 +880,49 @@ static void page_fault_handler(struct regs *r)
     if (cow_fault(r, addr))
         return;
 
-    /* Everything else is a real bug, so the job is to report it as precisely
-     * as possible. Demand paging is the other natural resolvable case - see
-     * docs/ROADMAP.md. */
     const char *where = fault_region(addr);
 
+    /* A fault taken in ring 3 kills the *process*, not the kernel.
+     *
+     * This is the difference between a kernel bug and a program bug, and
+     * until a fuzz target pointed it out this code did not make it: every
+     * unresolved fault panicked, so a user program dereferencing a null
+     * pointer took the machine down with it. The route the fuzzer found was
+     * an ELF whose entry point lay outside any segment it mapped - the loader
+     * accepted it, usermode_enter() IRETed to an unmapped address, and the
+     * kernel panicked on behalf of a program that had done nothing but be
+     * malformed.
+     *
+     * The low two bits of the saved CS are the privilege level the fault was
+     * taken at, and they are the whole test. There is no ambiguity here and
+     * no judgement call: ring 3 cannot have corrupted kernel state, because
+     * every way it could have was already checked at the syscall boundary. */
+    if ((r->cs & 3) != 0) {
+        struct task *t = task_current();
+
+        /* Rate limited, and for the same reason the syscall warnings are: a
+         * program that forks children which fault on purpose would otherwise
+         * print a full register dump per child, as fast as it can fork. */
+        static struct log_ratelimit rl = {
+            .window_ms = LOG_RATELIMIT_WINDOW_MS,
+            .burst = LOG_RATELIMIT_BURST,
+        };
+
+        if (log_ratelimit_allow(&rl, LOG_ERROR, LOG_TAG)) {
+            log_emit(LOG_ERROR, LOG_TAG,
+                     "pid %u \"%s\" faulted at %p (%s); killing it",
+                     t ? t->pid : 0, t ? t->name : "?", (void *)addr, where);
+            page_fault_describe(r);
+        }
+
+        /* A non-zero exit code, so a parent waiting on it can tell a fault
+         * from a clean exit. */
+        task_exit(-11);
+    }
+
+    /* A fault in ring 0 is a kernel bug, so the job is to report it as
+     * precisely as possible. Demand paging is the other natural resolvable
+     * case - see docs/ROADMAP.md. */
     kprintf("\n");
     page_fault_describe(r);
     kprintf("  region          : %s\n", where);

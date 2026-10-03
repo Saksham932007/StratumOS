@@ -829,6 +829,52 @@ static int cmd_programs(int argc, char **argv)
     return 0;
 }
 
+/* Run the ring-3 syscall fuzzer. It is a program like any other, so this
+ * just execs it into a child - which is also a demonstration that the fuzzer
+ * needs no privilege the shell does not already have. */
+static int cmd_fuzz(int argc, char **argv)
+{
+    UNUSED(argc);
+    UNUSED(argv);
+
+    u32 pid = usermode_spawn_named("fuzz");
+
+    if (!pid) {
+        kprintf("could not start the syscall fuzzer\n");
+        return 1;
+    }
+
+    kprintf("syscall fuzzer started as pid %u; its output follows\n", pid);
+
+    /* Wait for that process specifically. The shell may have other
+     * collectable children - `stress` and `ring3` both leave some - so a bare
+     * wait() could return one of those instead.
+     *
+     * The bound is on how many *other* children get collected first, not on
+     * time: task_wait() blocks, so each iteration makes progress. 64 is more
+     * children than any shell command creates, and reaching it would mean
+     * wait() is returning pids nobody asked for. */
+    for (u32 others = 0; others < 64; others++) {
+        int status = 0;
+        int got = task_wait(&status);
+
+        if (got < 0) {
+            kprintf("the fuzzer vanished without exiting\n");
+            return 1;
+        }
+
+        if ((u32)got != pid)
+            continue; /* someone else's zombie; keep waiting */
+
+        kprintf("pid %u exited with %d\n", pid, status);
+        return status == 0 ? 0 : 1;
+    }
+
+    kprintf("gave up waiting for pid %u after collecting 64 other children\n",
+            pid);
+    return 1;
+}
+
 static int cmd_ring3(int argc, char **argv)
 {
     UNUSED(argc);
@@ -1241,6 +1287,7 @@ static const struct shell_command commands[] = {
      cmd_profile},
     {"syms", "syms <address>", "resolve an address to a symbol", cmd_syms},
     {"ring3", "ring3", "run the user-mode demo", cmd_ring3},
+    {"fuzz", "fuzz", "attack the syscall boundary from ring 3", cmd_fuzz},
     {"programs", "programs", "list the programs exec() can run", cmd_programs},
     {"cpus", "cpus", "processors, ACPI and the local APIC", cmd_cpus},
     {"ipi", "ipi", "ping every other processor and time a TLB shootdown",

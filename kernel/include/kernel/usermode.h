@@ -31,6 +31,12 @@ bool usermode_exec(const char *name, struct regs *r);
 const char *usermode_program_name(u32 index);
 u32 usermode_exec_count(void);
 
+/* Start a named embedded or on-disk program as a new ring-3 process, and
+ * return its pid - or 0 if it could not be started. The boot path uses this
+ * for `init`; the shell uses it for the syscall fuzzer, and needs the pid so
+ * it can wait for that process specifically. */
+u32 usermode_spawn_named(const char *name);
+
 /* How many program images came off the disk, and how many from the copies
  * embedded in the kernel image. The second number being non-zero on a kernel
  * booted from a disk would mean a file is missing from the filesystem. */

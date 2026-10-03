@@ -35,10 +35,27 @@
  * bitmap, the VGA framebuffer and anything a loader left in low memory. A heap
  * pointer, a user pointer or a page-table frame above the window is NOT in the
  * linear map; use vmm_translate() for those. */
+#ifdef STRATUM_FUZZING
+
+/* On a host there is no linear map, and a physical address is an offset into
+ * the buffer the fuzzer supplied. Without this, the ACPI table walk - whose
+ * whole job is following physical pointers - dereferences
+ * `p + 0xC0000000` and segfaults before it reaches a single check. */
+void *phys_to_virt_shim(paddr_t p);
+
+static inline void *phys_to_virt(paddr_t p)
+{
+    return phys_to_virt_shim(p);
+}
+
+#else
+
 static inline void *phys_to_virt(paddr_t p)
 {
     return (void *)(p + KERNEL_VIRT_BASE);
 }
+
+#endif /* STRATUM_FUZZING */
 
 static inline paddr_t virt_to_phys(const void *v)
 {

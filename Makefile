@@ -6,6 +6,7 @@
 #   make run          boot the custom bootloader image in QEMU
 #   make run-iso      boot via GRUB/Multiboot2 in QEMU
 #   make test         host unit tests + both boot paths under QEMU, headless
+#   make fuzz         libFuzzer over the real parsers, bounded (needs clang)
 #   make debug        start QEMU stopped, waiting for GDB on :1234
 #   make gdb          attach GDB to a waiting QEMU
 #   make clean        remove build output
@@ -118,8 +119,10 @@ ASM_OBJECTS := $(ASM_SOURCES:%.asm=$(BUILD)/%.o)
 #
 # `init` is the program the kernel starts; `hello` exists so that exec() has
 # a genuinely different image to replace it with, which is the only way to
-# show that exec replaced an address space rather than reloading one.
-USER_PROGS := init hello
+# show that exec replaced an address space rather than reloading one; `fuzz`
+# attacks the syscall boundary from ring 3, which is the only seat from which
+# the kernel's pointer validation can actually be attacked.
+USER_PROGS := init hello fuzz
 USER_ELFS  := $(USER_PROGS:%=$(BUILD)/user/%.elf)
 USER_BLOBS := $(USER_PROGS:%=$(BUILD)/user/%_blob.o)
 
@@ -148,6 +151,7 @@ all: $(DISK_IMG) $(ISO) $(TEST_IMG) $(TEST_ISO) $(SHELL_IMG) $(BENCH_IMG)
 	@echo "  make run      boot the custom bootloader"
 	@echo "  make run-iso  boot through GRUB"
 	@echo "  make test     run every test, headless"
+	@echo "  make fuzz     fuzz the parsers (see docs/FUZZING.md)"
 	@echo
 
 .PHONY: kernel
@@ -436,6 +440,105 @@ $(BUILD)/test_printf: $(HOST_TEST_SRC)
 	@echo "  CC      $@ (host, 32-bit)"
 	@$(CC) -m32 -std=gnu11 -Wall -Wextra -Werror -g \
 		-I$(INCLUDE) $(HOST_TEST_SRC) -o $@
+
+# ---- fuzzing -----------------------------------------------------------------
+#
+# libFuzzer over the *real* kernel sources, compiled for the host with
+# AddressSanitizer and UndefinedBehaviorSanitizer. See tests/fuzz/shim.h for
+# what the shim supplies and docs/FUZZING.md for the argument.
+#
+# clang rather than gcc, because libFuzzer is a clang runtime. 32-bit, because
+# the kernel's vaddr_t is 32 bits and its pointer arithmetic assumes it - and
+# because the ELF loader's mapped pages have to land at the addresses the
+# kernel asked for, which only works in a 32-bit address space.
+
+FUZZ_CC      ?= clang
+FUZZ_TARGETS := elf fat heap acpi
+FUZZ_BINS    := $(FUZZ_TARGETS:%=$(BUILD)/fuzz/fuzz_%)
+FUZZ_CORPUS  := tests/fuzz/corpus
+
+# -fno-omit-frame-pointer so a report names the right frames; -g for line
+# numbers; -O1 because -O2 inlines away the frames a report needs and -O0
+# makes the fuzzer four times slower for no extra coverage.
+FUZZ_FLAGS := -m32 -std=gnu11 -g -O1 -fno-omit-frame-pointer \
+              -fsanitize=fuzzer,address,undefined \
+              -fno-sanitize-recover=undefined \
+              -DSTRATUM_FUZZING=1 \
+              -I$(INCLUDE) -Itests/fuzz \
+              -Wall -Wextra -Wno-unused-parameter
+
+# Each target pulls in only what it needs. Linking the whole kernel would
+# drag in the arch layer, which does not compile for a hosted target.
+FUZZ_SRC_COMMON := tests/fuzz/shim.c $(KSRC)/core/printf.c \
+                   $(KSRC)/core/string.c $(KSRC)/core/div64.c
+
+$(BUILD)/fuzz/fuzz_elf: tests/fuzz/fuzz_elf.c $(KSRC)/core/elf.c \
+                        $(FUZZ_SRC_COMMON)
+	@mkdir -p $(dir $@) $(FUZZ_CORPUS)/elf
+	@echo "  FUZZCC  $@"
+	@$(FUZZ_CC) $(FUZZ_FLAGS) $^ -o $@
+
+$(BUILD)/fuzz/fuzz_fat: tests/fuzz/fuzz_fat.c $(KSRC)/fs/fat16.c \
+                        $(FUZZ_SRC_COMMON)
+	@mkdir -p $(dir $@) $(FUZZ_CORPUS)/fat
+	@echo "  FUZZCC  $@"
+	@$(FUZZ_CC) $(FUZZ_FLAGS) $^ -o $@
+
+# The one target that uses the kernel's own allocator rather than the shim's,
+# because it is the thing being fuzzed.
+$(BUILD)/fuzz/fuzz_heap: tests/fuzz/fuzz_heap.c $(KSRC)/mm/heap.c \
+                         $(FUZZ_SRC_COMMON)
+	@mkdir -p $(dir $@) $(FUZZ_CORPUS)/heap
+	@echo "  FUZZCC  $@"
+	@$(FUZZ_CC) $(FUZZ_FLAGS) -DSTRATUM_FUZZ_REAL_HEAP=1 $^ -o $@
+
+$(BUILD)/fuzz/fuzz_acpi: tests/fuzz/fuzz_acpi.c $(KSRC)/arch/x86/acpi.c \
+                         $(FUZZ_SRC_COMMON)
+	@mkdir -p $(dir $@) $(FUZZ_CORPUS)/acpi
+	@echo "  FUZZCC  $@"
+	@$(FUZZ_CC) $(FUZZ_FLAGS) $^ -o $@
+
+.PHONY: fuzz-build
+fuzz-build:
+	@command -v $(FUZZ_CC) >/dev/null 2>&1 || \
+		{ echo "  SKIP    fuzzing ($(FUZZ_CC) is not installed)"; exit 0; }
+	@$(MAKE) --no-print-directory $(FUZZ_BINS)
+
+# Seed each corpus from inputs the kernel itself produces, which is what makes
+# the first minute of fuzzing useful rather than spent rediscovering what an
+# ELF header looks like.
+.PHONY: fuzz-seed
+fuzz-seed: $(FS_IMG) $(USER_ELFS)
+	@$(PYTHON) $(TOOLS)/fuzz-seed.py --corpus $(FUZZ_CORPUS) \
+		--user-elf $(BUILD)/user/init.stripped.elf \
+		--fs-image $(FS_IMG)
+
+# A short run, for CI and for a sanity check after a change. Long runs are
+# what a developer does by hand; a bounded one is what belongs in a pipeline.
+FUZZ_RUNS ?= 20000
+
+.PHONY: fuzz
+fuzz: fuzz-build fuzz-seed
+	@for t in $(FUZZ_TARGETS); do \
+		[ -x $(BUILD)/fuzz/fuzz_$$t ] || continue; \
+		printf "  FUZZ    %-6s " $$t; \
+		$(BUILD)/fuzz/fuzz_$$t $(FUZZ_CORPUS)/$$t \
+			-runs=$(FUZZ_RUNS) -max_total_time=60 -timeout=10 \
+			-rss_limit_mb=2048 -print_final_stats=1 \
+			> $(BUILD)/fuzz/$$t.log 2>&1 \
+			&& echo "ok   ($$(grep -oE 'cov: [0-9]+' $(BUILD)/fuzz/$$t.log | tail -1), $$(grep -oE 'exec/s: [0-9]+' $(BUILD)/fuzz/$$t.log | tail -1))" \
+			|| { echo "FAILED - see $(BUILD)/fuzz/$$t.log"; tail -30 $(BUILD)/fuzz/$$t.log; exit 1; }; \
+	done
+	@echo "  all fuzz targets survived $(FUZZ_RUNS) runs each"
+
+# Reproduce one crash file against one target, with the kernel's own log
+# output turned on - which is most of what makes a reproducer readable.
+.PHONY: fuzz-repro
+fuzz-repro:
+	@[ -n "$(TARGET)" ] && [ -n "$(CASE)" ] || \
+		{ echo "usage: make fuzz-repro TARGET=elf CASE=path/to/crash"; exit 1; }
+	@$(MAKE) --no-print-directory $(BUILD)/fuzz/fuzz_$(TARGET)
+	STRATUM_FUZZ_VERBOSE=1 $(BUILD)/fuzz/fuzz_$(TARGET) $(CASE)
 
 .PHONY: test-boot
 test-boot: $(TEST_IMG) $(TEST_ISO) $(SHELL_IMG) $(BENCH_IMG)

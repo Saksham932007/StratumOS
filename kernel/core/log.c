@@ -105,6 +105,49 @@ void log_emit(enum log_level level, const char *tag, const char *fmt, ...)
     kprintf("\n");
 }
 
+/* ---- rate limiting ----------------------------------------------------
+ *
+ * See kernel/include/kernel/log.h for why this exists: without it a ring-3
+ * process that makes bad syscalls in a loop owns the serial console.
+ */
+bool log_ratelimit_allow(struct log_ratelimit *rl, enum log_level level,
+                         const char *tag)
+{
+    u64 now = timer_ms();
+    u32 dropped;
+
+    /* A test that has declared an expected-error window is counting lines,
+     * and a dropped line would make its count wrong - so the limiter stands
+     * aside while one is open. The window is only ever open inside a test
+     * suite, which is not where a flood comes from. */
+    if (expecting_errors)
+        return true;
+
+    /* A window that has closed - or has not opened yet - starts fresh, and
+     * reports what the last one hid. The report goes out before the caller's
+     * own line, so the transcript reads in order: N suppressed, then the
+     * message that was being suppressed. */
+    if (rl->window_start == 0 || now - rl->window_start >= rl->window_ms) {
+        dropped = rl->suppressed;
+        rl->window_start = now;
+        rl->printed = 0;
+        rl->suppressed = 0;
+
+        if (dropped)
+            log_emit(level, tag,
+                     "(%u more like the next line in the last %llu ms)",
+                     dropped, rl->window_ms);
+    }
+
+    if (rl->printed < rl->burst) {
+        rl->printed++;
+        return true;
+    }
+
+    rl->suppressed++;
+    return false;
+}
+
 void log_boot_step(const char *name, bool ok, const char *detail)
 {
     u64 ms = timer_ms();

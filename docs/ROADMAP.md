@@ -101,6 +101,34 @@ which is already per-CPU because each processor needs its own TSS, costs 3.6.
 That is 125x, and it is on the context-switch path. Documented in
 [SMP.md](SMP.md).
 
+### Fuzzing
+
+Landed in v0.9.0, in two halves. Four libFuzzer targets compile the **real**
+kernel sources — `elf.c`, `fat16.c`, `heap.c`, `acpi.c` — for the host under
+AddressSanitizer and UndefinedBehaviorSanitizer, with a shim that `mmap`s
+pages at the addresses the kernel asks for so the ELF loader is fuzzed
+completely unmodified. And `user/fuzz.c` issues 40,000 deterministic malformed
+system calls from ring 3, which is the only seat the pointer validation can be
+attacked from.
+
+Six bugs, all pre-existing, all in code the other four test layers covered and
+passed:
+
+| | Found by |
+| --- | --- |
+| `memmove` called `memcpy` with overlapping ranges (undefined behaviour, latent) | ASan's `memcpy` interceptor |
+| ACPI trusted the RSDP's own `length` field and read past the structure | `fuzz_acpi` |
+| the heap stopped coalescing after a shrinking `krealloc` | `heap_check()` under `fuzz_heap` |
+| **any ring-3 page fault panicked the kernel** | `fuzz_elf`, via an ELF whose entry point lay outside its segments |
+| the ELF loader leaked every mapped page on a mid-segment failure | the "nothing may be left mapped" assertion |
+| a ring-3 process could flood the kernel console with log output | the syscall fuzzer |
+
+Honest about what it is not: the ring-3 fuzzer has no coverage feedback,
+because that needs instrumentation in the kernel and a way to export the
+counters. The drivers are not fuzzed. Nothing fuzzes concurrency. Documented,
+with the reasoning for each accommodation the shim makes, in
+[FUZZING.md](FUZZING.md).
+
 ---
 
 ## Next
@@ -172,6 +200,15 @@ A VFS layer belongs with it rather than before it: one filesystem behind an
 interface is an interface with one implementation, and the second
 implementation is what shows whether the interface was right. Long filenames
 and `argv` for `exec` are the two smaller gaps the current driver leaves.
+
+A negative-lookup cache belongs here too, and it closes a known bug rather
+than adding a feature: `exec()` of a path that does not exist does a disk
+lookup every time, so a ring-3 loop can make the kernel do unbounded
+synchronous polled-PIO I/O. The syscall fuzzer found it — it is most of the
+600 µs average cost of a call during a fuzz run — and it is left open
+deliberately, because caching a name's absence needs the invalidation story
+that arrives with write support. It is resource exhaustion, not a memory
+safety bug; see [FUZZING.md](FUZZING.md).
 
 ### 7. A slab allocator over the heap
 

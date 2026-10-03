@@ -830,3 +830,104 @@ surrounding code. That is the worst kind of luck — the code was wrong for
 three phases and the tests all passed. The `bootpd` suite is now the
 regression test, and it fails immediately and fatally rather than subtly if
 either half of the fix is removed.
+
+---
+
+## 29. The fuzz targets compile the real kernel sources, not a host-testable copy
+
+**Decision.** `build/fuzz/fuzz_elf` links `kernel/core/elf.c` — byte for byte
+the file that boots — against a shim that supplies what a kernel would:
+`kmalloc`, a page table, a console, a block device.
+
+**Rejected: extracting the parsers into host-testable copies.** The common
+shape, and the reason for rejecting it is the whole argument for the harness:
+a fuzzer that finds bugs in a rewritten copy of a parser is finding bugs in
+the rewrite. The copy drifts from the original, the drift is invisible because
+both pass their own tests, and the day it matters is the day the fuzzer reports
+clean on code that no longer resembles what ships.
+
+**Rejected: an in-kernel fuzzer, generating inputs under QEMU.** No
+AddressSanitizer, no coverage feedback, no corpus minimisation, and a
+one-byte heap overrun shows up as a triple fault twenty thousand inputs later
+instead of a backtrace at the instruction that did it. The ring-3 syscall
+fuzzer is in-kernel precisely because its target cannot be reached any other
+way — and it is blind, which is what that costs.
+
+**Cost.** The shim has to be convincing, and that is where the design went.
+Three things in particular:
+
+- `vmm_alloc_at()` has to `mmap(MAP_FIXED_NOREPLACE)` at the address the
+  kernel asked for, because `elf_load_user()` writes through that address as a
+  raw pointer. A stub returning `true` would turn its `memcpy` into a wild
+  write into libFuzzer's own state — a spurious crash at best, a silent
+  corruption at worst. This is also why the targets are `-m32`: a user ELF
+  asking for `0x00400000` can only be honoured in a 32-bit address space.
+- `cli`/`sti`/`hlt`/`invlpg` are stubbed in `arch/io.h` behind a macro the
+  kernel build never defines, because `heap.c` takes interrupt-safe locks and
+  `cli` in a user process is an immediate `SIGSEGV`. The interrupt flag is
+  *modelled* rather than discarded, so `irq_save`/`irq_restore` still nest and
+  a lock that forgets to restore is still findable.
+- `phys_to_virt` is routed through the shim, so a parser following a pointer
+  out of a table reads the fuzzer's bytes rather than the host's memory.
+
+Each of those is a small, auditable accommodation in a header, next to a
+comment explaining it. The alternative was a parallel copy of every file that
+touches them, which is how a test suite stops testing the code that ships.
+
+**Why.** Five bugs, all pre-existing, four of them in code that the in-kernel
+suites covered and passed. The ones worth the trouble are the two that no
+assertion about return values could have found: `memmove` violating `memcpy`'s
+non-overlap contract (reported by ASan's interceptor, which enforces exactly
+that contract) and the ELF loader leaking every mapped page on a mid-segment
+failure (reported by the target's own "nothing may be left mapped" assertion).
+Both were invisible to tests that checked the parsers answered correctly,
+because they did.
+
+See `docs/FUZZING.md`.
+
+---
+
+## 30. Warnings a user program can provoke are rate limited in the logging layer
+
+**Decision.** `pr_warn_ratelimited()` allows five lines per second per call
+site, counts what it drops, and reports the count when the window closes. The
+eight warnings reachable from ring 3 use it.
+
+**Rejected: leaving it alone.** The syscall fuzzer made the case. Every bad
+pointer it passed produced a `WARN` line on a shared, slow, serial device, so
+a program calling `write()` with a bad pointer in a loop makes the kernel print
+on its behalf as fast as the loop goes. Tens of thousands of lines, during
+which nothing else got a word in: a denial of service by an unprivileged
+process against the one channel an operator uses to see what the machine is
+doing. The console was the resource, and nothing was accounting for it.
+
+**Rejected: lowering these messages to DEBUG.** It makes the flood
+conditional on a log level, which is the same bug with an extra step — and it
+removes the diagnostic from the default transcript, where it is genuinely
+useful: `pid 7 passed an unreadable buffer 0xc0100000+16 to write()` is often
+the whole explanation of a user-space bug.
+
+**Rejected: one limiter for the whole kernel.** Then a flood of one warning
+hides every other, which is worse than the flood: an attacker picks the
+message that drowns the one you needed. Each call site gets its own, which is
+what makes the static inside the macro the right shape.
+
+**Cost.** Three things, each stated where it bites:
+
+- The counters are plain words, not atomics. Under SMP two processors can race
+  and allow a line more or fewer than the burst. The cost of being wrong is one
+  line; taking a lock would put the console's lock ordering underneath every
+  warning in the kernel.
+- The limiter has to stand aside while a test's expected-error window is open
+  (decision 25), because a test that counts error lines would otherwise count
+  the wrong number. One `if` at the top of `log_ratelimit_allow()`.
+- A burst of five is a guess. It is enough that the boot transcript and the
+  `run-tests.py` assertions still see what they look for, and few enough that
+  the limiter visibly engages during a fuzz run — which the `syscall-fuzz`
+  scenario now asserts, because a limiter that never fires is a limiter nobody
+  has tested.
+
+**Why.** The alternative is a kernel whose console can be taken by any process
+that can make a system call fail, and the fix belongs in the logging layer: a
+`pr_warn` on a user-reachable path is a resource the kernel hands out, and
+resources the kernel hands out get accounted for.

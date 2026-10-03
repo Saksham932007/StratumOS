@@ -9,8 +9,9 @@
 #
 #   1. host-tests    pure unit tests, no emulator        (~10 s)
 #   2. build         cross-toolchain build + validation  (~1 min)
-#   3. boot-tests    QEMU, three scenarios               (~3 min)
-#   4. analysis      static analysis and style           (~1 min)
+#   3. fuzz          libFuzzer over real kernel sources  (~2 min)
+#   4. boot-tests    QEMU, nine scenarios                (~6 min)
+#   5. analysis      static analysis and style           (~1 min)
 
 name: CI
 
@@ -84,6 +85,57 @@ jobs:
           if-no-files-found: error
 
   # --------------------------------------------------------------------------
+  # The four host fuzz targets compile the kernel's own parsers - ELF, FAT16,
+  # the heap and ACPI - for the host under AddressSanitizer and libFuzzer. This
+  # job is what keeps the five bugs they already found from coming back, and it
+  # runs before the QEMU job because a sanitizer report is a far better
+  # diagnosis than a triple fault.
+  #
+  # Bounded deliberately: 20,000 runs or 60 seconds per target, seeded from
+  # inputs the build itself produces. A long campaign is something a developer
+  # starts by hand; CI's job is to notice a regression, not to discover.
+  fuzz:
+    name: Fuzz the parsers
+    runs-on: ubuntu-latest
+    needs: [host-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang with a 32-bit sanitizer runtime
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            nasm gcc-multilib libc6-dev-i386 mtools python3 \
+            clang llvm
+
+      # libFuzzer and ASan are clang runtime libraries, and the 32-bit copies
+      # live in a separate package whose name carries the version. Resolve it
+      # from the installed clang rather than pinning a number that will rot.
+      - name: Install the 32-bit clang runtime
+        run: |
+          ver=$(clang --version | sed -n '1s/.*version \([0-9]*\).*/\1/p')
+          sudo apt-get install -y -qq \
+            "libclang-rt-$ver-dev" || \
+            sudo apt-get install -y -qq libclang-rt-dev
+          sudo apt-get install -y -qq lib32stdc++-13-dev || true
+
+      - name: Fuzz
+        run: make fuzz
+
+      - name: Upload any crashes and the fuzzer logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-logs
+          path: |
+            build/fuzz/*.log
+            crash-*
+            leak-*
+            timeout-*
+          retention-days: 14
+          if-no-files-found: warn
+
+  # --------------------------------------------------------------------------
   boot-tests:
     name: Boot tests under QEMU
     runs-on: ubuntu-latest
@@ -102,9 +154,12 @@ jobs:
       - name: Build
         run: make all
 
-      # Three scenarios: the custom bootloader from a raw disk, Multiboot2 via
-      # GRUB from an ISO, and 21 shell commands typed over the serial console.
-      # Each asserts on the kernel's own output and on its exit status.
+      # Nine scenarios: the custom bootloader from a raw disk, Multiboot2 via
+      # GRUB from an ISO, the same image on a CPU that has SMEP and SMAP, the
+      # shell driven command by command over the serial console, 40,000
+      # malformed system calls issued from ring 3, the benchmark image, and
+      # three faults that must panic and say why. Each asserts on the kernel's
+      # own output and on its exit status.
       - name: Boot and assert
         run: python3 tools/run-tests.py --build-dir build --keep-logs logs
 

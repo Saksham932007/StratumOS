@@ -61,7 +61,7 @@ void *memmove(void *dst, const void *src, size_t n)
     if (d == s || n == 0)
         return dst;
 
-    /* Overlapping and moving up: copy backwards so we read each byte before
+    /* Overlapping and moving up: copy backwards so each byte is read before
      * the write that would have clobbered it. */
     if (d > s && d < s + n) {
         d += n;
@@ -71,6 +71,29 @@ void *memmove(void *dst, const void *src, size_t n)
         return dst;
     }
 
+    /* Overlapping and moving *down* needs a forward copy, which is what
+     * memcpy does - but it may not be delegated to memcpy, and the reason is
+     * not pedantry.
+     *
+     * memcpy's arguments are specified as non-overlapping, so calling it with
+     * ranges that overlap is undefined behaviour. The call works today only
+     * because this file's memcpy happens to be a forward byte loop; the
+     * compiler is entitled to recognise that loop and replace it with
+     * something that copies in a different order, or in blocks, and either
+     * would corrupt the overlapping tail. The bug would appear as data
+     * corruption after an unrelated change to an optimisation flag.
+     *
+     * A fuzz target found this - AddressSanitizer intercepts memcpy and
+     * refuses overlapping ranges, which is exactly the contract being
+     * violated. The fix is to spell the forward copy out here, so memmove
+     * never hands memcpy a pair of ranges it is not allowed to have. */
+    if (d < s && s < d + n) {
+        while (n--)
+            *d++ = *s++;
+        return dst;
+    }
+
+    /* Genuinely disjoint. */
     return memcpy(dst, src, n);
 }
 

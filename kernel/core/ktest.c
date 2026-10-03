@@ -1135,6 +1135,8 @@ static void test_storage(struct ktest_result *r)
 
     KT_EQ(r, found, ata_drive_count());
     KT_ASSERT(r, d != NULL);
+    if (!d)
+        return; /* KT_ASSERT records and continues, so this has to be real */
     KT_ASSERT(r, d->sectors > 0);
     KT_ASSERT(r, d->model[0] != '\0');
 

@@ -72,8 +72,9 @@ static i32 sys_write(u32 ptr, u32 len)
         len = SYS_WRITE_MAX;
 
     if (!user_range_ok(ptr, len)) {
-        pr_warn("pid %u passed an unreadable buffer %p+%u to write()",
-                task_current() ? task_current()->pid : 0, (void *)ptr, len);
+        pr_warn_ratelimited(
+            "pid %u passed an unreadable buffer %p+%u to write()",
+            task_current() ? task_current()->pid : 0, (void *)ptr, len);
         return SYS_EFAULT;
     }
 
@@ -100,8 +101,9 @@ static bool user_copy_string(u32 ptr, char *dst, size_t max)
 {
     for (size_t i = 0; i < max; i++) {
         if (!user_range_ok(ptr + i, 1)) {
-            pr_warn("pid %u passed an unreadable string pointer %p",
-                    task_current() ? task_current()->pid : 0, (void *)ptr);
+            pr_warn_ratelimited("pid %u passed an unreadable string pointer %p",
+                                task_current() ? task_current()->pid : 0,
+                                (void *)ptr);
             return false;
         }
 
@@ -113,8 +115,9 @@ static bool user_copy_string(u32 ptr, char *dst, size_t max)
             return true;
     }
 
-    pr_warn("pid %u passed a string longer than %u bytes",
-            task_current() ? task_current()->pid : 0, (unsigned)max);
+    pr_warn_ratelimited("pid %u passed a string longer than %u bytes",
+                        task_current() ? task_current()->pid : 0,
+                        (unsigned)max);
     return false;
 }
 
@@ -173,10 +176,10 @@ static void syscall_handler(struct regs *r)
          * it is checked before being written through. */
         if (pid >= 0 && r->ebx) {
             if (!user_range_ok(r->ebx, sizeof(int))) {
-                pr_warn("pid %u passed an unwritable status pointer %p to "
-                        "wait()",
-                        task_current() ? task_current()->pid : 0,
-                        (void *)r->ebx);
+                pr_warn_ratelimited(
+                    "pid %u passed an unwritable status pointer %p to "
+                    "wait()",
+                    task_current() ? task_current()->pid : 0, (void *)r->ebx);
                 ret = SYS_EFAULT;
                 break;
             }
@@ -206,9 +209,10 @@ static void syscall_handler(struct regs *r)
         }
 
         if (!usermode_exec(name, r)) {
-            pr_warn("pid %u asked to exec \"%s\", which is not a program this "
-                    "kernel has",
-                    task_current() ? task_current()->pid : 0, name);
+            pr_warn_ratelimited(
+                "pid %u asked to exec \"%s\", which is not a program this "
+                "kernel has",
+                task_current() ? task_current()->pid : 0, name);
             ret = SYS_ENOENT;
             break;
         }
@@ -221,7 +225,8 @@ static void syscall_handler(struct regs *r)
     }
 
     default:
-        pr_warn("unknown syscall %u from EIP %p", r->eax, (void *)r->eip);
+        pr_warn_ratelimited("unknown syscall %u from EIP %p", r->eax,
+                            (void *)r->eip);
         ret = SYS_EBADCALL;
         break;
     }

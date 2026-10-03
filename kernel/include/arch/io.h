@@ -47,6 +47,37 @@ static inline void io_wait(void)
     outb(0x80, 0);
 }
 
+/* The privileged instructions, and the one accommodation this header makes
+ * for being compiled on a host.
+ *
+ * The fuzz targets in tests/fuzz compile real kernel sources - heap.c takes
+ * interrupt-safe locks, which means `cli`, which in a user process is an
+ * immediate SIGSEGV. The choice is between stubbing them here, behind a macro
+ * the kernel build never defines, and maintaining a parallel copy of every
+ * file that touches them. The second is how a test suite stops testing the
+ * code that ships.
+ *
+ * Interrupt state is modelled rather than ignored, so that irq_save() and
+ * irq_restore() still nest correctly and a lock that forgets to restore is
+ * still a bug the fuzzer can find. */
+#ifdef STRATUM_FUZZING
+
+extern int stratum_fuzz_interrupts_enabled;
+
+static inline void cli(void)
+{
+    stratum_fuzz_interrupts_enabled = 0;
+}
+static inline void sti(void)
+{
+    stratum_fuzz_interrupts_enabled = 1;
+}
+static inline void hlt(void)
+{
+}
+
+#else
+
 static inline void cli(void)
 {
     __asm__ volatile("cli" ::: "memory");
@@ -60,12 +91,25 @@ static inline void hlt(void)
     __asm__ volatile("hlt");
 }
 
+#endif /* STRATUM_FUZZING */
+
+#ifdef STRATUM_FUZZING
+
+static inline u32 read_eflags(void)
+{
+    return stratum_fuzz_interrupts_enabled ? 0x200u : 0u;
+}
+
+#else
+
 static inline u32 read_eflags(void)
 {
     u32 f;
     __asm__ volatile("pushfl; popl %0" : "=r"(f));
     return f;
 }
+
+#endif
 
 #define EFLAGS_IF 0x200u
 
@@ -152,7 +196,12 @@ static inline void write_cr4(u32 v)
 
 static inline void invlpg(vaddr_t va)
 {
+#ifdef STRATUM_FUZZING
+    (void)va;
+    barrier();
+#else
     __asm__ volatile("invlpg (%0)" : : "r"(va) : "memory");
+#endif
 }
 
 #endif /* _ARCH_IO_H */

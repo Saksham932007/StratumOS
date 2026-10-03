@@ -197,6 +197,23 @@ bool elf_load_user(const void *image, size_t size, struct elf_load_info *out)
             user_access_end();
 
             info.pages++;
+
+            /* Widen the recorded range as each page is mapped, not once per
+             * segment.
+             *
+             * The failure path above calls elf_unload_user(), which unmaps
+             * image_low..image_high - and if that range is still its initial
+             * empty value, every page mapped so far leaks. A hostile image
+             * with many segments can provoke that deliberately and leak on
+             * every attempt, which is a denial of service that repeats.
+             *
+             * Found by a fuzz target, which asserts that nothing is left
+             * mapped whether the load succeeded or failed. The accounting had
+             * been one statement too late since the loader was written. */
+            if (page < info.image_low)
+                info.image_low = page;
+            if (page + PAGE_SIZE > info.image_high)
+                info.image_high = page + PAGE_SIZE;
         }
 
         if (ph->filesz) {
@@ -208,6 +225,8 @@ bool elf_load_user(const void *image, size_t size, struct elf_load_info *out)
 
         /* The rest of memsz is the .bss tail; the pages were zeroed above. */
 
+        /* A segment whose pages were all already mapped by an earlier one
+         * still has to be inside the recorded range. */
         if (first < info.image_low)
             info.image_low = first;
         if (last > info.image_high)
@@ -218,6 +237,32 @@ bool elf_load_user(const void *image, size_t size, struct elf_load_info *out)
 
     if (info.segments == 0) {
         pr_err("refusing to load: no loadable segments");
+        return false;
+    }
+
+    /* The entry point has to be inside something that was actually mapped.
+     *
+     * Checking it is below KERNEL_VIRT_BASE - which happens earlier - stops a
+     * crafted image asking the kernel to jump into itself, and that is the
+     * check that matters for security. This one is about not loading a
+     * program that cannot possibly run: an entry point outside every segment
+     * means usermode_enter() IRETs to an unmapped address, and the process
+     * takes a page fault on its first instruction.
+     *
+     * A fuzz target found this, and what made it worth fixing was where it
+     * led: the page-fault handler panicked on *any* unresolved fault,
+     * including one taken in ring 3, so a malformed ELF took the machine
+     * down. That is fixed too, and independently - a program should not be
+     * able to panic a kernel whatever its entry point says. But a loader
+     * that accepts an image it knows cannot start is still a loader doing
+     * the wrong thing. */
+    if (info.entry < info.image_low || info.entry >= info.image_high ||
+        !vmm_translate(info.entry, NULL)) {
+        pr_err("refusing to load: the entry point %p is not inside any "
+               "segment this image maps (%p-%p)",
+               (void *)info.entry, (void *)info.image_low,
+               (void *)info.image_high);
+        elf_unload_user(&info);
         return false;
     }
 

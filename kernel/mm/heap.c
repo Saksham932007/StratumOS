@@ -173,6 +173,21 @@ void heap_init(void)
 
 /* Split `b` so that it serves exactly `size` bytes, returning the remainder
  * to the free list when it is large enough to be useful. */
+static void coalesce_forward(struct block *b);
+
+/* Shrink `b` to `size`, turning the remainder into a free block.
+ *
+ * The remainder is coalesced forward, and that is not an optimisation. When
+ * kmalloc splits a block it marks the front allocated, and the remainder's
+ * successor cannot be free - two adjacent free blocks would already have been
+ * merged. But krealloc shrinking a block leaves the front *allocated* and the
+ * remainder free, and the successor may well be free, so the two sit side by
+ * side unmerged.
+ *
+ * heap_check() calls that out: "adjacent free blocks were not merged". It was
+ * right, and it took a fuzz target three thousand inputs to produce the
+ * sequence - allocate 33 bytes, grow to 1025, shrink back to 33 - because no
+ * hand-written test happened to shrink a block whose neighbour was free. */
 static void split_block(struct block *b, u32 size)
 {
     if (b->size < size + MIN_SPLIT)
@@ -192,6 +207,8 @@ static void split_block(struct block *b, u32 size)
 
     b->size = size;
     write_guards(b);
+
+    coalesce_forward(rest);
 }
 
 static void validate(struct block *b, const char *op, void *ptr)

@@ -414,6 +414,106 @@ SHELL_SCRIPT: list[tuple[str, list[str]]] = [
 ]
 
 
+# The ring-3 syscall fuzzer gets a scenario of its own rather than a line in
+# SHELL_SCRIPT, for two reasons: it runs for ~25 seconds where every other
+# command finishes in under one, and its pass condition is different in kind.
+# Every other scenario asserts that the kernel did something; this one asserts
+# that 40,000 deliberately malformed system calls failed to make it do
+# anything at all.
+#
+# The FORBIDDEN list is what actually tests the kernel here. The patterns
+# below only confirm the run happened and completed.
+SYSCALL_FUZZ_EXPECTED = [
+    ("fuzzer started", r"syscall fuzzer started as pid \d+"),
+    # The fuzzer's own banner is the proof that it reached ring 3: it has no
+    # way to print except through the write() syscall, which is a privilege
+    # transition from user mode. (The shell image boots quietly, so the
+    # kernel's own "entering ring 3" line is not in this transcript.)
+    ("fuzzer reached ring 3 and can only have printed from there",
+     r"\[fuzz\] ring-3 syscall fuzzer"),
+    ("iteration count announced",
+     r"\[fuzz\] ring-3 syscall fuzzer: \d+ calls, deterministic seed"),
+    ("the run advanced", r"\[fuzz\] \d+ calls, uptime \d+ s"),
+    # Both counts must be non-zero: all-refused would mean the generator never
+    # produced a valid call, and all-accepted would mean the kernel never
+    # refused one. Either way the run proved nothing.
+    ("calls were refused", r"\[fuzz\] survived: \d+ accepted, [1-9]\d* refused"),
+    ("calls were accepted", r"\[fuzz\] survived: [1-9]\d* accepted,"),
+    ("no panics", r"refused, 0 panics"),
+    ("the kernel outlived the fuzzer",
+     r"\[fuzz\] the kernel is still running"),
+    ("the fuzzer exited cleanly", r"pid \d+ exited with 0"),
+    # The console rate limiter has to engage, or the fuzzer would not have
+    # found the flood it was built to find.
+    ("the console rate limiter engaged",
+     r"\(\d+ more like the next line in the last \d+ ms\)"),
+    ("the shell survived and took another command",
+     r"heap integrity: consistent"),
+]
+
+
+def run_syscall_fuzz(build_dir: Path, keep_logs: Path | None) -> Outcome:
+    """Run user/fuzz.c from the shell and require the kernel to survive it."""
+    image = build_dir / "stratum-shell.img"
+    sc = Scenario(
+        name="syscall-fuzz",
+        description="40,000 malformed system calls issued from ring 3",
+        image=image,
+        qemu_args=[],
+    )
+
+    failures: list[str] = []
+
+    cmd = [
+        QEMU, "-m", "128M", "-no-reboot", "-display", "none",
+        "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        "-serial", "stdio",
+        "-drive", f"format=raw,file={image},index=0,media=disk",
+    ]
+
+    session = SerialSession(cmd, timeout=240.0)
+
+    if not session.read_until(PROMPT, timeout=60.0):
+        failures.append("the shell prompt never appeared")
+        session.close()
+        return Outcome(sc, False, None, session.transcript, failures, None)
+
+    # 180 s of headroom over the ~25 s the run takes under TCG, because a
+    # machine running this in CI alongside other jobs is a slower machine.
+    session.run_command("fuzz", settle=180.0)
+
+    # Then one more command, which is the real proof: a kernel that survived
+    # the fuzzer but came out of it with a corrupted heap is not a kernel that
+    # survived the fuzzer.
+    session.run_command("stress 2 20", settle=30.0)
+
+    session.send_line("halt")
+    session.read_until("halting", timeout=15.0)
+    exit_code = session.close()
+
+    log = session.transcript
+    if keep_logs:
+        keep_logs.mkdir(parents=True, exist_ok=True)
+        (keep_logs / "syscall-fuzz.log").write_text(
+            log, errors="backslashreplace")
+
+    for label, pattern in SYSCALL_FUZZ_EXPECTED:
+        if not re.search(pattern, log):
+            failures.append(f"missing: {label}  (no match for /{pattern}/)")
+
+    for label, pattern in FORBIDDEN:
+        match = re.search(pattern, log)
+        if match:
+            failures.append(f"forbidden: {label} -> {match.group(0)}")
+
+    if exit_code is None:
+        failures.append("QEMU did not exit after 'halt'")
+    elif exit_code != EXIT_PASS:
+        failures.append(f"unexpected QEMU exit status {exit_code} after halt")
+
+    return Outcome(sc, not failures, exit_code, log, failures, None)
+
+
 def run_interactive(build_dir: Path, keep_logs: Path | None) -> Outcome:
     image = build_dir / "stratum-shell.img"
     sc = Scenario(
@@ -695,7 +795,7 @@ def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
                  r"\d+ clusters"),
                 ("init came off the disk",
                  r"entering ring 3 at 0x[0-9a-f]+ in its own address space "
-                 r"\(\d+ user pages mapped, image from the filesystem\)"),
+                 r"\(\d+ user pages mapped, \"init\" from the filesystem\)"),
                 ("exec read its image from the disk",
                  r"exec\(\"hello\"\) from the filesystem"),
                 ("stage 2 ran", r"StratumOS stage2"),
@@ -783,12 +883,12 @@ def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
                  r"boot: filesystem\s+\[ok\] none present; using the "
                  r"embedded programs"),
                 ("init came from the kernel image",
-                 r"image from the kernel image\)"),
+                 r"\"init\" from the kernel image\)"),
             ],
         ),
     ]
 
-    if only in ("interactive-shell", "benchmarks") or \
+    if only in ("interactive-shell", "benchmarks", "syscall-fuzz") or \
             (only or "").startswith("fault-"):
         return []
 
@@ -853,6 +953,33 @@ def main() -> int:
                     print("    --- end ---\n")
         else:
             print(f"  [interactive-shell] SKIP ({shell_image} not built)\n")
+
+    if args.only in (None, "syscall-fuzz"):
+        shell_image = args.build_dir / "stratum-shell.img"
+        if shell_image.is_file():
+            print("  [syscall-fuzz] 40,000 malformed system calls issued "
+                  "from ring 3")
+            outcome = run_syscall_fuzz(args.build_dir, args.keep_logs)
+            outcomes.append(outcome)
+            print(f"    qemu exit        : {outcome.qemu_exit}")
+            survived = re.search(r"\[fuzz\] survived: (\d+) accepted, "
+                                 r"(\d+) refused", outcome.log)
+            if survived:
+                print(f"    calls accepted   : {survived.group(1)}")
+                print(f"    calls refused    : {survived.group(2)}")
+            if outcome.passed:
+                print("    result           : PASS\n")
+            else:
+                print("    result           : FAIL")
+                for f in outcome.failures:
+                    print(f"      - {f}")
+                print()
+                print("    --- transcript ---")
+                for line in outcome.log.splitlines():
+                    print(f"    | {line}")
+                print("    --- end ---\n")
+        else:
+            print(f"  [syscall-fuzz] SKIP ({shell_image} not built)\n")
 
     if args.only in (None, "benchmarks"):
         bench_image = args.build_dir / "stratum-bench.img"

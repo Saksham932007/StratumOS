@@ -1,6 +1,6 @@
 # Testing
 
-Four layers, ordered cheapest-first so a trivial mistake fails in a second
+Five layers, ordered cheapest-first so a trivial mistake fails in a second
 rather than after an emulator run.
 
 | Layer | Needs | Runtime | Catches |
@@ -8,13 +8,20 @@ rather than after an emulator run.
 | Host unit tests | nothing | ~1 s | formatter, string, 64-bit division bugs |
 | Pre-boot validation | the linker | ~0.1 s | unbootable images (20 failure conditions) |
 | In-kernel suites | QEMU | ~5 s | allocator, paging, heap, scheduler, syscall, symbol and profiler bugs |
-| Boot scenarios | QEMU + GRUB | ~2 min | regressions in either boot path, shell behaviour, measurement |
+| Boot scenarios | QEMU + GRUB | ~6 min | regressions in either boot path, shell behaviour, measurement |
+| Fuzzing | clang | ~2 min | what nobody thought to test: the parsers and the syscall boundary |
 
 ```bash
-make test        # all of it
+make test        # layers 1 to 4
 make test-host   # layer 1 only, no emulator
 make test-boot   # layers 3 and 4
+make fuzz        # layer 5, bounded
 ```
+
+The first four layers test the kernel against inputs someone thought of. The
+fifth tests it against inputs nobody thought of, which is a different claim
+and has its own document: **`docs/FUZZING.md`**. It has found six real bugs so
+far, every one of them in code the other four layers covered and passed.
 
 ---
 
@@ -134,6 +141,11 @@ ktest: profile ... PASS (9 checks)
 ktest: summary 19/19 suites passed
 ```
 
+That transcript is from the four-processor scenario. The `smp` suite scales
+with the number of processors - it checks each one's APIC id, stack, TSS and
+online transition - so on one processor it does 49 checks and the total is
+459. Every other suite's count is fixed.
+
 | Suite | What it establishes |
 | --- | --- |
 | `string` | the formatter and string routines behave on the metal too |
@@ -191,8 +203,8 @@ table.
 
 ## Layer 4: boot scenarios
 
-`tools/run-tests.py` boots the kernel eight ways and asserts on what it says.
-Six of them must come up clean; two of them must *panic*.
+`tools/run-tests.py` boots the kernel nine ways and asserts on what it says.
+Six of them must come up clean; three of them must *panic*.
 
 ### Unattended boots
 
@@ -312,6 +324,34 @@ stratum> pagemap 0x100000      ← the first six commands simply vanished
 So the harness drives the shell the way a person does: wait for the prompt,
 send one command, read until the prompt returns, check, repeat. `SerialSession`
 in `run-tests.py` is about 50 lines of `select()`-based expect.
+
+### The syscall-fuzz scenario
+
+A scenario of its own rather than a line in the shell script, because it runs
+for ~25 seconds where every other command finishes in under one, and because
+its pass condition is different in kind. Every other scenario asserts that the
+kernel *did* something; this one asserts that 40,000 deliberately malformed
+system calls, issued from ring 3, failed to make it do anything at all.
+
+```python
+("calls were refused", r"\[fuzz\] survived: \d+ accepted, [1-9]\d* refused"),
+("calls were accepted", r"\[fuzz\] survived: [1-9]\d* accepted,"),
+("the console rate limiter engaged",
+ r"\(\d+ more like the next line in the last \d+ ms\)"),
+("the shell survived and took another command",
+ r"heap integrity: consistent"),
+```
+
+Four of the eleven expectations are worth pointing at. Both counts must be
+non-zero: all-refused would mean the generator never produced a valid call,
+all-accepted would mean the kernel never refused one, and either way the run
+proved nothing. The rate limiter must visibly engage, because a limiter that
+never fires is a limiter nobody has tested. And the scenario runs `stress 2 20`
+*after* the fuzzer, because a kernel that survived the fuzzer and came out of
+it with a corrupted heap has not survived the fuzzer.
+
+The nine forbidden patterns do the rest of the work. See
+[FUZZING.md](FUZZING.md).
 
 ### The benchmark scenario
 
@@ -449,14 +489,18 @@ arrive after it and those are most of what is being asserted.
 
 ## CI
 
-`.github/workflows/ci.yml` runs four jobs, cheapest first:
+`.github/workflows/ci.yml` runs five jobs, cheapest first:
 
 | Job | Contents |
 | --- | --- |
 | `host-tests` | layer 1, ~10 s |
 | `build` | cross build, pre-boot validation, size report, uploads the images |
+| `fuzz` | layer 5: four libFuzzer targets over the real kernel sources, 20,000 runs each |
 | `boot-tests` | layers 3 and 4; uploads every serial transcript on success or failure |
 | `analysis` | `clang-format --dry-run --Werror` (gating), `cppcheck` and GCC's `-fanalyzer` (advisory) |
+
+`fuzz` runs before `boot-tests` on purpose: when both would fail, a sanitizer
+report naming the instruction is a far better diagnosis than a triple fault.
 
 The static analysers are advisory on purpose: a kernel legitimately does things
 that look alarming out of context — volatile pointers to fixed addresses,

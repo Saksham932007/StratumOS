@@ -40,6 +40,7 @@ BIOS ─► stage 1 ─────► stage 2 ─────► protected mode
 - [Two boot paths, one kernel](#two-boot-paths-one-kernel)
 - [Performance](#performance)
 - [Testing](#testing)
+- [Fuzzing](#fuzzing)
 - [Repository layout](#repository-layout)
 - [Design decisions worth defending](#design-decisions-worth-defending)
 - [Bugs this project found and fixed](#bugs-this-project-found-and-fixed)
@@ -50,7 +51,7 @@ BIOS ─► stage 1 ─────► stage 2 ─────► protected mode
 
 ## The parts worth looking at
 
-Five things in here were harder than they look, and each has a document that
+Six things in here were harder than they look, and each has a document that
 explains the reasoning rather than the code.
 
 **One binary, two boot protocols.** `build/stratum.elf` is a single file.
@@ -90,6 +91,16 @@ touches per sector, so seven of eight should hit — and fewer than half did,
 because FAT sectors and data sectors were evicting each other. Splitting the
 cache by purpose took the hit rate from 47% to 89%.
 → [docs/STORAGE.md](docs/STORAGE.md#the-cache-and-what-measuring-it-changed)
+
+**Fuzzing the real kernel sources, not a copy of them.** `build/fuzz/fuzz_elf`
+links `kernel/core/elf.c` — byte for byte the file that boots — against a shim
+whose `vmm_alloc_at()` is `mmap(MAP_FIXED_NOREPLACE)` *at the address the
+kernel asked for*, because the loader maps a page at an address an untrusted
+header chose and then writes through it as a raw pointer. So the loader is
+fuzzed unmodified, and a write past what it mapped takes `SIGSEGV` exactly as
+it would in the kernel. Six pre-existing bugs, including one that let any
+unprivileged process panic the machine with a malformed program file.
+→ [docs/FUZZING.md](docs/FUZZING.md)
 
 And one piece of test design that the rest depends on: **two CI scenarios
 whose expected result is a panic.** The `harden` suite proves the kernel's
@@ -200,7 +211,7 @@ StratumOS stage2
   [->] entering protected mode
 
   .-----------------------------------------------------.
-  | StratumOS 0.8.0  -  x86 kernel: real mode to ring 3 |
+  | StratumOS 0.9.0  -  x86 kernel: real mode to ring 3 |
   '-----------------------------------------------------'
 [    0.000] INFO  boot: serial COM1        [ok] 115200 8N1
 [    0.000] INFO  boot: CPU detect         [ok] GenuineIntel
@@ -227,7 +238,7 @@ StratumOS stage2
 [    0.070] INFO  boot: filesystem         [ok] FAT16 "STRATUM" on hd0p1
 [    0.070] INFO  sched: scheduler ready; boot context adopted as pid 0 (idle)
 [    0.070] INFO  syscall: syscall gate installed at int 0x80 (11 calls available)
-[    0.080] INFO  boot: StratumOS 0.8.0 is up: 127 MiB RAM, 6 PCI devices, 19 test suites
+[    0.080] INFO  boot: StratumOS 0.9.0 is up: 127 MiB RAM, 6 PCI devices, 19 test suites
 ```
 
 Ring 3, exercising the syscall boundary from the untrusted side, then
@@ -594,7 +605,8 @@ QEMU.
 | **Image validation** | the boot signature, stage 1 not overlapping its own partition table, the stage 2 header pointing at a real ELF, every partition inside the image, the FAT geometry, and every file in `/BIN` being an i386 ELF with `INIT` among them | every image, every build |
 | **In-kernel suites** | allocator, paging, address spaces, copy-on-write, heap coalescing, interrupts, scheduler, processes, hardening, ATA and partitions, FAT16, ACPI/APIC/locks/IPIs, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 484 checks in 19 suites |
 | **Boot scenarios** | custom bootloader unattended, **the same image on four processors**, the same image on a CPU with SMEP and SMAP, GRUB/Multiboot2 unattended, 41 shell commands typed over serial, benchmarks + profile | 6 scenarios |
-| **Deliberate faults** | a write to the kernel's own `.text`, and a write below a task's stack — each must panic, naming the address, the reason and the region, and exit with the panic code | 2 scenarios |
+| **Deliberate faults** | a write to the kernel's own `.text`, and a write below a task's stack — each must panic, naming the address, the reason and the region, and exit with the panic code | 3 scenarios |
+| **Fuzzing** | four libFuzzer targets over the **real** `elf.c`/`fat16.c`/`heap.c`/`acpi.c` under AddressSanitizer, plus 40,000 malformed system calls issued from ring 3 | 6 bugs found |
 
 ```
 $ make test
@@ -603,18 +615,22 @@ $ make test
 
   RUN     QEMU boot tests (both boot paths)
   [interactive-shell] shell driven over the serial console, command by command
-    commands run     : 23
+    commands run     : 41
+    result           : PASS
+  [syscall-fuzz] 40,000 malformed system calls issued from ring 3
+    calls accepted   : 18230
+    calls refused    : 21770
     result           : PASS
   [benchmarks] microbenchmarks and a sampling profile
     result           : PASS
   [custom-bootloader] two-stage BIOS bootloader from a raw disk image
-    in-kernel suites : 12/12 passed
+    in-kernel suites : 19/19 passed
     result           : PASS
   [multiboot2-grub] Multiboot2 via GRUB from an ISO
-    in-kernel suites : 12/12 passed
+    in-kernel suites : 19/19 passed
     result           : PASS
 
-run-tests: all 4 scenario(s) passed
+run-tests: all 9 scenario(s) passed
 ```
 
 Three details that make this work unattended:
@@ -631,6 +647,61 @@ Three details that make this work unattended:
   by trying it.
 
 More in [docs/TESTING.md](docs/TESTING.md).
+
+---
+
+## Fuzzing
+
+The four layers above test the kernel against inputs someone thought of.
+Fuzzing tests it against inputs nobody thought of — which, for a kernel, is
+the case that matters: every parser it has takes bytes from somewhere
+untrusted. An ELF a user hands to `exec`. A FAT16 boot sector on a disk anyone
+can image. An ACPI table from firmware. A system call argument from ring 3.
+
+```bash
+make fuzz                      # four targets, 20,000 runs each, in CI
+make fuzz FUZZ_RUNS=5000000    # a real campaign
+```
+
+**The targets compile the real kernel sources.** `build/fuzz/fuzz_elf` links
+`kernel/core/elf.c` — byte for byte the file that boots — against a shim that
+supplies what a kernel would. Extracting the parsers into host-testable copies
+is the more common shape, and it was rejected for one reason: a fuzzer that
+finds bugs in a rewritten copy of a parser is finding bugs in the rewrite.
+
+The accommodation that made it possible is `vmm_alloc_at()`, which the shim
+implements as `mmap(MAP_FIXED_NOREPLACE)` **at the address the kernel asked
+for** — because `elf_load_user()` maps a page at an address an untrusted header
+chose and then writes through it as a raw pointer. So `elf.c` is fuzzed
+completely unmodified, and a write one page past what it mapped takes
+`SIGSEGV` exactly as it would in the kernel. That is also why the targets build
+`-m32`: an image asking for `0x00400000` can only be honoured in a 32-bit
+address space.
+
+The other half is `user/fuzz.c`, an ordinary ELF loaded off the disk by the
+ordinary loader, which issues 40,000 deterministic malformed system calls from
+ring 3 — the only seat the kernel's pointer validation can actually be
+attacked from. Its pass condition is that the kernel is still running
+afterwards.
+
+Six bugs, all pre-existing, every one of them in code the other four layers
+covered and passed:
+
+| Bug | Found by |
+| --- | --- |
+| `memmove` called `memcpy` with overlapping ranges — undefined behaviour that worked only because this `memcpy` happens to be a forward byte loop | ASan's `memcpy` interceptor |
+| ACPI trusted the RSDP's own `length` field; `0xFFFFFFFF` reads 4 GiB from `0xE0000` | `fuzz_acpi` |
+| the heap stopped coalescing after a shrinking `krealloc`, fragmenting one block at a time | `heap_check()` under `fuzz_heap` |
+| **any ring-3 page fault panicked the kernel** — so a malformed program file took the machine down | `fuzz_elf`, via an ELF whose entry point lay outside every segment it mapped |
+| the ELF loader leaked every mapped page when allocation failed mid-segment — a denial of service that repeats | the target's "nothing may be left mapped" assertion |
+| a ring-3 process could flood the kernel console with log output, drowning out everything else | the syscall fuzzer |
+
+And what it does not cover, stated because a fuzzing claim without a boundary
+is advertising: the ring-3 fuzzer has no coverage feedback, the drivers are not
+fuzzed, and nothing fuzzes concurrency.
+
+More in [docs/FUZZING.md](docs/FUZZING.md), including the reasoning behind
+every accommodation the shim makes.
 
 ---
 
@@ -773,6 +844,13 @@ The `bootinfo.c` one is also what the embedded symbol table earned its keep
 on: the panic read `at strlen+0x6` under `emit_number / kprintf / cmd_version`,
 which made it a two-line diagnosis instead of a bisection.
 
+Six more came from the fuzzing harness, which is the strongest version of the
+same argument: those four were found by tests someone wrote on purpose, and
+these were found by inputs nobody thought of, in code that every one of those
+tests had already covered and passed. The worst of them let any unprivileged
+process panic the kernel with a malformed program file. They are tabulated
+under [Fuzzing](#fuzzing) above.
+
 ---
 
 ## What is deliberately not here
@@ -830,7 +908,8 @@ Being clear about scope is more useful than a longer feature list.
 | [docs/STORAGE.md](docs/STORAGE.md) | the ATA driver, the partition table, FAT16, and where a program comes from |
 | [docs/SMP.md](docs/SMP.md) | ACPI, the APIC, the AP trampoline, real locks, TLB shootdown |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | benchmark methodology, results with analysis, the profiler and its limits |
-| [docs/TESTING.md](docs/TESTING.md) | the four test layers and how to add to each |
+| [docs/TESTING.md](docs/TESTING.md) | the five test layers and how to add to each |
+| [docs/FUZZING.md](docs/FUZZING.md) | both fuzzing harnesses, the shim's design, and the six bugs they found |
 | [docs/DEBUGGING.md](docs/DEBUGGING.md) | GDB against QEMU, reading a panic, common symptoms |
 | [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md) | the trade-offs, with the alternatives that were rejected |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | what is next, and what each item would take |

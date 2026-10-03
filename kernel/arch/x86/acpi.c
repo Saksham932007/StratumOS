@@ -124,8 +124,25 @@ static const struct acpi_rsdp *scan_for_rsdp(paddr_t start, paddr_t end)
             continue;
         }
 
+        /* The extended checksum covers `length` bytes - and `length` is a
+         * number the firmware wrote, used here as a read length. An
+         * implausible value would walk off the end of the linear map and
+         * panic the kernel from firmware data before a single field had been
+         * looked at.
+         *
+         * A fuzz target found this immediately: AddressSanitizer reported a
+         * read past the end of its physical-memory buffer, from a checksum
+         * over a table claiming to be megabytes long. The specification fixes
+         * the ACPI 2.0 RSDP at 36 bytes, so anything outside a narrow range
+         * is not an RSDP. */
         if (candidate->revision >= 2 &&
-            !checksum_ok(candidate, candidate->length)) {
+            (candidate->length < sizeof(*candidate) ||
+             candidate->length > 64)) {
+            pr_warn("the RSDP at %p claims a length of %u; ignoring its "
+                    "64-bit fields",
+                    (void *)at, candidate->length);
+        } else if (candidate->revision >= 2 &&
+                   !checksum_ok(candidate, candidate->length)) {
             pr_warn("the RSDP at %p has a bad extended checksum; using its "
                     "32-bit fields only",
                     (void *)at);
