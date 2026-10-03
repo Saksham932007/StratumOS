@@ -89,6 +89,19 @@ static inline void irq_restore(bool was_enabled)
         sti();
 }
 
+/* A compiler barrier: nothing more than "do not move memory accesses across
+ * this point". It emits no instruction.
+ *
+ * Needed wherever a store changes the *meaning* of a later access rather than
+ * its value - writing a page table entry being the example that matters here.
+ * The compiler sees a store to one address and a load from an unrelated one,
+ * and is entitled to reorder them; the hardware sees the first store change
+ * where the second access goes. Only a barrier connects the two. */
+static inline void barrier(void)
+{
+    __asm__ volatile("" ::: "memory");
+}
+
 static inline void cpu_relax(void)
 {
     __asm__ volatile("pause" ::: "memory");

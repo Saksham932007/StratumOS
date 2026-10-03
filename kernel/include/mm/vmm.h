@@ -96,6 +96,29 @@
 #define KSTACK_BASE      0xE0000000u
 #define KSTACK_REGION    (4 * MIB)
 
+/* A window for device registers and firmware tables that live outside the
+ * linear map.
+ *
+ * The linear map covers the first VMM_LINEAR_SIZE of physical memory, which
+ * is where RAM and the VGA framebuffer are. The things that need this window
+ * are not there: the local APIC sits at 0xFEE00000, just below 4 GiB, and
+ * QEMU puts the ACPI tables near the top of installed memory - 0x07FE0000 on
+ * a 128 MiB machine, eight times beyond the linear map's reach.
+ *
+ * Mappings here are permanent. A device's registers are needed for as long as
+ * the kernel runs, so there is nothing to reclaim and no reason for an
+ * allocator more sophisticated than a bump pointer. */
+#define VMM_MMIO_BASE    0xCE000000u
+#define VMM_MMIO_SIZE    (8 * MIB)
+
+/* Per-CPU boot and idle stacks, laid out exactly like the task stacks at
+ * KSTACK_BASE: one guard page, then the stack. A processor needs a stack
+ * before it can execute a single line of C, so these cannot come from the
+ * task allocator - the scheduler does not exist yet when an application
+ * processor arrives. */
+#define CPUSTACK_BASE    0xE8000000u
+#define CPUSTACK_REGION  (1 * MIB)
+
 /* Two kernel pages reserved for temporarily mapping an arbitrary frame.
  *
  * The recursive window can only reach the *current* address space's tables,
@@ -122,6 +145,18 @@ paddr_t vmm_kernel_pd_phys(void);
 
 /* Returns the physical address of a fresh page directory, or 0. */
 paddr_t vmm_create_address_space(void);
+
+/* A page directory that identity-maps the first 4 MiB *and* contains the
+ * kernel's half.
+ *
+ * Exists for exactly one caller: an application processor enabling paging
+ * while still executing at a low physical address. The kernel's own directory
+ * has no low mapping - dropping it is what frees user space - so loading that
+ * would unmap the instruction after `mov cr0`. Handing the processor a
+ * directory with both halves means the kernel's address space is never in a
+ * state its own test suite would reject. */
+paddr_t vmm_create_bootstrap_pd(void);
+void vmm_destroy_bootstrap_pd(paddr_t pd_phys);
 
 /* Clone the *current* address space's user half copy-on-write: every writable
  * user page becomes read-only and COW-marked in both parent and child, and
@@ -151,6 +186,21 @@ void vmm_switch_address_space(paddr_t pd_phys);
  * during vmm_init(), and ensure_table() panics if one is created later. */
 void vmm_reserve_kernel_tables(vaddr_t base, size_t bytes);
 
+/* Map a physical range into the MMIO window and return a kernel pointer to
+ * it. `bytes` may be unaligned; the mapping is rounded out to whole pages and
+ * the returned pointer keeps the offset within the first one.
+ *
+ * `uncached` sets PTE_PCD, which must be used for device registers: a cached
+ * read of a status register can return a value the device has already
+ * changed, and a cached write may never reach it at all. Firmware tables are
+ * ordinary memory and want caching.
+ *
+ * Returns NULL if the window is full. Never unmapped. */
+void *vmm_map_mmio(paddr_t phys, size_t bytes, bool uncached);
+
+/* How much of the MMIO window has been handed out, in bytes. */
+u32 vmm_mmio_used(void);
+
 /* Remove write permission from the kernel's own .text and .rodata. Called
  * once, after the heap exists, because a failure here should be reportable
  * rather than a boot-time panic. */
@@ -179,6 +229,12 @@ u32 vmm_pte(vaddr_t va);
  * vmm_pte() because a directory entry's USER and WRITE bits gate a whole
  * 4 MiB range, so they are worth being able to assert on directly. */
 u32 vmm_pde_raw(u32 pdi);
+
+/* Read one entry out of a page directory that is *not* the current one, by
+ * physical address. For inspecting an address space from outside it - which
+ * the test suite needs, and which is the access pattern that exposed the
+ * compiler-reordering bug the map/unmap barriers now prevent. */
+bool vmm_inspect_pd(paddr_t pd_phys, u32 pdi, u32 *out);
 
 bool vmm_map_range(vaddr_t va, paddr_t pa, size_t bytes, u32 flags);
 void vmm_unmap_range(vaddr_t va, size_t bytes);

@@ -105,13 +105,13 @@ Checking them takes 30 milliseconds.
 
 ## Layer 3: in-kernel suites
 
-`kernel/core/ktest.c` holds 17 suites and 393 assertions, run against
+`kernel/core/ktest.c` holds 19 suites and 484 assertions, run against
 real hardware state — a bitmap with actual firmware-reported memory in it, real
 page tables, a real heap, a real scheduler.
 
 ```
 stratum> selftest
-ktest: running 17 suites
+ktest: running 19 suites
 ktest: string ... PASS (15 checks)
 ktest: boot ... PASS (26 checks)
 ktest: cpu ... PASS (8 checks)
@@ -127,9 +127,11 @@ ktest: proc ... PASS (14 checks)
 ktest: harden ... PASS (24 checks)
 ktest: storage ... PASS (44 checks)
 ktest: fs ... PASS (56 checks)
+ktest: smp ... PASS (74 checks)
+ktest: bootpd ... PASS (17 checks)
 ktest: ksyms ... PASS (12 checks)
 ktest: profile ... PASS (9 checks)
-ktest: summary 17/17 suites passed
+ktest: summary 19/19 suites passed
 ```
 
 | Suite | What it establishes |
@@ -148,6 +150,8 @@ ktest: summary 17/17 suites passed
 | `proc` | a kernel thread shares the kernel's page directory; `task_fork(NULL)` is refused rather than reading address zero; `wait()` returns a real pid and status for each child and -1 once there are none; `exec`'s program table contains `init` and terminates |
 | `harden` | `CR0.WP` is set; no page of `.text` or `.rodata` is writable or user-accessible and `.data` still is; every kernel directory entry is present and none has the `USER` bit; this task's stack is in the guarded region with its guard page unmapped above and below; CR4 agrees with CPUID about SMEP and SMAP; a declared user access opens a window and an undeclared one is what SMAP exists to refuse |
 | `storage` | IDENTIFY reports a model and a capacity; a two-sector read equals two one-sector reads *and* the two sectors differ, which is the per-sector DRQ handshake; five malformed reads are each refused *and* logged; zero sectors is a no-op that logs nothing; a read of a partition's block 0 equals a read of the disk at the partition's first LBA; a read past the partition's end is refused even though those sectors exist |
+| `smp` | the MADT's local APIC address is page aligned and every processor it describes has a distinct APIC id; a table that is not there comes back NULL; the task priority register is zero; **LINT0 is ExtINT and unmasked, and the timer is advancing**; `smp_cpu_index()` agrees with the APIC id; every application processor's stack has an unmapped guard page below it and reached its idle loop; a lock taken with interrupts enabled gives them back; every other processor answers a ping and acknowledges a shootdown |
+| `bootpd` | the AP bootstrap directory identity-maps the first 4 MiB, its recursive entry points at itself rather than the kernel's, its kernel half matches entry for entry, its user half is empty, and destroying it returns exactly the two frames it allocated — which is also the regression test for a compiler-reordering bug, see docs/SMP.md |
 | `fs` | the BPB's four offsets are ordered and inside the device; the cluster count is in FAT16's range; lookup is case-insensitive and tolerates redundant slashes; a missing name, a relative path, an over-long component, a file used as a directory and a directory read as a file are all refused; a chunked read agrees with a whole-file read byte for byte across a cluster boundary; a read at the end is short and past the end is zero; a size bound the file exceeds refuses rather than truncates; the volume label is not reported as a file; and the sector cache's hit rate |
 | `ksyms` | the table is sorted; every symbol resolves to itself; an exact address gives offset 0 and an address inside a function gives the right offset; addresses outside every executable section resolve to nothing |
 | `profile` | synthetic frames are attributed correctly — ring 0 inside a known function counts, ring 3 counts separately, an address outside `.text` counts as unattributed, and a stopped profiler ignores ticks |
@@ -187,8 +191,8 @@ table.
 
 ## Layer 4: boot scenarios
 
-`tools/run-tests.py` boots the kernel seven ways and asserts on what it says.
-Five of them must come up clean; two of them must *panic*.
+`tools/run-tests.py` boots the kernel eight ways and asserts on what it says.
+Six of them must come up clean; two of them must *panic*.
 
 ### Unattended boots
 
@@ -214,7 +218,7 @@ build/stratum-test.img    # cmdline "autotest", via stage 2's patchable header
 build/stratum-test.iso    # cmdline "autotest", via grub-test.cfg
 ```
 
-Each scenario then checks 46 expected lines, 9 forbidden patterns, the
+Each scenario then checks 47 expected lines, 9 forbidden patterns, the
 in-kernel summary, and the exit status. The forbidden list is the important
 half:
 
@@ -238,6 +242,25 @@ one silently fall back to the other is caught:
 ```python
 ("native protocol detected",     r"boot protocol\s+\[ok\] StratumOS native"),
 ("multiboot2 protocol detected", r"boot protocol\s+\[ok\] Multiboot2"),
+```
+
+### The same image, on four processors
+
+Every other scenario runs on one processor, because that is the path that has
+to keep working and is what almost every reader will build on. `four-processors`
+boots the identical test image with `-smp 4`.
+
+Nothing a uniprocessor boot touches is exercised by it. The trampoline, the
+per-CPU GDT entries, the real spinlocks and the IPI paths only exist when
+there is more than one processor, and the `smp` suite's second half — pings
+answered, shootdowns acknowledged — can only run there:
+
+```python
+("the MADT was parsed",
+ r"acpi: MADT: 4 processor\(s\), \d+ I/O APIC\(s\)"),
+("every application processor started",
+ r"smp: cpu 3 online \(APIC id 3\)"),
+("all four are online", r"smp: 4 of 4 processor\(s\) online"),
 ```
 
 ### The same image, on a CPU that has SMEP and SMAP
@@ -264,7 +287,7 @@ never declared the user-page write it uses to prove copy-on-write works.
 
 ### The interactive scenario
 
-39 shell commands, sent over the serial console and checked against regular
+41 shell commands, sent over the serial console and checked against regular
 expressions:
 
 ```python

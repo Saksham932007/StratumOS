@@ -700,3 +700,133 @@ the two highest levels, and only while a test asks for it.
 "tests must provoke errors" — look like they conflict and do not. The window
 makes the expectation explicit at the call site, and asserting the count turns
 it from an exemption into an additional assertion.
+
+---
+
+## 26. The current processor comes from the task register, not the APIC
+
+**Decision.** `smp_cpu_index()` executes `str`, reads the task register's
+selector, and subtracts the base of the per-CPU TSS descriptors.
+
+**Rejected: reading the local APIC's id register.** The obvious answer, and
+what the first version did. It is an uncached access to a device, and it sits
+on the context-switch path because `tss_set_kernel_stack()` has to write
+*this* processor's TSS. Measured:
+
+```
+                 APIC read      task register
+  cpu-index      453 cycles          3.6        125x
+  spinlock       580 cycles         68           8.5x   (two per acquisition)
+  ctxsw          886 cycles        580           1.5x
+```
+
+Medians under emulation, so the absolute figures are the emulator's — but the
+ratio is real, and an uncontended spinlock costing about as much as a system
+call was not a trade anyone would have chosen deliberately.
+
+**Rejected: a per-CPU GDT descriptor reached as `%gs:offset`.** What Linux
+does, and better still, because it yields the whole `struct cpu` rather than
+an index. It needs the interrupt stubs to load a per-CPU GS on every kernel
+entry — which needs the processor already identified, and `str` is exactly how
+you would break that circle. Worth doing when there is a reason; there is not
+one yet.
+
+**Cost.** The index is derived from a GDT layout, so `SMP_MAX_CPUS` is baked
+into the descriptor table and a processor's index can never be reassigned —
+which is why failed processors leave gaps rather than being compacted away.
+And it answers 0 before any `ltr` has run, which has to be correct rather than
+merely harmless, because `gdt_init()` itself calls it.
+
+**Why.** The task register was already per-CPU and already distinct on every
+processor, because each one needs its own TSS for `ss0`/`esp0`. The identity
+the kernel was obliged to set up anyway turned out to be the cheapest one to
+read back.
+
+---
+
+## 27. LINT0 takes ExtINT on the boot processor, and is masked everywhere else
+
+**Decision.** `configure_local()` masks every local vector table entry the
+kernel does not handle — except LINT0 and LINT1, which on the boot processor
+become ExtINT and NMI.
+
+**Rejected: masking them too.** This is what the first version did, and it
+reads as obviously correct: an unmasked LVT entry left over from firmware
+delivers an interrupt on a vector nothing is installed for, so masking what
+you do not handle is the right instinct.
+
+It stopped the kernel's timer dead. Before the local APIC is enabled the 8259
+pair drives the processor's INTR pin directly; enabling it puts that pin
+behind LINT0, in the arrangement the specification calls virtual wire mode. A
+masked LINT0 means no 8259 interrupt reaches the processor at all — and this
+kernel's timer, keyboard and serial input all arrive that way.
+
+The symptom is worth recording because it is so quiet: the kernel booted
+perfectly, printed every line of its startup, and hung before the first test
+suite with **every log line sharing one timestamp**. Nothing said "the timer
+stopped"; the clock simply never advanced.
+
+**Rejected: moving the timer to the I/O APIC first.** That is the real answer
+and it is a bigger change — the MADT's interrupt source overrides have to be
+honoured, which on QEMU means knowing that IRQ 0 arrives as GSI 2. Those
+entries are parsed and reported; programming the I/O APIC is a separate item.
+
+**Cost.** One of the eight processors is special, which is a thing the code
+now has to say out loud: `configure_local(bool is_bsp)`. Application
+processors mask both pins, because the 8259 has one output, it is already
+going to the boot processor, and a second processor accepting ExtINT would
+race it for the same interrupt and acknowledge a controller it was not talking
+to.
+
+**Why.** The `smp` suite now asserts LINT0 is ExtINT and unmasked **and** that
+the timer is advancing. The second is the property that mattered; the first is
+only how it is achieved, and a test that checked the configuration alone would
+have passed on a kernel whose clock was stopped.
+
+---
+
+## 28. Page table entries are volatile, and map/unmap carry barriers
+
+**Decision.** `pd_entries()` and `pt_entries()` return `volatile u32 *`, and
+`temp_map()`/`temp_unmap()` each contain an explicit compiler barrier.
+
+**Rejected: plain pointers, which is what this file had for three phases.**
+The disassembly of what GCC produced:
+
+```
+  mov    %eax,0xfff3c000    <- temp_map:   write the PTE  (mapping ON)
+  invlpg (%ecx)
+  movl   $0x0,0xfff3c000    <- temp_unmap: clear the PTE  (mapping OFF)  *** HOISTED ***
+  mov    0xcf000000,%eax    <- read through a mapping that is now gone   -> #PF
+  movl   $0x0,0xcf000000
+  invlpg (%ecx)             <- temp_unmap's invlpg, left behind
+```
+
+The store that tore down the mapping was hoisted above the code still using
+it. The compiler is entitled to: it sees a store to one absolute address and
+accesses to another, has no way to know the first changes where the second
+*goes*, and reorders them freely.
+
+**Rejected: relying on `invlpg`'s memory clobber.** It was already there, and
+it is not enough. A `"memory"` clobber constrains ordering relative to *the
+asm statement*, and each store did stay on its own side of its own `invlpg`.
+Nothing connected `temp_unmap`'s store to the accesses that happened between
+the two asm statements.
+
+**Rejected: volatile alone.** It keeps page-table accesses ordered relative to
+each other, which stops them being merged or elided — but it says nothing
+about ordinary memory accesses, which is precisely what reads through the
+mapping are.
+
+**Cost.** Every local holding one of these pointers has to carry the
+qualifier, and `memset` cannot be used on a page table any more — zeroing a
+fresh one is now an explicit loop, because casting the qualifier away is
+exactly the mistake being paid for. Two barriers that emit no instructions.
+
+**Why.** The bug had been latent since the copy-on-write work:
+`vmm_clone_current`, `cow_fault` and `vmm_destroy_address_space` all use the
+same pattern and happened to survive whatever GCC decided about their
+surrounding code. That is the worst kind of luck — the code was wrong for
+three phases and the tests all passed. The `bootpd` suite is now the
+regression test, and it fails immediately and fatally rather than subtly if
+either half of the fix is removed.

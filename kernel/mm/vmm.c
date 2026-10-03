@@ -59,15 +59,25 @@ static u32 stat_address_spaces;
 
 /* Page tables are always reached through the recursive window. Before the
  * higher-half jump there was a physical path as well; there no longer is,
- * because C never runs with paging off. */
-static inline u32 *pd_entries(void)
+ * because C never runs with paging off.
+ *
+ * `volatile`, and it has to be. A page table entry is not ordinary memory:
+ * writing one changes where every subsequent access to a virtual address
+ * *goes*, and the compiler cannot see that. Given a store to 0xFFF3C000 and a
+ * load from 0xCF000000 it sees two unrelated absolute addresses and reorders
+ * them freely - which it did, hoisting a temp_unmap() above the code using
+ * the mapping and producing a page fault on a mapping that had just been
+ * established. Volatile keeps these accesses in order relative to each other;
+ * barrier() in temp_map/temp_unmap keeps them in order relative to accesses
+ * through the mapping. Both are needed, and neither is sufficient alone. */
+static inline volatile u32 *pd_entries(void)
 {
-    return (u32 *)PD_VADDR;
+    return (volatile u32 *)PD_VADDR;
 }
 
-static inline u32 *pt_entries(u32 pdi)
+static inline volatile u32 *pt_entries(u32 pdi)
 {
-    return (u32 *)PT_VADDR(pdi);
+    return (volatile u32 *)PT_VADDR(pdi);
 }
 
 paddr_t vmm_kernel_pd_phys(void)
@@ -95,11 +105,16 @@ static void *temp_map(unsigned slot, paddr_t frame)
     ASSERT(!temp_slot_busy[slot]);
 
     vaddr_t va = VMM_TEMP_BASE + slot * PAGE_SIZE;
-    u32 *pt = pt_entries(PDE_INDEX(va));
+    volatile u32 *pt = pt_entries(PDE_INDEX(va));
 
     temp_slot_busy[slot] = true;
     pt[PTE_INDEX(va)] = (frame & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITE;
     invlpg(va);
+
+    /* Nothing the caller does through this mapping may be moved above the
+     * store that created it. invlpg's clobber already says so; saying it
+     * again means the guarantee does not depend on invlpg staying here. */
+    barrier();
 
     return (void *)va;
 }
@@ -108,8 +123,14 @@ static void temp_unmap(unsigned slot)
 {
     ASSERT(slot < VMM_TEMP_SLOTS);
 
+    /* The caller's accesses through this mapping must all have happened
+     * before it is torn down. Without this the compiler will hoist the store
+     * below above them - it has, and the result was a page fault on a page
+     * the code had just mapped and was still using. */
+    barrier();
+
     vaddr_t va = VMM_TEMP_BASE + slot * PAGE_SIZE;
-    u32 *pt = pt_entries(PDE_INDEX(va));
+    volatile u32 *pt = pt_entries(PDE_INDEX(va));
 
     pt[PTE_INDEX(va)] = 0;
     invlpg(va);
@@ -132,7 +153,7 @@ static void set_pte(vaddr_t va, u32 entry)
 /* Create the page table for a directory slot if it is missing. */
 static bool ensure_table(u32 pdi, u32 flags)
 {
-    u32 *pd = pd_entries();
+    volatile u32 *pd = pd_entries();
 
     if (pd[pdi] & PTE_PRESENT) {
         /* A directory entry's USER bit gates its whole 4 MiB range, so it has
@@ -172,7 +193,13 @@ static bool ensure_table(u32 pdi, u32 flags)
      * (not-present) translation for that window address. */
     invlpg(PT_VADDR(pdi));
 
-    memset(pt_entries(pdi), 0, PAGE_SIZE);
+    /* Zeroed a word at a time through the volatile pointer rather than with
+     * memset, which would need the qualifier cast away - and casting it away
+     * is exactly the mistake this file just finished paying for. */
+    volatile u32 *fresh = pt_entries(pdi);
+
+    for (u32 i = 0; i < PAGE_SIZE / sizeof(u32); i++)
+        fresh[i] = 0;
     return true;
 }
 
@@ -189,7 +216,7 @@ bool vmm_map(vaddr_t va, paddr_t pa, u32 flags)
     if (!ensure_table(pdi, flags))
         return false;
 
-    u32 *pt = pt_entries(pdi);
+    volatile u32 *pt = pt_entries(pdi);
 
     if (pt[pti] & PTE_PRESENT) {
         /* Silently replacing a live mapping hides bugs, so say so. The
@@ -231,12 +258,12 @@ bool vmm_protect(vaddr_t va, u32 flags)
 {
     u32 pdi = PDE_INDEX(va);
     u32 pti = PTE_INDEX(va);
-    u32 *pd = pd_entries();
+    volatile u32 *pd = pd_entries();
 
     if (!(pd[pdi] & PTE_PRESENT))
         return false;
 
-    u32 *pt = pt_entries(pdi);
+    volatile u32 *pt = pt_entries(pdi);
     if (!(pt[pti] & PTE_PRESENT))
         return false;
 
@@ -265,12 +292,12 @@ void vmm_unmap(vaddr_t va)
 {
     u32 pdi = PDE_INDEX(va);
     u32 pti = PTE_INDEX(va);
-    u32 *pd = pd_entries();
+    volatile u32 *pd = pd_entries();
 
     if (!(pd[pdi] & PTE_PRESENT))
         return;
 
-    u32 *pt = pt_entries(pdi);
+    volatile u32 *pt = pt_entries(pdi);
     u32 entry = pt[pti];
 
     if (!(entry & PTE_PRESENT))
@@ -314,10 +341,26 @@ u32 vmm_pde_raw(u32 pdi)
     return pdi < 1024 ? pd_entries()[pdi] : 0;
 }
 
+bool vmm_inspect_pd(paddr_t pd_phys, u32 pdi, u32 *out)
+{
+    if (!pd_phys || pdi >= 1024 || !out)
+        return false;
+
+    bool irqs = irq_save();
+    const volatile u32 *pd = temp_map(0, pd_phys);
+
+    *out = pd[pdi];
+
+    temp_unmap(0);
+    irq_restore(irqs);
+
+    return true;
+}
+
 u32 vmm_pte(vaddr_t va)
 {
     u32 pdi = PDE_INDEX(va);
-    u32 *pd = pd_entries();
+    volatile u32 *pd = pd_entries();
 
     if (!(pd[pdi] & PTE_PRESENT))
         return 0;
@@ -352,7 +395,7 @@ paddr_t vmm_create_address_space(void)
 
     bool irqs = irq_save();
     u32 *dst = temp_map(0, pd);
-    const u32 *kernel = pd_entries();
+    const volatile u32 *kernel = pd_entries();
 
     memset(dst, 0, PAGE_SIZE);
 
@@ -374,6 +417,82 @@ paddr_t vmm_create_address_space(void)
     return pd;
 }
 
+paddr_t vmm_create_bootstrap_pd(void)
+{
+    paddr_t pd = pmm_alloc_frame();
+
+    if (pd == PMM_NO_FRAME) {
+        pr_err("cannot allocate a bootstrap page directory");
+        return 0;
+    }
+
+    paddr_t pt = pmm_alloc_frame();
+
+    if (pt == PMM_NO_FRAME) {
+        pr_err("cannot allocate the bootstrap identity page table");
+        pmm_free_frame(pd);
+        return 0;
+    }
+
+    bool irqs = irq_save();
+
+    /* The identity page table: the first 4 MiB, one entry per page. The same
+     * 1024 entries _start built at boot, for the same reason. */
+    u32 *entries = temp_map(0, pt);
+
+    for (u32 i = 0; i < 1024; i++)
+        entries[i] = (i << PAGE_SHIFT) | PTE_PRESENT | PTE_WRITE;
+
+    temp_unmap(0);
+
+    u32 *dst = temp_map(0, pd);
+    const volatile u32 *kernel = pd_entries();
+
+    memset(dst, 0, PAGE_SIZE);
+
+    /* The kernel's half, so that the jump into the higher half works the
+     * instant paging is on. */
+    for (u32 i = KERNEL_PDE_FIRST; i < RECURSIVE_SLOT; i++)
+        dst[i] = kernel[i];
+
+    dst[0] = pt | PTE_PRESENT | PTE_WRITE;
+    dst[RECURSIVE_SLOT] = pd | PTE_PRESENT | PTE_WRITE;
+
+    temp_unmap(0);
+    irq_restore(irqs);
+
+    pr_debug("bootstrap page directory at phys %p (identity 0-4 MiB plus the "
+             "kernel half)",
+             (void *)pd);
+
+    return pd;
+}
+
+void vmm_destroy_bootstrap_pd(paddr_t pd_phys)
+{
+    if (!pd_phys)
+        return;
+
+    if (pd_phys == read_cr3())
+        panic("vmm_destroy_bootstrap_pd(%p): that is the directory we are "
+              "running on",
+              (void *)pd_phys);
+
+    bool irqs = irq_save();
+    u32 *pd = temp_map(0, pd_phys);
+    paddr_t pt = pd[0] & PTE_ADDR_MASK;
+
+    pd[0] = 0;
+    temp_unmap(0);
+    irq_restore(irqs);
+
+    /* Only the identity table and the directory itself were allocated here;
+     * the kernel's page tables are shared and must not be touched. */
+    if (pt)
+        pmm_free_frame(pt);
+    pmm_free_frame(pd_phys);
+}
+
 paddr_t vmm_clone_current(void)
 {
     paddr_t child_pd = vmm_create_address_space();
@@ -382,7 +501,7 @@ paddr_t vmm_clone_current(void)
         return 0;
 
     bool irqs = irq_save();
-    u32 *parent_pd = pd_entries();
+    volatile u32 *parent_pd = pd_entries();
     u32 *child_pd_map = temp_map(0, child_pd);
 
     for (u32 pdi = 0; pdi < KERNEL_PDE_FIRST; pdi++) {
@@ -398,7 +517,7 @@ paddr_t vmm_clone_current(void)
             return 0;
         }
 
-        u32 *parent_pt = pt_entries(pdi);
+        volatile u32 *parent_pt = pt_entries(pdi);
         u32 *child_pt = temp_map(1, child_pt_frame);
 
         for (u32 pti = 0; pti < 1024; pti++) {
@@ -482,13 +601,13 @@ void vmm_destroy_address_space(paddr_t pd_phys)
 void vmm_clear_user_space(void)
 {
     bool irqs = irq_save();
-    u32 *pd = pd_entries();
+    volatile u32 *pd = pd_entries();
 
     for (u32 pdi = 0; pdi < KERNEL_PDE_FIRST; pdi++) {
         if (!(pd[pdi] & PTE_PRESENT))
             continue;
 
-        u32 *pt = pt_entries(pdi);
+        volatile u32 *pt = pt_entries(pdi);
 
         for (u32 pti = 0; pti < 1024; pti++) {
             if (!(pt[pti] & PTE_PRESENT))
@@ -559,6 +678,52 @@ void vmm_protect_kernel_text(void)
             pages);
 }
 
+/* ---- the MMIO window ---------------------------------------------------
+ *
+ * A bump pointer, because every mapping here is permanent: see mm/vmm.h.
+ * Page granularity, so two devices whose registers share a page get one
+ * mapping between them - which is correct, and is why the offset within the
+ * page has to be carried through to the returned pointer.
+ */
+static u32 mmio_next;
+
+u32 vmm_mmio_used(void)
+{
+    return mmio_next;
+}
+
+void *vmm_map_mmio(paddr_t phys, size_t bytes, bool uncached)
+{
+    if (bytes == 0)
+        return NULL;
+
+    paddr_t first = PAGE_TRUNC(phys);
+    u32 offset = phys - first;
+    size_t span = PAGE_ALIGN(offset + bytes);
+
+    if (mmio_next + span > VMM_MMIO_SIZE) {
+        pr_err("the MMIO window is full: %u KiB in use, %u KiB more wanted",
+               mmio_next / KIB, (unsigned)(span / KIB));
+        return NULL;
+    }
+
+    vaddr_t va = VMM_MMIO_BASE + mmio_next;
+    u32 flags = PTE_PRESENT | PTE_WRITE | (uncached ? PTE_PCD : 0);
+
+    if (!vmm_map_range(va, first, span, flags)) {
+        pr_err("cannot map %u KiB of MMIO at phys %p", (unsigned)(span / KIB),
+               (void *)first);
+        return NULL;
+    }
+
+    mmio_next += span;
+
+    pr_debug("mapped phys %p+%u -> %p (%s)", (void *)phys, (unsigned)bytes,
+             (void *)(va + offset), uncached ? "uncached" : "cached");
+
+    return (void *)(va + offset);
+}
+
 void vmm_reserve_kernel_tables(vaddr_t base, size_t bytes)
 {
     ASSERT(base >= KERNEL_VIRT_BASE);
@@ -585,12 +750,12 @@ u32 vmm_count_user_pages(void)
 {
     u32 count = 0;
     bool irqs = irq_save();
-    u32 *pd = pd_entries();
+    volatile u32 *pd = pd_entries();
 
     for (u32 pdi = 0; pdi < KERNEL_PDE_FIRST; pdi++) {
         if (!(pd[pdi] & PTE_PRESENT))
             continue;
-        u32 *pt = pt_entries(pdi);
+        volatile u32 *pt = pt_entries(pdi);
         for (u32 pti = 0; pti < 1024; pti++)
             if (pt[pti] & PTE_PRESENT)
                 count++;
@@ -625,6 +790,8 @@ static const char *fault_region(u32 addr)
         return "the kernel's linear map of low physical memory";
     if (addr >= KHEAP_BASE && addr < KHEAP_BASE + KHEAP_MAX_SIZE)
         return "the kernel heap window - a bad heap pointer";
+    if (addr >= VMM_MMIO_BASE && addr < VMM_MMIO_BASE + VMM_MMIO_SIZE)
+        return "the MMIO window - a device register that is not mapped";
     if (addr >= VMM_TEMP_BASE &&
         addr < VMM_TEMP_BASE + VMM_TEMP_SLOTS * PAGE_SIZE)
         return "a temporary frame-mapping slot that is not currently mapped";

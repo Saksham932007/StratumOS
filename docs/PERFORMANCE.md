@@ -1,7 +1,7 @@
 # Performance
 
 The kernel measures itself. `make bench` boots an image that calibrates the
-time-stamp counter against the PIT, runs eleven microbenchmarks, takes a
+time-stamp counter against the PIT, runs fourteen microbenchmarks, takes a
 sampling profile, and shuts the machine down. CI runs the same image on every
 push and asserts that every figure is produced.
 
@@ -205,9 +205,9 @@ is embedded in, rather than trusting that argument:
 
 ```
   LD      pass A (enumerate symbols)
-  KSYMS   612 symbols -> build/ksyms_a.c
+  KSYMS   672 symbols -> build/ksyms_a.c
   LD      pass B (addresses settle)
-  KSYMS   612 symbols -> build/ksyms_b.c
+  KSYMS   672 symbols -> build/ksyms_b.c
   LD      build/stratum.debug.elf (pass C, final)
   VERIFY  embedded symbol table describes this kernel
 ```
@@ -216,8 +216,8 @@ Only *function* symbols are emitted. That is the constraint that makes the
 argument hold: data symbols would include the table's own, so the set of names
 would differ between passes B and C and the size would change again.
 
-The 612 symbols cost 12.6 KiB of the image - 4.8 KiB of address/pointer
-pairs plus 7.8 KiB of names. In exchange, a panic is
+The 672 symbols cost 13.8 KiB of the image - 5.2 KiB of address/pointer
+pairs plus 8.6 KiB of names. In exchange, a panic is
 readable with nothing but the serial log:
 
 ```
@@ -231,6 +231,57 @@ Call trace (return addresses; the faulting frame is EIP above):
 ```
 
 ---
+
+## Identifying a processor: the one measurement that changed a design
+
+Most of these numbers describe something that was already decided. This one
+decided it.
+
+`smp_cpu_index()` answers "which processor is this", and it sits on the
+context-switch path because `tss_set_kernel_stack()` has to write *this*
+processor's TSS. The obvious implementation reads the local APIC's id
+register:
+
+```
+bench: cpu-index    min=427.425c med=453.256c mean=455.663c  = 215.719 ns
+bench: spinlock     min=567.988c med=579.892c mean=591.871c  = 275.989 ns
+bench: ctxsw        min=860.320c med=886.405c mean=893.887c  = 421.869 ns
+```
+
+216 nanoseconds to answer a question with four possible answers — because the
+local APIC is a device, and its registers are mapped uncached, so every read
+goes to it. An uncontended spinlock cost about as much as a system call, and
+two of those APIC reads were most of it.
+
+The task register is already per-CPU, because every processor executed
+`ltr` with its own TSS selector — it needs its own TSS for `ss0`/`esp0`. So
+the identity was already there, and `str` reads it in one instruction that
+touches no memory:
+
+```
+bench: cpu-index    min=2.869c   med=3.636c   mean=5.711c    = 1.731 ns
+bench: spinlock     min=65.293c  med=67.564c  mean=72.331c   = 32.175 ns
+bench: ctxsw        min=524.780c med=579.901c mean=640.163c  = 276.161 ns
+```
+
+125x on the lookup, 8.5x on the lock, 1.5x on a context switch. These are
+emulated cycles, so the absolute figures are the emulator's — but the ratio is
+the finding, and the benchmark is why there is one at all rather than a
+comment asserting the cost was acceptable.
+
+The remaining large number is the shootdown:
+
+```
+bench: shootdown    min=109335c med=127844c mean=128072c  = 8173.501 ns
+```
+
+A TLB shootdown broadcasts an IPI and waits for every other processor to
+acknowledge it. Under TCG that is mostly inter-thread signalling rather than
+anything a real machine would pay, but the order of magnitude is right: a
+shootdown is expensive, which is why real kernels batch them.
+
+---
+
 
 ## Reproducing this
 

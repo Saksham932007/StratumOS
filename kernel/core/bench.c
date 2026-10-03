@@ -16,6 +16,8 @@
 #include <kernel/log.h>
 #include <kernel/printf.h>
 #include <kernel/sched.h>
+#include <kernel/smp.h>
+#include <kernel/spinlock.h>
 #include <kernel/string.h>
 #include <kernel/syscall.h>
 
@@ -294,6 +296,54 @@ static void bench_heap_check(u32 iterations)
         (void)heap_check();
 }
 
+/* Identifying the current processor.
+ *
+ * This is here because the cost is a design decision, not an accident.
+ * smp_cpu_index() reads the local APIC's id register, which is an uncached
+ * memory access to a device - and it is on the context-switch path, because
+ * tss_set_kernel_stack() has to write *this* processor's TSS.
+ *
+ * The alternative is a per-CPU GDT descriptor whose base points at the
+ * `struct cpu`, reached as `%gs:offset` in one instruction. That is what a
+ * production kernel does, and it needs the interrupt stubs to load a per-CPU
+ * GS on every kernel entry, which needs the processor already identified.
+ * Breaking that circle is worth doing; knowing what it would buy means
+ * measuring what the simple version costs rather than asserting it is fine.
+ */
+/* A volatile sink, so the optimiser cannot delete the thing being measured.
+ * Without it GCC observes that the result is unused and removes the call. */
+static volatile u32 bench_sink;
+
+static void bench_cpu_index(u32 iterations)
+{
+    for (u32 i = 0; i < iterations; i++)
+        bench_sink = smp_cpu_index();
+}
+
+/* An uncontended lock, which is what nearly every acquisition in this kernel
+ * is. The interesting number is how much the atomic compare-exchange and the
+ * interrupt save/restore cost when nobody is competing - because that is the
+ * price paid on every acquisition for the one in a thousand that contends. */
+static void bench_spinlock(u32 iterations)
+{
+    static spinlock_t bench_lock = SPINLOCK_INIT("bench");
+
+    for (u32 i = 0; i < iterations; i++) {
+        spin_lock(&bench_lock);
+        spin_unlock(&bench_lock);
+    }
+}
+
+/* A TLB shootdown: an IPI broadcast plus the wait for every other processor
+ * to acknowledge. On one processor this measures the local invalidation and
+ * the early return, which is itself worth knowing - it is the cost a
+ * uniprocessor pays for code written to be correct on many. */
+static void bench_shootdown(u32 iterations)
+{
+    for (u32 i = 0; i < iterations; i++)
+        smp_tlb_shootdown(KERNEL_VIRT_BASE + ((i & 0xFF) << PAGE_SHIFT));
+}
+
 /* ---- registry ---------------------------------------------------------- */
 
 static const struct bench benches[] = {
@@ -312,6 +362,12 @@ static const struct bench benches[] = {
     {"ksnprintf", "format 4 conversions to a buffer", bench_printf, 2000, false,
      1},
     {"heapcheck", "full heap integrity walk", bench_heap_check, 200, false, 1},
+    {"cpu-index", "identify the current processor (an APIC register read)",
+     bench_cpu_index, 2000, false, 1},
+    {"spinlock", "uncontended spin_lock + spin_unlock", bench_spinlock, 2000,
+     false, 2},
+    {"shootdown", "TLB shootdown, including every ack", bench_shootdown, 200,
+     true, 1},
 };
 
 u32 bench_count(void)

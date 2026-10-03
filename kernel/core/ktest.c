@@ -16,6 +16,8 @@
  */
 #define LOG_TAG "ktest"
 
+#include <arch/acpi.h>
+#include <arch/apic.h>
 #include <arch/cpu.h>
 #include <arch/harden.h>
 #include <arch/io.h>
@@ -34,6 +36,8 @@
 #include <kernel/printf.h>
 #include <kernel/profile.h>
 #include <kernel/sched.h>
+#include <kernel/smp.h>
+#include <kernel/spinlock.h>
 #include <kernel/string.h>
 #include <kernel/syscall.h>
 #include <kernel/usermode.h>
@@ -1462,6 +1466,390 @@ static void test_filesystem(struct ktest_result *r)
     KT_ASSERT(r, hits > reads * 2);
 }
 
+/* ---- processors, the APIC and locks -----------------------------------
+ *
+ * Runs on one processor and on four, so every group checks either the real
+ * thing or the absence of it. A machine with no ACPI at all is a case this
+ * has to pass on too: the GRUB ISO path has ACPI, but a kernel that assumed
+ * it would be there would be wrong about a 486.
+ */
+static void test_smp(struct ktest_result *r)
+{
+    const struct acpi_info *ai = acpi_get_info();
+
+    /* --- ACPI ------------------------------------------------------------ */
+    if (ai->available) {
+        /* The root table parsed, so these are facts rather than guesses. */
+        KT_ASSERT(r, ai->tables_seen > 0);
+        KT_ASSERT(r, ai->oem_id[0] != '\0');
+
+        if (ai->madt_found) {
+            KT_ASSERT(r, ai->cpus_reported >= 1);
+            KT_ASSERT(r, ai->local_apic_phys != 0);
+            /* The local APIC's registers are a page, and the architecture
+             * requires that page to be aligned. A misaligned base means the
+             * MADT was misread. */
+            KT_ASSERT(r, (ai->local_apic_phys & (PAGE_SIZE - 1)) == 0);
+            KT_ASSERT(r, ai->cpu_count <= ai->cpus_reported);
+
+            /* Every processor ACPI described has a distinct APIC id. Two
+             * processors sharing one would make the id-to-index map
+             * ambiguous, and the symptom would be two CPUs believing they
+             * are the same CPU. */
+            for (u32 i = 0; i < ai->cpu_count; i++)
+                for (u32 j = i + 1; j < ai->cpu_count; j++)
+                    KT_ASSERT(r, ai->cpus[i].apic_id != ai->cpus[j].apic_id);
+        }
+
+        /* A table that is not there must come back NULL rather than as
+         * whatever the walk last looked at. */
+        KT_ASSERT(r, acpi_find_table("ZZZZ") == NULL);
+        KT_ASSERT(r, acpi_find_table(NULL) == NULL);
+
+        /* The FADT is in every ACPI implementation, so finding it proves the
+         * walk reaches more than the one table SMP needs. */
+        const struct acpi_sdt_header *fadt = acpi_find_table("FACP");
+
+        if (fadt) {
+            KT_ASSERT(r, memcmp(fadt->signature, "FACP", 4) == 0);
+            KT_ASSERT(r, fadt->length >= sizeof(*fadt));
+        }
+    }
+
+    /* --- the local APIC -------------------------------------------------- */
+    if (apic_available()) {
+        KT_ASSERT(r, apic_version() != 0);
+
+        /* The task priority register has to be zero, or this processor
+         * refuses interrupts below some priority - and the symptom is a CPU
+         * that comes up and then never takes one. */
+        KT_EQ(r, apic_read(APIC_TPR), 0u);
+
+        /* The software enable, and the spurious vector, exactly as
+         * configure_local() wrote them. */
+        u32 svr = apic_read(APIC_SPURIOUS);
+
+        KT_ASSERT(r, (svr & APIC_SW_ENABLE) != 0);
+        KT_EQ(r, svr & 0xFF, (u32)APIC_VECTOR_SPURIOUS);
+
+        /* This is the boot processor, so LINT0 must be ExtINT and not masked.
+         * Masking it is what cut the 8259s off from the CPU and stopped the
+         * timer; the symptom was every log line sharing one timestamp, which
+         * is not something a functional test would have noticed. */
+        u32 lint0 = apic_read(APIC_LVT_LINT0);
+
+        KT_EQ(r, lint0 & APIC_LVT_MASKED, 0u);
+        KT_EQ(r, lint0 & 0x700, (u32)APIC_LVT_EXTINT);
+
+        /* ...and the timer really is advancing, which is the property that
+         * mattered. */
+        u64 before = timer_ticks();
+        u32 spins = 0;
+
+        while (timer_ticks() == before && spins < 100000000u)
+            spins++;
+
+        KT_ASSERT(r, timer_ticks() > before);
+
+        /* No errors latched. The error register needs a write before a read
+         * to push the current state into it. */
+        apic_write(APIC_ESR, 0);
+        KT_EQ(r, apic_read(APIC_ESR), 0u);
+    }
+
+    /* --- the processor table --------------------------------------------- */
+    KT_ASSERT(r, smp_cpu_count() >= 1);
+    KT_ASSERT(r, smp_cpu_count() <= SMP_MAX_CPUS);
+    KT_ASSERT(r, smp_cpus_present() >= smp_cpu_count());
+    KT_ASSERT(r, smp_cpu(SMP_MAX_CPUS) == NULL);
+
+    u32 me = smp_cpu_index();
+
+    KT_ASSERT(r, me < SMP_MAX_CPUS);
+    KT_ASSERT(r, smp_this_cpu() == (struct cpu *)smp_cpu(me));
+
+    const struct cpu *self = smp_cpu(me);
+
+    KT_ASSERT(r, self != NULL);
+
+    if (self) {
+        KT_ASSERT(r, self->present);
+        KT_ASSERT(r, self->online);
+        /* The test suite runs on the boot processor, because that is where
+         * the scheduler runs. */
+        KT_ASSERT(r, self->is_bsp);
+        KT_EQ(r, self->index, me);
+
+        if (apic_available())
+            KT_EQ(r, (u32)self->apic_id, apic_id());
+    }
+
+    u32 online = 0, distinct = 1;
+
+    for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
+        const struct cpu *c = smp_cpu(i);
+
+        if (!c)
+            continue;
+
+        online++;
+        KT_EQ(r, c->index, i);
+
+        for (u32 j = i + 1; j < SMP_MAX_CPUS; j++) {
+            const struct cpu *o = smp_cpu(j);
+
+            if (o && o->apic_id == c->apic_id)
+                distinct = 0;
+        }
+
+        if (c->is_bsp)
+            continue;
+
+        /* Every application processor's stack is in the per-CPU region, with
+         * an unmapped guard page below it - the same arrangement as a task
+         * stack, for the same reason. */
+        vaddr_t base = c->stack_top - (16 * KIB);
+
+        KT_ASSERT(r, base >= CPUSTACK_BASE);
+        KT_ASSERT(r, c->stack_top <= CPUSTACK_BASE + CPUSTACK_REGION);
+        KT_ASSERT(r, vmm_translate(base, NULL));
+        KT_ASSERT(r, !vmm_translate(base - PAGE_SIZE, NULL));
+
+        /* It reached its idle loop, which is the only thing an application
+         * processor does in this phase. */
+        KT_ASSERT(r, c->idle_loops > 0);
+    }
+
+    KT_EQ(r, online, smp_cpu_count());
+    KT_EQ(r, distinct, 1u);
+
+    /* --- locks ----------------------------------------------------------- */
+    static spinlock_t probe = SPINLOCK_INIT("ktest-probe");
+
+    KT_ASSERT(r, !spin_is_locked(&probe));
+    KT_ASSERT(r, spin_trylock(&probe));
+    KT_ASSERT(r, spin_is_locked(&probe));
+
+    /* A second acquisition from this processor must fail rather than spin.
+     * spin_lock() would panic here, correctly - which is why this is the
+     * trylock, and why the panic is not something a passing test can
+     * check. */
+    KT_ASSERT(r, !spin_trylock(&probe));
+
+    u32 acquisitions = probe.acquisitions;
+
+    spin_unlock(&probe);
+    KT_ASSERT(r, !spin_is_locked(&probe));
+
+    /* Uncontended, so it counts an acquisition and no contention. */
+    KT_ASSERT(r, spin_trylock(&probe));
+    KT_EQ(r, probe.acquisitions, acquisitions + 1);
+    spin_unlock(&probe);
+
+    /* A lock taken with interrupts enabled must give them back, and one
+     * taken with them disabled must leave them disabled. Getting this
+     * backwards re-enables interrupts inside a critical section somebody
+     * else opened. */
+    KT_ASSERT(r, irq_enabled());
+    spin_lock(&probe);
+    KT_ASSERT(r, !irq_enabled());
+    spin_unlock(&probe);
+    KT_ASSERT(r, irq_enabled());
+
+    bool saved = irq_save();
+
+    KT_ASSERT(r, !irq_enabled());
+    spin_lock(&probe);
+    spin_unlock(&probe);
+    KT_ASSERT(r, !irq_enabled());
+    irq_restore(saved);
+    KT_ASSERT(r, irq_enabled());
+
+    /* --- inter-processor interrupts --------------------------------------- */
+    struct smp_stats ss;
+
+    smp_get_stats(&ss);
+    KT_EQ(r, ss.start_failures, 0u);
+
+    if (!smp_enabled()) {
+        /* One processor. Both paths still have to be callable and both still
+         * have to invalidate locally - a caller should not need to ask how
+         * many processors there are to get correct behaviour on its own. */
+        smp_ping_others();
+        smp_tlb_shootdown(KERNEL_VIRT_BASE);
+
+        struct smp_stats after;
+
+        smp_get_stats(&after);
+        KT_EQ(r, after.pings_sent, ss.pings_sent);
+        KT_EQ(r, after.shootdowns_sent, ss.shootdowns_sent);
+        return;
+    }
+
+    /* More than one. Every other processor must answer a ping. */
+    u32 before_ping[SMP_MAX_CPUS];
+
+    for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
+        const struct cpu *c = smp_cpu(i);
+
+        before_ping[i] = c ? c->ipi_ping : 0;
+    }
+
+    smp_ping_others();
+
+    /* Delivery is asynchronous, so wait - bounded, because an unanswered IPI
+     * is a result and not a reason to hang. */
+    for (u32 ms = 0; ms < 200; ms++) {
+        u32 answered = 0;
+
+        for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
+            const struct cpu *c = smp_cpu(i);
+
+            if (c && !c->is_bsp && c->ipi_ping > before_ping[i])
+                answered++;
+        }
+
+        if (answered >= smp_cpu_count() - 1)
+            break;
+
+        task_sleep_ms(1);
+    }
+
+    u32 answered = 0;
+
+    for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
+        const struct cpu *c = smp_cpu(i);
+
+        if (c && !c->is_bsp && c->ipi_ping > before_ping[i])
+            answered++;
+    }
+
+    KT_EQ(r, answered, smp_cpu_count() - 1);
+
+    /* And a TLB shootdown, which is the one that matters: it waits for every
+     * other processor to confirm it has dropped the translation, so a count
+     * that comes back short means a stale TLB entry survived somewhere. */
+    smp_get_stats(&ss);
+    smp_tlb_shootdown(KERNEL_VIRT_BASE + PAGE_SIZE);
+
+    struct smp_stats after;
+
+    smp_get_stats(&after);
+    KT_EQ(r, after.shootdowns_sent, ss.shootdowns_sent + 1);
+    KT_EQ(r, after.shootdowns_served - ss.shootdowns_served,
+          smp_cpu_count() - 1);
+}
+
+/* ---- the bootstrap page directory, and an ordering bug it found --------
+ *
+ * This exercises vmm_create_bootstrap_pd() and vmm_destroy_bootstrap_pd(),
+ * which exist for the application-processor trampoline. It is also a
+ * regression test, and the regression is worth describing because no
+ * functional test would have caught it.
+ *
+ * Both functions edit a page directory through a temporary mapping: map the
+ * frame at a fixed kernel address, write it, unmap. The compiler sees a store
+ * to the page table at one absolute address and accesses to the mapped frame
+ * at another, concludes they cannot alias, and reorders them - so the store
+ * that *tore down* the mapping was hoisted above the code still using it, and
+ * the result was a page fault on a page the kernel had just mapped.
+ *
+ * It had been latent since the copy-on-write work, where the same pattern
+ * happens to survive whatever GCC decides about the surrounding code. The fix
+ * is that page table entries are volatile and the map/unmap pair carries
+ * compiler barriers; this test is what notices if either is removed, because
+ * the failure is immediate and fatal rather than subtle.
+ */
+static void test_bootstrap_pd(struct ktest_result *r)
+{
+    struct pmm_stats before, after;
+
+    pmm_get_stats(&before);
+
+    paddr_t pd = vmm_create_bootstrap_pd();
+
+    KT_ASSERT(r, pd != 0);
+    KT_ASSERT(r, pd != vmm_kernel_pd_phys());
+
+    if (!pd)
+        return;
+
+    /* Read it back through a temporary mapping, which is the access pattern
+     * that was being reordered. */
+    paddr_t identity_pt = 0;
+    bool kernel_half_ok = true;
+
+    {
+        /* vmm_inspect_pd copies the entries out under the same temp-slot
+         * discipline, so a reordering bug shows up here as a fault. */
+        u32 slot0 = 0, recursive = 0, kernel_first = 0;
+
+        KT_ASSERT(r, vmm_inspect_pd(pd, 0, &slot0));
+        KT_ASSERT(r, vmm_inspect_pd(pd, 1023, &recursive));
+        KT_ASSERT(r, vmm_inspect_pd(pd, KERNEL_PDE_FIRST, &kernel_first));
+
+        /* Slot 0 identity-maps the first 4 MiB: that is the whole reason this
+         * directory exists, because a processor enabling paging while
+         * executing at a low physical address needs the next instruction to
+         * still be fetchable. */
+        KT_ASSERT(r, (slot0 & PTE_PRESENT) != 0);
+        KT_ASSERT(r, (slot0 & PTE_WRITE) != 0);
+        identity_pt = slot0 & PTE_ADDR_MASK;
+        KT_ASSERT(r, identity_pt != 0);
+
+        /* The recursive entry points at this directory and not at the
+         * kernel's. Copying the kernel's would give the new address space a
+         * window onto somebody else's page tables. */
+        KT_EQ(r, recursive & PTE_ADDR_MASK, pd);
+        KT_ASSERT(r, (recursive & PTE_PRESENT) != 0);
+
+        /* And the kernel's half came across, which is what makes the jump
+         * into the higher half work the instant paging is on. */
+        u32 expect = vmm_pde_raw(KERNEL_PDE_FIRST);
+
+        KT_EQ(r, kernel_first, expect);
+
+        u32 kernel_slots = 0;
+
+        for (u32 i = KERNEL_PDE_FIRST; i < 1023; i++) {
+            u32 got = 0;
+
+            kernel_slots++;
+            if (!vmm_inspect_pd(pd, i, &got) || got != vmm_pde_raw(i))
+                kernel_half_ok = false;
+        }
+
+        KT_EQ(r, kernel_slots, 1023u - KERNEL_PDE_FIRST);
+    }
+
+    KT_ASSERT(r, kernel_half_ok);
+
+    /* The user half below the identity map is empty: this directory is for a
+     * processor, not a process. Counted rather than asserted per slot - 767
+     * passing slots are one property, not 767 pieces of evidence. */
+    u32 user_slots = 0, user_nonempty = 0;
+
+    for (u32 i = 1; i < KERNEL_PDE_FIRST; i++) {
+        u32 got = 1;
+
+        user_slots++;
+        if (!vmm_inspect_pd(pd, i, &got) || got != 0)
+            user_nonempty++;
+    }
+
+    KT_EQ(r, user_slots, KERNEL_PDE_FIRST - 1);
+    KT_EQ(r, user_nonempty, 0u);
+
+    vmm_destroy_bootstrap_pd(pd);
+
+    /* Two frames in, two frames out: the directory and its identity page
+     * table. The kernel's own page tables are shared and must not have been
+     * touched, which is what the frame count proves. */
+    pmm_get_stats(&after);
+    KT_EQ(r, after.used_frames, before.used_frames);
+    KT_ASSERT(r, identity_pt != 0);
+}
+
 static const struct ktest tests[] = {
     {"string", "string and formatting primitives", test_string},
     {"boot", "boot protocol normalisation", test_boot},
@@ -1479,6 +1867,8 @@ static const struct ktest tests[] = {
      test_hardening},
     {"storage", "ATA PIO reads and the MBR partition table", test_storage},
     {"fs", "FAT16: geometry, paths, cluster chains", test_filesystem},
+    {"smp", "ACPI, the local APIC, per-CPU state, locks, IPIs", test_smp},
+    {"bootpd", "the AP bootstrap page directory", test_bootstrap_pd},
     {"ksyms", "embedded symbol table lookup", test_ksyms},
     {"profile", "sampling profiler attribution", test_profile},
 };

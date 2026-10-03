@@ -210,6 +210,11 @@ static void nmi_handler(struct regs *r)
             (void *)r->eip);
 }
 
+void idt_load(void)
+{
+    idt_flush(&idt_pointer);
+}
+
 void idt_init(void)
 {
     memset(idt, 0, sizeof(idt));

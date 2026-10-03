@@ -72,11 +72,52 @@ allocation-table and data sectors, halving its hit rate. Splitting it into
 two slots by purpose took the hit rate from 47% to 89%. Documented in
 [STORAGE.md](STORAGE.md).
 
+### Symmetric multiprocessing
+
+Landed in v0.8.0, with an explicit boundary: every processor is brought up and
+runs kernel code, locks are real, processors can interrupt each other and TLB
+shootdown is acknowledged — and the **scheduler still runs only on the boot
+processor**. Per-CPU run queues are the large remaining piece.
+
+ACPI's RSDP, RSDT/XSDT and MADT, every length and checksum validated; the
+local APIC mapped uncached and enabled, with ExtINT on LINT0 so the 8259s keep
+working; a 176-byte real-mode trampoline and INIT-SIPI-SIPI; per-CPU GDT
+entries, TSSes, stacks with guard pages; `spinlock_t` as a real
+test-and-test-and-set lock that masks interrupts first and is bounded; IPIs
+and TLB shootdown.
+
+Two bugs. Masking every local vector table entry — which looks correct —
+stopped the timer dead, because enabling the local APIC puts the 8259s behind
+LINT0 and a masked LINT0 cuts them off; the symptom was a kernel that booted
+perfectly with every log line sharing one timestamp. And the compiler was
+hoisting a `temp_unmap()` above the code still using the mapping, because it
+cannot see that a store to a page table entry changes where a later access
+*goes* — latent since the copy-on-write work, and now prevented by volatile
+page-table pointers and explicit barriers.
+
+Identifying the current processor was measured rather than assumed. Reading
+the local APIC's id register costs 453 cycles; reading the task register,
+which is already per-CPU because each processor needs its own TSS, costs 3.6.
+That is 125x, and it is on the context-switch path. Documented in
+[SMP.md](SMP.md).
+
 ---
 
 ## Next
 
-### 1. NX, and therefore real W^X
+### 1. Per-CPU run queues
+
+The scheduler runs on the boot processor and the other processors idle. What
+remains is the part that makes four processors useful rather than merely
+present: a run queue per processor, `current` becoming per-CPU, work stealing
+when one queue empties, a reschedule IPI, and every scheduler invariant
+re-examined for two processors entering it at once.
+
+It needs the local APIC timer first - the single 8254 cannot drive four
+processors - which is item 8 below, and that makes this the one item in this
+list whose dependencies are not already in place.
+
+### 2. NX, and therefore real W^X
 
 The one piece of hardening that is a project rather than a patch. A 32-bit
 page table entry has no execute-disable bit, so the kernel's text is
@@ -95,7 +136,7 @@ needs. Everything else in [SECURITY.md](SECURITY.md#what-is-missing) is
 smaller: UMIP is a CR4 bit, KASLR is relocations, and `-fstack-protector`
 wants the per-CPU area the SMP work brings.
 
-### 2. Interrupt-driven serial transmit
+### 3. Interrupt-driven serial transmit
 
 `console_write` currently holds interrupts off for the whole of a polled UART
 write. On QEMU that is free; on real hardware at 115200 it is ~87 µs per
@@ -105,21 +146,21 @@ Needs: a transmit ring buffer, the THR-empty interrupt enabled in IER, and a
 drain path in the existing `serial_irq`. The panic path has to keep polling,
 because it cannot rely on interrupts.
 
-### 3. Reclaim empty page tables
+### 4. Reclaim empty page tables
 
 Unmapping the last page in a 4 MiB region leaves its table allocated. Needs a
 per-table mapped-page count, decremented in `vmm_unmap`, freeing the frame and
 clearing the directory entry at zero — and a `tlb` flush of the recursive
 window entry for that slot.
 
-### 4. Symbolising the profiler's call graph
+### 5. Symbolising the profiler's call graph
 
 Samples are attributed to the leaf function only, so a helper called from
 several places aggregates all of its callers together. Walking the
 frame-pointer chain at sample time would fix it, and the backtrace code
 already exists - see [PERFORMANCE.md](PERFORMANCE.md).
 
-### 5. Writing to the filesystem, and a VFS
+### 6. Writing to the filesystem, and a VFS
 
 Reading is done. Writing means allocating from the FAT, updating both copies
 of it, extending a directory entry's size and cluster chain, and surviving
@@ -132,25 +173,24 @@ interface is an interface with one implementation, and the second
 implementation is what shows whether the interface was right. Long filenames
 and `argv` for `exec` are the two smaller gaps the current driver leaves.
 
-### 6. A slab allocator over the heap
+### 7. A slab allocator over the heap
 
 The heap is one arena, so a long-lived small allocation can keep a large region
 from coalescing. Per-size caches for the common fixed-size objects (`struct
 task`, page-table wrappers) would fix the fragmentation and speed up the common
 path. `heap_check()` already exists to validate the result.
 
-### 7. APIC and the HPET
+### 8. The I/O APIC, and the local APIC timer
 
-The 8259 and 8254 are legacy. The local APIC timer and the I/O APIC are what
-real hardware uses, and the local APIC is a prerequisite for SMP. `cpu.c`
-already detects the APIC feature bit.
+The MADT's I/O APIC entries and its interrupt source overrides are already
+parsed - including that IRQ 0 arrives as GSI 2 on QEMU, which a kernel that
+assumed otherwise would lose its timer to. Nothing is programmed yet: device
+interrupts still go through the 8259s to the boot processor, so there is no
+interrupt distribution and no affinity.
 
-### 8. SMP
-
-Needs: ACPI MADT parsing to find the other cores, a trampoline to bring them
-out of reset in real mode, per-CPU data, and — at last — `spinlock_t` becoming
-a real spinlock. `kernel/core/spinlock.c` is written so that this is a change
-of implementation rather than a change of every call site.
+The local APIC timer belongs with it, and is the prerequisite for item 1: the
+single 8254 cannot drive four processors, so per-CPU preemption needs a timer
+per CPU.
 
 ### 9. A `/proc`
 

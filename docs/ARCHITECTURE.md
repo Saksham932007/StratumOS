@@ -4,12 +4,12 @@
 
 ```
                          ┌──────────────────────────┐
-                         │   shell (task, ring 0)   │  29 commands, history
+                         │   shell (task, ring 0)   │  31 commands, history
                          └────────────┬─────────────┘
                                       │
    ┌──────────────┐      ┌────────────┴─────────────┐      ┌──────────────┐
    │ init, hello  │      │        scheduler         │      │   ktest      │
-   │ (ring 3)     │◄────►│  round robin, 100 Hz     │      │ 17 suites    │
+   │ (ring 3)     │◄────►│  round robin, 100 Hz     │      │ 19 suites    │
    └──────┬───────┘      └────────────┬─────────────┘      └──────────────┘
           │ int 0x80                  │
    ┌──────┴───────┐                   │  fork / exec / wait
@@ -33,7 +33,8 @@
    ┌─────────────────┴──────────────┴────────────────────────────────┴──────┐
    │                        arch/x86                                       │
    │   gdt+tss · idt (256 vectors) · irq (8259 PIC) · cpu (CPUID)          │
-   │   harden (SMEP/SMAP, W^X, the kernel/user split)                      │
+   │   harden (SMEP/SMAP, W^X)  ·  acpi (MADT)  ·  apic (IPIs)             │
+   │   ap_boot.asm: a second processor, real mode to the higher half       │
    │   isr.asm · switch.asm · usermode.asm · boot.asm                      │
    └───────────────────────────────┬───────────────────────────────────────┘
                                    │
@@ -71,11 +72,12 @@ out of sequence.
 | 13 | `heap_init` | Needs paging, because the heap is a virtual window backed on demand. |
 | 14 | `vmm_protect_kernel_text`, `harden_init` | Must follow paging, and must precede any second address space or any user program. Narrowing the kernel's own text needs one address space to narrow it in, and turning SMAP on afterwards would fault inside code already written without the `stac`/`clac` discipline. |
 | 15 | `rtc_init`, `pci_init` | Non-essential hardware. A failure is logged, not fatal. |
-| 16 | `ata_init`, `blockdev_init`, `fat16_mount` | Needs the heap, because the filesystem allocates. The ATA driver polls, so it needs nothing from the interrupt layer. Mounting is *allowed to fail*: the GRUB ISO path has no FAT partition, and a kernel that refused to boot without one could not be tested through both of its loaders. |
-| 17 | `sched_init` | Adopts the boot context as pid 0. |
-| 18 | `syscall_init` | Needs the IDT; re-installs vector 0x80 with DPL 3. |
-| 19 | task creation | Needs the scheduler, the stack region the VMM reserved, and - for `init` - the filesystem, which it reads its own image from. |
-| 20 | `sched_start` | The boot context becomes the idle task and never returns. |
+| 16 | `acpi_init`, `apic_init_bsp`, `smp_init` | Needs the VMM, because the firmware tables sit outside the linear map, and the heap. Must come *after* the hardening step: a processor brought up before SMAP was enabled would be running with it off. Enabling the local APIC is also what puts the 8259s behind LINT0, which is why that pin is programmed as ExtINT rather than masked. |
+| 17 | `ata_init`, `blockdev_init`, `fat16_mount` | Needs the heap, because the filesystem allocates. The ATA driver polls, so it needs nothing from the interrupt layer. Mounting is *allowed to fail*: the GRUB ISO path has no FAT partition, and a kernel that refused to boot without one could not be tested through both of its loaders. |
+| 18 | `sched_init` | Adopts the boot context as pid 0. |
+| 19 | `syscall_init` | Needs the IDT; re-installs vector 0x80 with DPL 3. |
+| 20 | task creation | Needs the scheduler, the stack region the VMM reserved, and - for `init` - the filesystem, which it reads its own image from. |
+| 21 | `sched_start` | The boot context becomes the idle task and never returns. |
 
 ### The `sti()` placement
 
@@ -201,5 +203,6 @@ cleanly instead of walking off into the heap.
 - [PROCESSES.md](PROCESSES.md) — address spaces, fork, copy-on-write, exec, wait
 - [SECURITY.md](SECURITY.md) — the mitigations, how each is enforced, and what is missing
 - [STORAGE.md](STORAGE.md) — the ATA driver, the partition table, FAT16, and where a program comes from
+- [SMP.md](SMP.md) — ACPI, the APIC, the AP trampoline, real locks, TLB shootdown
 - [PERFORMANCE.md](PERFORMANCE.md) — benchmarks, the profiler, the symbol table
 - [DESIGN-DECISIONS.md](DESIGN-DECISIONS.md) — the trade-offs behind the above

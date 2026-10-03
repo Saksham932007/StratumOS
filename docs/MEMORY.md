@@ -36,9 +36,11 @@ in. See [PROCESSES.md](PROCESSES.md) for what that buys.
   0xC00B8000              the VGA text framebuffer (physical 0xB8000)
   0xC0100000              the kernel image (loaded at physical 0x100000)
   0xC012E000              the frame-allocator bitmap
+0xCE000000 - 0xCE800000   MMIO window: firmware tables, the local APIC
 0xCF000000 - 0xCF001FFF   two temporary frame-mapping slots (see below)
 0xD0000000 - 0xD4000000   kernel heap window, backed on demand, 64 MiB max
 0xE0000000 - 0xE0400000   kernel task stacks, each behind a guard page
+0xE8000000 - 0xE8100000   per-processor stacks, each behind a guard page
 ...
 0xFFC00000 - 0xFFFFEFFF   recursive window: every page table
 0xFFFFF000 - 0xFFFFFFFF   recursive window: the page directory itself
@@ -345,6 +347,23 @@ deliberately never mapped, so an overflow is a page fault that names the guard
 page and the function that overran. Details in
 [SECURITY.md](SECURITY.md#stack-guard-pages).
 
+### The MMIO window
+
+The linear map covers the first 16 MiB of physical memory, which is where RAM
+and the VGA framebuffer are. Two things that arrived with SMP are not there:
+the local APIC sits at `0xFEE00000`, just below 4 GiB, and QEMU puts the ACPI
+tables at `0x07FE0000` on a 128 MiB machine — eight times beyond the linear
+map's reach.
+
+`vmm_map_mmio(phys, bytes, uncached)` is a bump pointer over an 8 MiB window,
+because every mapping in it is permanent: a device's registers are needed for
+as long as the kernel runs, so there is nothing to reclaim.
+
+The `uncached` flag sets `PTE_PCD`, and device registers must have it. A
+cached read of a status register can return a value the device has already
+changed, and a cached write may never reach it at all. Firmware tables are
+ordinary memory and want caching.
+
 ### Temporary mapping slots
 
 The recursive window reaches the *current* address space's tables only, and
@@ -514,6 +533,12 @@ elsewhere has every string literal pointing where ring 3 cannot read. See
 - **No demand paging.** Every fault is a bug, or a copy-on-write fault.
 - **No swap, no page replacement, no memory pressure handling.** `kmalloc`
   returns `NULL` when the heap cannot grow, and callers are expected to check.
+- **Page table entries are volatile, and the map/unmap pair carries
+  barriers.** Not a limitation but a constraint worth knowing about: a store
+  to a page table entry changes where a later access *goes*, which the
+  compiler cannot see. It reordered them, and the result was a page fault on a
+  mapping the kernel had just made. See
+  [SMP.md](SMP.md#the-compiler-unmapped-a-page-the-kernel-was-still-using).
 - **The kernel half costs 1 MiB of page tables** at boot, because all 255
   directory slots are backed up front. Reserving only the regions in use
   would cost 84 KiB and leave a list to keep in step with the layout.

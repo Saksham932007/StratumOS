@@ -12,6 +12,8 @@
  */
 #define LOG_TAG "shell"
 
+#include <arch/acpi.h>
+#include <arch/apic.h>
 #include <arch/cpu.h>
 #include <arch/harden.h>
 #include <arch/io.h>
@@ -36,6 +38,7 @@
 #include <kernel/profile.h>
 #include <kernel/sched.h>
 #include <kernel/shell.h>
+#include <kernel/smp.h>
 #include <kernel/string.h>
 #include <kernel/syscall.h>
 #include <kernel/usermode.h>
@@ -439,6 +442,144 @@ static int cmd_selftest(int argc, char **argv)
     }
 
     return failed == 0 ? 0 : 1;
+}
+
+/* ---- processors --------------------------------------------------------- */
+
+static int cmd_cpus(int argc, char **argv)
+{
+    UNUSED(argc);
+    UNUSED(argv);
+
+    const struct acpi_info *ai = acpi_get_info();
+    struct apic_stats as;
+    struct smp_stats ss;
+
+    apic_get_stats(&as);
+    smp_get_stats(&ss);
+
+    kprintf("Firmware\n");
+    if (ai->available)
+        kprintf("  ACPI      : %s from \"%s\", %u table(s)%s\n",
+                ai->used_xsdt ? "XSDT" : "RSDT", ai->oem_id, ai->tables_seen,
+                ai->madt_found ? ", MADT parsed" : ", no MADT");
+    else
+        kprintf("  ACPI      : no tables on this machine\n");
+
+    if (ai->madt_found) {
+        kprintf("  reports   : %u processor(s), %u I/O APIC(s), "
+                "%u interrupt override(s)\n",
+                ai->cpus_reported, ai->ioapic_count, ai->iso_count);
+        for (u32 i = 0; i < ai->iso_count; i++)
+            kprintf("              ISA IRQ %u arrives as GSI %u\n",
+                    ai->isos[i].source, ai->isos[i].gsi);
+    }
+
+    kprintf("Local APIC\n");
+    if (apic_available())
+        kprintf("  enabled   : id %u, version %02x; %u IPI(s) sent, %u EOI(s), "
+                "%u spurious, %u error(s)\n",
+                apic_id(), apic_version() & 0xFF, as.ipis_sent, as.eois,
+                as.spurious, as.errors);
+    else
+        kprintf("  absent    : this kernel is running on the 8259s alone\n");
+
+    kprintf("Processors (%u online of %u reported)\n", smp_cpu_count(),
+            smp_cpus_present());
+    kprintf("  %4s %5s %5s %-9s %10s %8s %8s %12s\n", "CPU", "APIC", "ROLE",
+            "STATE", "STACK", "PINGS", "TLB", "IDLE LOOPS");
+
+    for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
+        const struct cpu *c = smp_cpu(i);
+
+        if (!c)
+            continue;
+
+        kprintf("  %4u %5u %5s %-9s %10p %8u %8u %12llu%s\n", c->index,
+                c->apic_id, c->is_bsp ? "bsp" : "ap",
+                c->online ? "online" : "OFFLINE", (void *)c->stack_top,
+                c->ipi_ping, c->ipi_tlb, c->idle_loops,
+                c->index == smp_cpu_index() ? "  <- this one" : "");
+    }
+
+    kprintf("  IPIs      : %u ping(s) sent, %u shootdown(s) sent, "
+            "%u served, %u start failure(s)\n",
+            ss.pings_sent, ss.shootdowns_sent, ss.shootdowns_served,
+            ss.start_failures);
+
+    if (!smp_enabled())
+        kprintf("  (one processor: the scheduler, the locks and the IPI "
+                "paths all still work, there is just nobody to talk to)\n");
+    else
+        kprintf("  The scheduler runs on cpu %u only; the others service "
+                "interrupts. See docs/SMP.md.\n",
+                0u);
+
+    return 0;
+}
+
+/* Prove the inter-processor interrupt path from the keyboard, rather than
+ * inferring it from the fact that nothing has broken. */
+static int cmd_ipi(int argc, char **argv)
+{
+    UNUSED(argc);
+    UNUSED(argv);
+
+    if (!smp_enabled()) {
+        kprintf("only one processor is online; there is nobody to ping\n");
+        return 1;
+    }
+
+    u32 before[SMP_MAX_CPUS];
+
+    for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
+        const struct cpu *c = smp_cpu(i);
+
+        before[i] = c ? c->ipi_ping : 0;
+    }
+
+    kprintf("broadcasting a ping IPI to every other processor...\n");
+    smp_ping_others();
+
+    /* The IPI is delivered asynchronously; give the other processors a
+     * moment to take it. A sleep rather than a spin, because this task has
+     * no business holding a CPU while it waits. */
+    task_sleep_ms(50);
+
+    u32 answered = 0;
+
+    for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
+        const struct cpu *c = smp_cpu(i);
+
+        if (!c || c->index == smp_cpu_index())
+            continue;
+
+        kprintf("  cpu %u: %u -> %u ping(s)%s\n", c->index, before[i],
+                c->ipi_ping,
+                c->ipi_ping > before[i] ? "" : "   <- no response!");
+
+        if (c->ipi_ping > before[i])
+            answered++;
+    }
+
+    kprintf("%u of %u other processor(s) answered\n", answered,
+            smp_cpu_count() - 1);
+
+    kprintf("\nnow a TLB shootdown, which waits for every processor to "
+            "acknowledge:\n");
+
+    struct smp_stats ss_before, ss_after;
+
+    smp_get_stats(&ss_before);
+    smp_tlb_shootdown(KERNEL_VIRT_BASE);
+    smp_get_stats(&ss_after);
+
+    kprintf("  %u shootdown(s) sent, %u served (was %u)\n",
+            ss_after.shootdowns_sent - ss_before.shootdowns_sent,
+            ss_after.shootdowns_served - ss_before.shootdowns_served,
+            ss_before.shootdowns_served);
+
+    return answered == smp_cpu_count() - 1 ? 0 : 1;
 }
 
 /* ---- the filesystem ---------------------------------------------------- */
@@ -1101,6 +1242,9 @@ static const struct shell_command commands[] = {
     {"syms", "syms <address>", "resolve an address to a symbol", cmd_syms},
     {"ring3", "ring3", "run the user-mode demo", cmd_ring3},
     {"programs", "programs", "list the programs exec() can run", cmd_programs},
+    {"cpus", "cpus", "processors, ACPI and the local APIC", cmd_cpus},
+    {"ipi", "ipi", "ping every other processor and time a TLB shootdown",
+     cmd_ipi},
     {"disk", "disk", "ATA drives and block devices", cmd_disk},
     {"mount", "mount", "the mounted filesystem's geometry and activity",
      cmd_mount},

@@ -1,31 +1,38 @@
 # StratumOS
 
 A 32-bit x86 kernel and bootloader, written from scratch in C and assembly.
-It takes a machine from the BIOS's first instruction in 16-bit real mode all
-the way to a preemptively scheduled, higher-half, paged kernel running an
-interactive shell and a separate user-space program in ring 3.
+It takes a machine from the BIOS's first instruction in 16-bit real mode to a
+preemptively scheduled, higher-half, paged kernel with per-process address
+spaces, copy-on-write `fork`, `exec` from a FAT16 filesystem on disk, and a
+hardened kernel/user boundary enforced by SMEP, SMAP and `CR0.WP`.
 
 [![CI](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml/badge.svg)](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml)
-![language](https://img.shields.io/badge/C11%20%2B%20NASM-19.5k%20lines-blue)
+![language](https://img.shields.io/badge/C11%20%2B%20NASM-22.4k%20lines-blue)
 ![arch](https://img.shields.io/badge/arch-x86%20(i686)-lightgrey)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 The same kernel binary boots two ways — through a bootloader written for this
-project, and through GRUB via Multiboot2 — and every push runs 485 assertions
-across 92 host unit tests, 17 in-kernel suites, and seven QEMU boot scenarios.
+project, and through GRUB via Multiboot2 — and every push runs 576 assertions
+across 92 host unit tests, 19 in-kernel suites, and eight QEMU boot scenarios.
+Two of those scenarios are required to **panic**, because a mitigation has two
+halves and only one of them can be checked by a test that passes.
 
 ```
-BIOS ─► stage 1 (512 B MBR) ─► stage 2 ─► 32-bit protected mode ─► kernel ─► ring 3
-         LBA/CHS disk I/O      A20 gate    flat GDT              higher half  separate
-         retry + verify        E820 map    ELF32 loader           @0xC0000000   ELF
-                                                                   paging    syscalls
-                        GRUB ─► Multiboot2 ─────────────────────► heap, sched  int 0x80
+BIOS ─► stage 1 ─────► stage 2 ─────► protected mode ─► kernel ──────► /bin/INIT ─► ring 3
+        512 B MBR      A20 gate       flat GDT          higher half    ATA PIO      fork
+        LBA + CHS      E820 map       CR0.PE            @0xC0000000    MBR table    COW
+        retry/verify   32 KiB reads   ELF32 loader      paging, heap   FAT16        exec
+        + partition                                     SMEP/SMAP                   wait
+          table                                         W^X                       int 0x80
+
+               GRUB ─► Multiboot2 ─────────────────────► (same kernel binary)
 ```
 
 ---
 
 ## Contents
 
+- [The parts worth looking at](#the-parts-worth-looking-at)
 - [What this actually does](#what-this-actually-does)
 - [Quick start](#quick-start)
 - [What it looks like running](#what-it-looks-like-running)
@@ -38,6 +45,60 @@ BIOS ─► stage 1 (512 B MBR) ─► stage 2 ─► 32-bit protected mode ─�
 - [Bugs this project found and fixed](#bugs-this-project-found-and-fixed)
 - [What is deliberately not here](#what-is-deliberately-not-here)
 - [Documentation](#documentation)
+
+---
+
+## The parts worth looking at
+
+Five things in here were harder than they look, and each has a document that
+explains the reasoning rather than the code.
+
+**One binary, two boot protocols.** `build/stratum.elf` is a single file.
+GRUB finds a Multiboot2 header in it; the bootloader in `boot/` parses its ELF
+program headers and copies the segments itself. The kernel works out which one
+loaded it from the magic in `EAX`, and CI boots both paths on every push — so
+a regression that silently falls back to one is caught.
+→ [docs/BOOT.md](docs/BOOT.md)
+
+**Copy-on-write that is proved, not claimed.** `fork` marks every writable
+page read-only in *both* parent and child and bumps a per-frame reference
+count. Marking only the child is the subtle wrong answer, and its symptom is a
+parent whose data is occasionally, quietly wrong. The ring-3 program writes to
+an inherited page and the parent checks its own copy is intact, which is the
+only externally visible difference between correct copy-on-write and a shared
+page.
+→ [docs/PROCESSES.md](docs/PROCESSES.md)
+
+**`exec` returns by rewriting its own trap frame.** It cannot return normally:
+the code that issued `int 0x80` was in the image it just unmapped. So it
+edits `EIP` and `ESP` in the frame the syscall is about to `IRET` through, and
+the ordinary interrupt-return path delivers control into the new program.
+→ [docs/PROCESSES.md](docs/PROCESSES.md#exec)
+
+**SMAP turned "anywhere" into a list of five.** Enabling it forced every place
+the kernel deliberately touches user memory to declare itself with
+`stac`/`clac`. On its first boot it faulted the test suite — which writes to a
+user page from ring 0 to prove copy-on-write works and had never declared the
+access. A mitigation that finds a defect in the same change that introduces it
+has earned its two instructions.
+→ [docs/SECURITY.md](docs/SECURITY.md#smep-and-smap)
+
+**A cache decision made by measurement, against my own reasoning.** The FAT
+driver shipped with one cached sector and a comment explaining that a second
+would buy nothing. The test suite reads a file in 64-byte chunks — eight
+touches per sector, so seven of eight should hit — and fewer than half did,
+because FAT sectors and data sectors were evicting each other. Splitting the
+cache by purpose took the hit rate from 47% to 89%.
+→ [docs/STORAGE.md](docs/STORAGE.md#the-cache-and-what-measuring-it-changed)
+
+And one piece of test design that the rest depends on: **two CI scenarios
+whose expected result is a panic.** The `harden` suite proves the kernel's
+`.text` has no write bit in its page table entry; it cannot prove the CPU acts
+on that, because the correct outcome of trying is a dead kernel. So
+`fault-text` and `fault-stackguard` each boot a kernel, type one command, and
+require the panic to name the right address, reason and region — and require
+QEMU to exit 35.
+→ [docs/TESTING.md](docs/TESTING.md#scenarios-that-must-panic)
 
 ---
 
@@ -73,7 +134,11 @@ Concretely, from power-on:
    own, and entered at ring 3, where it probes the syscall boundary from the
    untrusted side, `fork`s, proves copy-on-write from inside the child,
    `wait`s for it, and then `exec`s a different image into a second child.
-8. **The shell** runs as a scheduled task, reachable from the VGA console or
+8. **Every other processor** is found through ACPI's MADT and taken out of
+   reset with INIT-SIPI-SIPI, each one repeating the 16-bit → 32-bit → paging
+   → higher-half journey in a 176-byte trampoline before landing in C with
+   its own GDT entry, TSS, stack and local APIC.
+9. **The shell** runs as a scheduled task, reachable from the VGA console or
    over a serial line, with line editing and command history.
 
 Along the way the kernel narrows its own permissions: its `.text` and
@@ -98,7 +163,7 @@ cd StratumOS
 make              # kernel, disk image, GRUB ISO, and the test images
 make run          # boot through the custom bootloader
 make run-iso      # boot through GRUB / Multiboot2
-make test         # host unit tests + three QEMU boot scenarios
+make test         # host unit tests + seven QEMU boot scenarios
 ```
 
 `make toolchain` reports exactly which tools were found. An `i686-elf-gcc`
@@ -115,6 +180,8 @@ Other useful targets:
 | `make sections` | dump the image layout and re-run the pre-boot validator |
 | `make bench` | run the microbenchmarks and a profile, then exit |
 | `make test-host` | host unit tests only (no emulator, ~1 second) |
+| `make fs` | rebuild the FAT16 filesystem image and describe its layout |
+| `make image-check` | validate a built disk image: MBR, BPB, `/BIN` contents |
 | `make lines` | line counts by subsystem |
 
 ---
@@ -133,7 +200,7 @@ StratumOS stage2
   [->] entering protected mode
 
   .-----------------------------------------------------.
-  | StratumOS 0.7.0  -  x86 kernel: real mode to ring 3 |
+  | StratumOS 0.8.0  -  x86 kernel: real mode to ring 3 |
   '-----------------------------------------------------'
 [    0.000] INFO  boot: serial COM1        [ok] 115200 8N1
 [    0.000] INFO  boot: CPU detect         [ok] GenuineIntel
@@ -150,14 +217,17 @@ StratumOS stage2
 [    0.040] INFO  vmm: kernel .text and .rodata mapped read-only (43 pages); CR0.WP makes that binding on ring 0 too
 [    0.050] INFO  harden: SMEP enabled, SMAP enabled
 [    0.050] INFO  boot: hardening          [ok] W^X, guard pages, SMEP + SMAP
-[    0.060] INFO  pci: 6 PCI devices found
+[    0.040] INFO  pci: 6 PCI devices found
+[    0.040] INFO  acpi: MADT: 4 processor(s), 1 I/O APIC(s), 5 interrupt override(s), local APIC at 0xfee00000, 8259 PICs present
+[    0.050] INFO  apic: local APIC at 0xfee00000 -> 0xce003000, id 0, version 14, 6 LVT entries
+[    0.050] INFO  smp: 4 of 4 processor(s) online
 [    0.060] INFO  ata: hd0: QEMU HARDDISK, 36864 sectors (18 MiB), LBA48
 [    0.070] INFO  blk: hd0p1: type 0e (FAT), LBA 2048 + 32768 sectors (16384 KiB)
 [    0.070] INFO  fat: mounted hd0p1: FAT16 "STRATUM", 16384 KiB, 8167 clusters of 2 KiB
 [    0.070] INFO  boot: filesystem         [ok] FAT16 "STRATUM" on hd0p1
 [    0.070] INFO  sched: scheduler ready; boot context adopted as pid 0 (idle)
 [    0.070] INFO  syscall: syscall gate installed at int 0x80 (11 calls available)
-[    0.080] INFO  boot: StratumOS 0.7.0 is up: 127 MiB RAM, 6 PCI devices, 17 test suites
+[    0.080] INFO  boot: StratumOS 0.8.0 is up: 127 MiB RAM, 6 PCI devices, 19 test suites
 ```
 
 Ring 3, exercising the syscall boundary from the untrusted side, then
@@ -230,6 +300,25 @@ stratum> ps
      2     0  shell          running   ring0 kernel         104       7
      3     2  init           zombie    ring3 -                2       4
   4 tasks, 22 context switches total
+
+stratum> cpus
+Processors (4 online of 4 reported)
+   CPU  APIC  ROLE STATE          STACK    PINGS      TLB   IDLE LOOPS
+     0     0   bsp online    0x00000000        0        0            0  <- this one
+     1     1    ap online    0xe800a000        0        0            1
+     2     2    ap online    0xe800f000        0        0            1
+     3     3    ap online    0xe8014000        0        0            1
+  The scheduler runs on cpu 0 only; the others service interrupts. See docs/SMP.md.
+
+stratum> ipi
+broadcasting a ping IPI to every other processor...
+  cpu 1: 0 -> 1 ping(s)
+  cpu 2: 0 -> 1 ping(s)
+  cpu 3: 0 -> 1 ping(s)
+3 of 3 other processor(s) answered
+
+now a TLB shootdown, which waits for every processor to acknowledge:
+  1 shootdown(s) sent, 3 served (was 0)
 
 stratum> disk
 ATA drives
@@ -368,12 +457,17 @@ Everything marked ✅ is implemented and covered by a test.
 | ✅ | **MBR partition table** parsed from the same sector stage 1 boots from |
 | ✅ | **Read-only FAT16** — BPB validation, cluster chains, subdirectories, 8.3 names, a two-slot sector cache |
 | ✅ | **`/bin/INIT` is read off the disk** before ring 3 is entered; the embedded copies are the fallback for the ISO boot path |
+| ✅ | **ACPI**: RSDP, RSDT/XSDT and the MADT, every length and checksum validated |
+| ✅ | **Local APIC** mapped uncached, enabled, with ExtINT on LINT0 so the 8259s keep working |
+| ✅ | **Every processor brought up** — 176-byte real-mode trampoline, INIT-SIPI-SIPI, per-CPU GDT entry, TSS, stack and guard page |
+| ✅ | **Real spinlocks** — test-and-test-and-set, `PAUSE`, bounded, interrupts masked first, contention counted |
+| ✅ | **IPIs and TLB shootdown**, acknowledged by every processor before the sender continues |
 | ✅ | Drivers: 16550 (in and out), VGA text, PIT, PS/2 keyboard, CMOS RTC, PCI |
 | ✅ | `kprintf` with width/precision/64-bit support, levelled logging |
 | ✅ | 64-bit division helpers — the kernel links against nothing at all |
-| ✅ | 29-command shell with line editing, history, and fault injection |
+| ✅ | 31-command shell with line editing, history, and fault injection |
 | ✅ | Embedded symbol table: panics print `function+0x1c`, no addr2line needed |
-| ✅ | 11 TSC-calibrated microbenchmarks, overhead-subtracted, median of 24 |
+| ✅ | 14 TSC-calibrated microbenchmarks, overhead-subtracted, median of 24 |
 | ✅ | Timer-driven sampling profiler with symbol attribution |
 
 ---
@@ -416,19 +510,21 @@ The kernel measures itself. `make bench` calibrates the TSC against the PIT,
 runs eleven microbenchmarks, takes a sampling profile, and exits — and CI
 asserts on every figure.
 
-Measured under QEMU TCG at a calibrated 2099 MHz, median of 24 samples, with
-the harness's own overhead subtracted:
+Measured under QEMU TCG at a calibrated 2100 MHz, median of 24 samples, with
+the harness's own 2306-cycle overhead subtracted:
 
 | Benchmark | Cycles | Time | |
 |---|---:|---:|---|
-| virtual → physical translation | 60 | 28.6 ns | two loads through the recursive window |
-| heap integrity walk | 155 | 73.7 ns | every block's header and footer magic |
-| physical frame alloc + free | 376 | 179.3 ns | bitmap scan, 32 frames per word |
-| `kmalloc(64)` + `kfree` | 414 | 197.2 ns | first-fit, split, coalesce, guards |
-| map + unmap a 4 KiB page | 495 | 236.0 ns | includes `invlpg` |
-| context switch | 610 | 290.4 ns | stack swap + scheduler bookkeeping |
-| `int 0x80` round trip | 1360 | 647.8 ns | heavily emulation-distorted |
-| `memcpy` 4 KiB | 6060 | 2886.7 ns | 1.48 cycles/byte, dword path |
+| virtual → physical translation | 55 | 26.3 ns | two loads through the recursive window |
+| heap integrity walk | 58 | 27.8 ns | every block's header and footer magic |
+| context switch | 654 | 311.3 ns | `CR3` swap, stack swap, canary check, bookkeeping |
+| physical frame alloc + free | 733 | 349.2 ns | bitmap scan, 32 frames per word |
+| `kmalloc(64)` + `kfree` | 962 | 458.0 ns | first-fit, split, coalesce, guards |
+| map + unmap a 4 KiB page | 1054 | 502.1 ns | includes `invlpg` |
+| `int 0x80` round trip | 1488 | 708.6 ns | heavily emulation-distorted |
+| `ksnprintf` | 2666 | 1269.3 ns | width, precision and 64-bit division |
+| `memset` 4 KiB | 4977 | 2369.8 ns | dword path |
+| `memcpy` 4 KiB | 6767 | 3222.2 ns | 1.65 cycles/byte, dword path |
 
 **These are emulated costs, not silicon timings** — and the harness says so
 itself, detecting the hypervisor via CPUID and printing the caveat with every
@@ -444,26 +540,38 @@ table:
 stratum> profile run 1500
 
   SAMPLES   SHARE  FUNCTION
-       40   57.1%  kmalloc
-       16   22.8%  kfree
-       13   18.5%  emit_number      <- the formatter's digit loop
-        1    1.4%  ksnprintf
+       32   45.7%  kmalloc
+       24   34.2%  kfree
+       14   20.0%  emit_number      <- the formatter's digit loop
 ```
 
 That workload was allocator traffic plus integer formatting, and the profile
-finds exactly that — including separating `emit_number` from the `ksnprintf`
-that calls it. CI asserts `kmalloc` tops that list, so a regression in
-attribution fails the build instead of producing a quietly flat profile.
+finds exactly those three — including separating `emit_number` from the
+`ksnprintf` that calls it.
 
-The same 559-symbol table makes panics readable with nothing but a serial log:
+CI asserts all three appear with a share, and that the *top* entry is one of
+them rather than some unrelated function. Which of the three leads moves
+between runs with host scheduling noise — 29/23/18 one time, 32/24/14 the
+next — so naming a specific winner would be asserting a coin flip. The
+property worth testing is that attribution still discriminates, and a flaky
+test is worse than a loose one.
+
+The same 612-symbol table makes panics readable with nothing but a serial log.
+This is a real one, from the CI scenario that deliberately writes to the
+kernel's own `.text`:
 
 ```
-  EIP 0010cab4  CS  0008      EFLAGS 00000286
-  at  cmd_fault+0x124
+ page fault at 0xc0103000 in the kernel's own code or constants, which are read-only
+
+  EIP c01184fe  CS  0008      EFLAGS 00000286
+  at  cmd_fault+0x17e
+  vector 14 (Page Fault)  error 00000003
+  CR0 80010011  CR2 c0103000  CR3 00101000  CR4 00300000
+
 Call trace (return addresses; the faulting frame is EIP above):
-  [0] 0x0010de26  shell_run_line+0xe6
-  [1] 0x0010e3c7  shell_task+0x507
-  [2] 0x00101b02  thread_trampoline+0xb
+  [0] 0xc011a8c6  shell_run_line+0xe6
+  [1] 0xc011ae67  shell_task+0x507
+  [2] 0xc0103b02  thread_trampoline+0xb
 ```
 
 Embedding that table is circular — it changes the addresses it describes — so
@@ -484,8 +592,8 @@ QEMU.
 | **Host unit tests** | the kernel's real `printf`/`string`/`div64` sources, compiled for the host, diffed against glibc | 92 checks |
 | **Pre-boot validation** | Multiboot2 header and checksum, ELF type, entry point inside a load segment, load address, `.bss` alignment, the higher-half split, every embedded ring-3 program, absence of SSE | 20 failure conditions, every link |
 | **Image validation** | the boot signature, stage 1 not overlapping its own partition table, the stage 2 header pointing at a real ELF, every partition inside the image, the FAT geometry, and every file in `/BIN` being an i386 ELF with `INIT` among them | every image, every build |
-| **In-kernel suites** | allocator, paging, address spaces, copy-on-write, heap coalescing, interrupts, scheduler, processes, hardening, ATA and partitions, FAT16, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 393 checks in 17 suites |
-| **Boot scenarios** | custom bootloader unattended, the same image on a CPU with SMEP and SMAP, GRUB/Multiboot2 unattended, 39 shell commands typed over serial, benchmarks + profile | 5 scenarios |
+| **In-kernel suites** | allocator, paging, address spaces, copy-on-write, heap coalescing, interrupts, scheduler, processes, hardening, ATA and partitions, FAT16, ACPI/APIC/locks/IPIs, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 484 checks in 19 suites |
+| **Boot scenarios** | custom bootloader unattended, **the same image on four processors**, the same image on a CPU with SMEP and SMAP, GRUB/Multiboot2 unattended, 41 shell commands typed over serial, benchmarks + profile | 6 scenarios |
 | **Deliberate faults** | a write to the kernel's own `.text`, and a write below a task's stack — each must panic, naming the address, the reason and the region, and exit with the panic code | 2 scenarios |
 
 ```
@@ -542,6 +650,9 @@ kernel/
     usermode.asm           the forged IRET frame that reaches ring 3
     gdt.c idt.c irq.c      descriptor tables, dispatch, 8259 PIC
     cpu.c                  CPUID, reset, QEMU exit
+    acpi.c                 RSDP, RSDT/XSDT, the MADT
+    apic.c                 the local APIC, IPIs, INIT-SIPI-SIPI
+    ap_boot.asm            176 bytes: a second CPU, real mode to the higher half
   mm/
     pmm.c                  bitmap physical frame allocator
     vmm.c                  paging, recursive page directory, fault reporting
@@ -552,14 +663,16 @@ kernel/
   core/
     bootinfo.c             the two boot protocols, normalised
     sched.c                scheduler, tasks, fork, wait, the zombie reaper
+    smp.c                  per-CPU state, bring-up, IPIs, TLB shootdown
+    spinlock.c             real locks: test-and-test-and-set, bounded
     syscall.c              int 0x80 and userspace pointer validation
     elf.c                  defensive ELF32 loader for untrusted images
     usermode.c             address space + image for a process, and exec
     bench.c profile.c      microbenchmarks and the sampling profiler
     ksyms.c                the embedded symbol table
-    printf.c log.c panic.c string.c div64.c spinlock.c ktest.c kmain.c
+    printf.c log.c panic.c string.c div64.c ktest.c kmain.c
   drivers/                 serial, vga, timer, keyboard, rtc, pci, ata
-  shell/shell.c            29 commands, line editing, history
+  shell/shell.c            31 commands, line editing, history
   include/                 headers, grouped by subsystem
 
 user/                      ring-3 programs, built as separate ELFs
@@ -675,8 +788,13 @@ Being clear about scope is more useful than a longer feature list.
 - **No DMA and no disk interrupts.** The ATA driver is PIO and polled, which
   burns a timeslice per read on real hardware. The trade-off, and what it
   buys, is in [docs/STORAGE.md](docs/STORAGE.md#ata-by-programmed-io).
-- **No SMP.** Uniprocessor only; `spinlock.c` is honest about being an
-  interrupt mask rather than a spin, and says what it will become.
+- **The scheduler runs on one processor.** Every processor is brought up,
+  runs kernel code, holds real locks and services IPIs — but run queues are
+  still per-system rather than per-CPU, so the other processors idle. That is
+  the next large piece; see [docs/SMP.md](docs/SMP.md#what-is-missing).
+- **The I/O APIC is parsed but not programmed.** Device interrupts still go
+  through the 8259s to the boot processor, so there is no interrupt
+  distribution and no affinity.
 - **No `argv`, environment or file descriptors.** `exec` takes a program
   name and nothing else; `write` goes to the console unconditionally, so
   `fork` has no descriptor table to duplicate.
@@ -710,6 +828,7 @@ Being clear about scope is more useful than a longer feature list.
 | [docs/PROCESSES.md](docs/PROCESSES.md) | address spaces, `fork`, copy-on-write, `exec`, `wait` |
 | [docs/SECURITY.md](docs/SECURITY.md) | W^X, SMEP/SMAP, guard pages, and what is deliberately missing |
 | [docs/STORAGE.md](docs/STORAGE.md) | the ATA driver, the partition table, FAT16, and where a program comes from |
+| [docs/SMP.md](docs/SMP.md) | ACPI, the APIC, the AP trampoline, real locks, TLB shootdown |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | benchmark methodology, results with analysis, the profiler and its limits |
 | [docs/TESTING.md](docs/TESTING.md) | the four test layers and how to add to each |
 | [docs/DEBUGGING.md](docs/DEBUGGING.md) | GDB against QEMU, reading a panic, common symptoms |

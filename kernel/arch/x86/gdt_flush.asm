@@ -28,10 +28,15 @@ gdt_flush:
 .reload:
                 ret
 
-; void tss_flush(void) - load the task register with our one TSS descriptor.
+; void tss_flush(u16 selector)
+;
+; Each CPU loads its own TSS descriptor, because `ltr` names one and the CPU
+; reads ss0/esp0 out of whichever TSS its own task register points at. A kernel
+; with one shared TSS would have a ring-3 interrupt on one processor land on
+; another processor's stack.
 global tss_flush
 tss_flush:
-                mov     ax, SEL_TSS
+                mov     ax, [esp + 4]
                 ltr     ax
                 ret
 

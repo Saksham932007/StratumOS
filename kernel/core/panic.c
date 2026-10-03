@@ -19,6 +19,7 @@
 #include <kernel/ksyms.h>
 #include <kernel/panic.h>
 #include <kernel/printf.h>
+#include <kernel/smp.h>
 
 /* Set while a panic is in progress so that a fault *inside* the panic handler
  * stops rather than recursing until the stack is gone. */
@@ -104,6 +105,13 @@ NORETURN void panic(const char *fmt, ...)
     }
     panicking = true;
 
+    /* Stop every other processor before printing anything. A kernel that has
+     * decided it cannot continue should not leave three other CPUs running in
+     * the state that made it decide that - and more immediately, two
+     * processors interleaving output through the same console would make the
+     * one message that matters unreadable. */
+    smp_halt_others();
+
     panic_banner();
     kprintf(" ");
     va_start(ap, fmt);
@@ -129,6 +137,13 @@ NORETURN void panic_with_regs(const struct regs *r, const char *fmt, ...)
         cpu_halt_forever();
     }
     panicking = true;
+
+    /* Stop every other processor before printing anything. A kernel that has
+     * decided it cannot continue should not leave three other CPUs running in
+     * the state that made it decide that - and more immediately, two
+     * processors interleaving output through the same console would make the
+     * one message that matters unreadable. */
+    smp_halt_others();
 
     panic_banner();
     kprintf(" ");

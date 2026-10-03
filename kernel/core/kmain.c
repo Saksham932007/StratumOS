@@ -19,6 +19,8 @@
  */
 #define LOG_TAG "boot"
 
+#include <arch/acpi.h>
+#include <arch/apic.h>
 #include <arch/cpu.h>
 #include <arch/gdt.h>
 #include <arch/harden.h>
@@ -44,6 +46,7 @@
 #include <kernel/profile.h>
 #include <kernel/sched.h>
 #include <kernel/shell.h>
+#include <kernel/smp.h>
 #include <kernel/string.h>
 #include <kernel/syscall.h>
 #include <kernel/usermode.h>
@@ -356,6 +359,45 @@ void kmain(u32 magic, u32 info_addr)
 
     pci_init();
     log_boot_step("PCI", true, "legacy 0xCF8 enumeration");
+
+    /* Processors. ACPI first, because the MADT is the only thing that says
+     * how many there are and where the local APIC's registers live; then the
+     * local APIC, which is what can send an interrupt to another processor at
+     * all; then the other processors themselves.
+     *
+     * All three come after paging and the heap, because the firmware tables
+     * sit outside the linear map and have to be mapped, and after the
+     * hardening step, because a processor that came up before SMAP was
+     * enabled would be running with it off. */
+    acpi_init();
+    {
+        const struct acpi_info *ai = acpi_get_info();
+        char detail[56];
+
+        if (ai->available)
+            ksnprintf(detail, sizeof(detail), "%s, %u tables, %u cpu(s)",
+                      ai->used_xsdt ? "XSDT" : "RSDT", ai->tables_seen,
+                      ai->cpus_reported);
+        else
+            strlcpy(detail, "no tables on this machine", sizeof(detail));
+
+        log_boot_step("ACPI", ai->available, detail);
+    }
+
+    bool have_apic = apic_init_bsp();
+
+    log_boot_step("local APIC", have_apic,
+                  have_apic ? "enabled, IPIs available"
+                            : "absent; uniprocessor only");
+
+    smp_init();
+    {
+        char detail[56];
+
+        ksnprintf(detail, sizeof(detail), "%u of %u processor(s) online",
+                  smp_cpu_count(), smp_cpus_present());
+        log_boot_step("processors", true, detail);
+    }
 
     /* Storage. The ATA driver polls, so it needs nothing from the interrupt
      * layer; the block layer needs the heap only indirectly, through the

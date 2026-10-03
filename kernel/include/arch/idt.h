@@ -52,6 +52,12 @@ struct idt_ptr {
 typedef void (*isr_handler_t)(struct regs *r);
 
 void idt_init(void);
+
+/* Load the IDT register on this processor. idt_init() builds the table and
+ * loads it on the boot processor; an application processor only needs the
+ * load, because the table is shared - an interrupt descriptor table has no
+ * per-CPU content, unlike the GDT, whose TSS descriptors do. */
+void idt_load(void);
 void idt_set_gate(u8 num, u32 base, u16 selector, u8 flags);
 
 /* Install a handler for a raw interrupt vector (0-255). */

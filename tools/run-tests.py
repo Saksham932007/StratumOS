@@ -75,6 +75,11 @@ COMMON_EXPECTED = [
     ("kernel text is read-only",
      r"kernel \.text and \.rodata mapped read-only \(\d+ pages\)"),
     ("hardening reported at boot", r"hardening\s+\[ok\]"),
+    # Processors. One or four, the step has to report cleanly - and the
+    # local-APIC line has to be there either way, because enabling it is what
+    # moved the 8259s behind LINT0.
+    ("processor count reported",
+     r"boot: processors\s+\[ok\] \d+ of \d+ processor\(s\) online"),
     # Storage. The ATA driver and the block layer run on both boot paths; the
     # filesystem exists only on the raw disk image, so the shared expectation
     # is only that the step reported cleanly either way.
@@ -383,6 +388,10 @@ SHELL_SCRIPT: list[tuple[str, list[str]]] = [
                   r"image\(s\) loaded from disk"]),
     ("selftest storage", [r"ktest: storage \.\.\. PASS"]),
     ("selftest fs", [r"ktest: fs \.\.\. PASS"]),
+    ("selftest smp", [r"ktest: smp \.\.\. PASS"]),
+    ("selftest bootpd", [r"ktest: bootpd \.\.\. PASS"]),
+    ("cpus", [r"Local APIC", r"CPU\s+APIC\s+ROLE\s+STATE",
+              r"\s+0\s+0\s+bsp online", r"<- this one"]),
     ("disk", [r"DEV\s+MODEL\s+SECTORS\s+ADDR", r"hd0\s+\S",
               r"0 error\(s\), 0 timeout\(s\)",
               r"hd0p1\s+0e\s+\d+\s+\d+"]),
@@ -479,10 +488,22 @@ BENCH_EXPECTED = [
     ("nanoseconds derived", r"= \d+\.\d+ ns"),
     ("profile produced", r"Sampling profile"),
     ("profile attributed samples", r"kernel samples: [1-9]\d* attributed"),
-    # The workload is allocator-dominated, so a profiler that discriminates
-    # must put kmalloc at the top. This asserts the profiler is useful, not
-    # merely that it runs.
-    ("profile found the hot path", r"\d+\s+\d+\.\d%\s+kmalloc"),
+    # The workload is allocator traffic plus integer formatting, so a
+    # profiler that discriminates has to find exactly those three functions.
+    # This asserts the profiler is useful, not merely that it runs.
+    ("profile found kmalloc", r"\d+\s+\d+\.\d%\s+kmalloc"),
+    ("profile found kfree", r"\d+\s+\d+\.\d%\s+kfree"),
+    ("profile separated the formatter's digit loop",
+     r"\d+\s+\d+\.\d%\s+emit_number"),
+    # The leader is whichever of the three the scheduler happened to sample
+    # most, and it moves between runs - 29/23/18 one time, 32/24/14 the next.
+    # So the positional check is that the top entry is one of the three
+    # rather than some unrelated function: that is the part that would break
+    # if attribution regressed, and naming a specific winner would be
+    # asserting host scheduling noise.
+    ("nothing unrelated is on top",
+     r"SHARE\s+FUNCTION\s*\n\s*\d+\s+\d+\.\d%\s+"
+     r"(kmalloc|kfree|emit_number)\b"),
     ("autobench finished", r"stratum: autobench complete"),
 ]
 
@@ -709,6 +730,36 @@ def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
                  r"harden: SMEP enabled, SMAP enabled"),
                 ("the boot step says so",
                  r"hardening\s+\[ok\] W\^X, guard pages, SMEP \+ SMAP"),
+            ],
+        ),
+        Scenario(
+            name="four-processors",
+            description="the same kernel on four processors",
+            image=build_dir / "stratum-test.img",
+            qemu_args=[
+                # The other scenarios run on one processor, which is the path
+                # that has to keep working and is what almost every reader
+                # will build on. This one brings up four, so the trampoline,
+                # the per-CPU GDT entries, the real spinlocks and the IPI
+                # paths are all exercised - none of which a uniprocessor boot
+                # touches at all.
+                "-smp", "4",
+                "-cpu", "max",
+                "-drive",
+                f"format=raw,file={build_dir / 'stratum-test.img'},"
+                f"index=0,media=disk",
+            ],
+            extra_expected=[
+                ("the MADT was parsed",
+                 r"acpi: MADT: 4 processor\(s\), \d+ I/O APIC\(s\)"),
+                ("the local APIC came up",
+                 r"apic: local APIC at 0xfee00000 -> 0x[0-9a-f]+, id 0"),
+                ("every application processor started",
+                 r"smp: cpu 3 online \(APIC id 3\)"),
+                ("all four are online",
+                 r"smp: 4 of 4 processor\(s\) online"),
+                ("the boot step agrees",
+                 r"processors\s+\[ok\] 4 of 4 processor\(s\) online"),
             ],
         ),
         Scenario(
