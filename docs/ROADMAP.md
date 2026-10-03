@@ -174,11 +174,56 @@ for. Documented in [LONGMODE.md](LONGMODE.md).
 That is one commit that either boots or does not, which is why it is a
 project rather than a phase.
 
+### A network stack
+
+Landed in v0.11.0: an Intel e1000, Ethernet, ARP, IPv4, ICMP, UDP and a small
+TCP. The machine answers a ping, answers a who-has, accepts a TCP connection
+and echoes on it - verified against a real host-side peer through QEMU's
+`hostfwd`, which did the other half of the handshake.
+
+The driver is descriptor rings with the one-slot-unused rule, interrupts, the
+PCI bus-mastering bit, and `RCTL.SECRC` to strip the Ethernet CRC. TCP is a
+passive open with a real send queue, MSS-sized segments inside the peer's
+window, retransmission with a bounded retry, a half-open timeout, and resets
+built from the offending segment per RFC 793.
+
+Two things worth recording. The first working driver sent every frame with a
+source MAC of zero - `struct net_device` was `const` and its `.mac` was never
+filled, so the log printed the driver's own correct copy while the stack sent
+frames from a second one that was empty. Transmit worked, the device's counter
+confirmed it, receive was silent, and every log line was right. Only a packet
+capture showed it, which is why the `network` scenario parses a pcap and
+recomputes the checksums independently rather than reading the kernel's log.
+
+The second: QEMU attaches a default e1000 unless told otherwise, so two runs
+intended to exercise opposite paths both reported the same check count. Both
+suite paths are now asserted by count, and there is a `no-network` scenario
+with `-nic none`.
+
+**What it deliberately does not have**, in rough order of how much it matters:
+congestion control (no slow start, no congestion window - the biggest
+omission, and the reason this is not a general-purpose TCP); out-of-order
+reassembly; IP fragment reassembly; a sockets API for ring 3; DHCP; a routing
+table beyond one gateway; window scaling, SACK and timestamps; ICMP error
+generation. Each has its reasoning in [NETWORK.md](NETWORK.md).
+
 ---
 
 ## Next
 
-### 1. Per-CPU run queues
+### 1. A sockets API, and therefore file descriptors
+
+The network stack has no way for a ring-3 program to use it, and the reason
+is not in the network stack: this kernel has no file descriptors. There is no
+`open`, so there is nothing a socket could be.
+
+So this is a process-model change that happens to be motivated by networking:
+a per-process descriptor table, `read`/`write`/`close` that dispatch on what
+the descriptor refers to, and then `socket`/`bind`/`listen`/`accept`/`connect`
+on top. It would make the filesystem usable from ring 3 at the same time,
+which is the other half of why it is first.
+
+### 2. Per-CPU run queues
 
 The scheduler runs on the boot processor and the other processors idle. What
 remains is the part that makes four processors useful rather than merely
@@ -187,10 +232,10 @@ when one queue empties, a reschedule IPI, and every scheduler invariant
 re-examined for two processors entering it at once.
 
 It needs the local APIC timer first - the single 8254 cannot drive four
-processors - which is item 8 below, and that makes this the one item in this
+processors - which is item 9 below, and that makes this the one item in this
 list whose dependencies are not already in place.
 
-### 2. NX, and therefore real W^X
+### 3. NX, and therefore real W^X
 
 The one piece of hardening that is a project rather than a patch. A 32-bit
 page table entry has no execute-disable bit, so the kernel's text is
@@ -211,7 +256,7 @@ and the PAE-before-paging ordering are already written down and tested in
 smaller: UMIP is a CR4 bit, KASLR is relocations, and `-fstack-protector`
 wants the per-CPU area the SMP work brings.
 
-### 3. Interrupt-driven serial transmit
+### 4. Interrupt-driven serial transmit
 
 `console_write` currently holds interrupts off for the whole of a polled UART
 write. On QEMU that is free; on real hardware at 115200 it is ~87 µs per
@@ -221,21 +266,21 @@ Needs: a transmit ring buffer, the THR-empty interrupt enabled in IER, and a
 drain path in the existing `serial_irq`. The panic path has to keep polling,
 because it cannot rely on interrupts.
 
-### 4. Reclaim empty page tables
+### 5. Reclaim empty page tables
 
 Unmapping the last page in a 4 MiB region leaves its table allocated. Needs a
 per-table mapped-page count, decremented in `vmm_unmap`, freeing the frame and
 clearing the directory entry at zero — and a `tlb` flush of the recursive
 window entry for that slot.
 
-### 5. Symbolising the profiler's call graph
+### 6. Symbolising the profiler's call graph
 
 Samples are attributed to the leaf function only, so a helper called from
 several places aggregates all of its callers together. Walking the
 frame-pointer chain at sample time would fix it, and the backtrace code
 already exists - see [PERFORMANCE.md](PERFORMANCE.md).
 
-### 6. Writing to the filesystem, and a VFS
+### 7. Writing to the filesystem, and a VFS
 
 Reading is done. Writing means allocating from the FAT, updating both copies
 of it, extending a directory entry's size and cluster chain, and surviving
@@ -257,14 +302,14 @@ deliberately, because caching a name's absence needs the invalidation story
 that arrives with write support. It is resource exhaustion, not a memory
 safety bug; see [FUZZING.md](FUZZING.md).
 
-### 7. A slab allocator over the heap
+### 8. A slab allocator over the heap
 
 The heap is one arena, so a long-lived small allocation can keep a large region
 from coalescing. Per-size caches for the common fixed-size objects (`struct
 task`, page-table wrappers) would fix the fragmentation and speed up the common
 path. `heap_check()` already exists to validate the result.
 
-### 8. The I/O APIC, and the local APIC timer
+### 9. The I/O APIC, and the local APIC timer
 
 The MADT's I/O APIC entries and its interrupt source overrides are already
 parsed - including that IRQ 0 arrives as GSI 2 on QEMU, which a kernel that
@@ -272,15 +317,15 @@ assumed otherwise would lose its timer to. Nothing is programmed yet: device
 interrupts still go through the 8259s to the boot processor, so there is no
 interrupt distribution and no affinity.
 
-The local APIC timer belongs with it, and is the prerequisite for item 1: the
+The local APIC timer belongs with it, and is the prerequisite for item 2: the
 single 8254 cannot drive four processors, so per-CPU preemption needs a timer
 per CPU.
 
-### 9. A `/proc`
+### 10. A `/proc`
 
 The introspection the shell does through direct calls - `ps`, `meminfo`,
 `irq`, `disk`, `mount`, `harden` - belongs behind readable files instead.
-That needs a VFS with at least two filesystems in it (item 5) and write
+That needs a VFS with at least two filesystems in it (item 7) and write
 support for the synthetic one, so it follows them rather than preceding
 them.
 
@@ -313,18 +358,43 @@ what remains is the port, and the five steps it needs are enumerated there.
 It is one commit that either boots or does not, which is why it is kept
 separate from the phase that made it testable.
 
-### A network stack
-
-An e1000 driver, then ARP, IP, UDP and a minimal TCP. It is a
-protocol-stack project rather than an OS-fundamentals one, which is why it
-is last, but it is also the one that exercises interrupt latency, DMA and
-buffer lifetime management in a way nothing else here does.
-
 ### A second architecture
 
-RISC-V or AArch64. Most of `kernel/core` and `kernel/mm` is already free of
-x86, and `kernel/arch/x86` is where everything that is not would have to
-grow a sibling. The value is in finding out how much of that claim is true.
+RISC-V or AArch64, and the honest statement is that this has not been
+started.
+
+It is a different kind of project from everything else on this list. Every
+other item adds a subsystem to a kernel that exists; this one asks whether
+`kernel/core` and `kernel/mm` are genuinely portable, and the only way to
+find out is to build the sibling of `kernel/arch/x86` and see what breaks.
+What is known so far, from the two phases that pushed hardest on the arch
+boundary:
+
+- **Boot.** Nothing is shared. A RISC-V machine starts in S-mode with a
+  device tree in a register; there is no BIOS, no A20 gate, no real mode and
+  no Multiboot. `boot/` and `kernel/arch/x86/boot.asm` have no counterpart -
+  they would be rewritten, not ported.
+- **Paging.** Sv39 is three levels of 512 entries with a different entry
+  format, and the recursive-mapping trick `mm/vmm.c` uses to reach its own
+  page tables is specific to x86's two-level layout. That is a design
+  decision to make again, and the long-mode work (decision 31) already
+  flagged it as not generalising.
+- **Interrupts.** No PIC, no APIC, no IDT: a single trap vector, a cause
+  register, and the PLIC for external sources. `arch/idt.c`, `isr.asm` and
+  `irq.c` are x86 documents.
+- **DMA coherence.** The e1000 driver relies on x86 snooping its caches, and
+  says so in a comment. An architecture without coherent DMA needs explicit
+  cache maintenance in every driver - which is the kind of assumption a port
+  exists to discover, and the kind that is invisible until then.
+- **What probably does port.** The scheduler, the frame allocator, the heap,
+  the ELF loader, FAT16, the network stack above the driver, the formatter
+  and the test harness. That claim is the thing worth testing, and it is
+  untested.
+
+The value of doing it is exactly that: finding out how much of
+"architecture-independent" is true. The cost is a second toolchain, a second
+emulator target, a second CI matrix, and the discovery that a few dozen
+`u32`s were addresses. It is not a phase.
 
 ---
 

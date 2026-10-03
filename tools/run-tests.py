@@ -35,6 +35,7 @@ import os
 import re
 import select
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -402,6 +403,26 @@ SHELL_SCRIPT: list[tuple[str, list[str]]] = [
     # transition itself under qemu-system-x86_64.
     ("selftest longmode", [r"ktest: longmode \.\.\. PASS"]),
     ("longmode", [r"Long mode \(x86-64\)", r"CPUID\s+:"]),
+    # QEMU attaches a default e1000, so the shell scenario has a network
+    # whether it asked for one or not - which makes these real assertions
+    # rather than hopeful ones. The `network` scenario checks the wire; these
+    # check that the commands report it.
+    ("selftest net", [r"ktest: net \.\.\. PASS"]),
+    ("net", [r"Controller", r"MAC       : [0-9a-f:]{17}",
+             r"link      : up", r"receive   : 32 descriptors",
+             r"address   : 10\.0\.2\.15", r"tcp echo  : port 7",
+             r"udp echo  : port 7"]),
+    # Either outcome is correct, and which one happens depends on whether
+    # `selftest net` ran first and already resolved it. Asserting only the
+    # cache-miss form made this test depend on the order of the script.
+    ("arp 10.0.2.2",
+     [r"(10\.0\.2\.2 is at|already cached:) [0-9a-f:]{17}"]),
+    ("arp", [r"ADDRESS\s+MAC\s+AGE", r"10\.0\.2\.2"]),
+    ("ping 10.0.2.2 2", [r"seq 1: reply from 10\.0\.2\.2 in \d+ ms",
+                         r"seq 2: reply from 10\.0\.2\.2",
+                         r"2 sent, 2 received, 0 lost"]),
+    ("udpsend 10.0.2.2 7 stratum udp probe",
+     [r"sent \d+ byte\(s\) to 10\.0\.2\.2:7"]),
     ("cpus", [r"Local APIC", r"CPU\s+APIC\s+ROLE\s+STATE",
               r"\s+0\s+0\s+bsp online", r"<- this one"]),
     ("disk", [r"DEV\s+MODEL\s+SECTORS\s+ADDR", r"hd0\s+\S",
@@ -524,6 +545,281 @@ def run_syscall_fuzz(build_dir: Path, keep_logs: Path | None) -> Outcome:
         failures.append(f"unexpected QEMU exit status {exit_code} after halt")
 
     return Outcome(sc, not failures, exit_code, log, failures, None)
+
+
+# ---------------------------------------------------------------------------
+# The network scenario, and the pcap it asserts on.
+#
+# Every other scenario checks what the kernel *says*. This one checks what it
+# *put on the wire*, by having QEMU dump every frame to a pcap and parsing it
+# here - independently of the kernel, with the harness recomputing the
+# checksums itself.
+#
+# That distinction earned its keep immediately. The driver's first working
+# version transmitted frames with a source MAC of 00:00:00:00:00:00: the boot
+# log printed the correct address, because it printed the driver's copy, while
+# the stack sent frames built from a second copy that was never filled in. The
+# peer replied to the zero address and the controller's own receive filter
+# dropped the reply. Transmit worked, receive was silent, and every log line
+# was correct. Only the capture showed it.
+# ---------------------------------------------------------------------------
+
+def parse_pcap(path: Path) -> list[bytes]:
+    """Return the frames in a libpcap file. Little-endian microsecond format,
+    which is what QEMU's filter-dump writes."""
+    data = path.read_bytes()
+
+    if len(data) < 24:
+        return []
+
+    magic = data[:4]
+    if magic == b"\xd4\xc3\xb2\xa1":
+        endian = "<"
+    elif magic == b"\xa1\xb2\xc3\xd4":
+        endian = ">"
+    else:
+        return []
+
+    frames = []
+    off = 24
+
+    while off + 16 <= len(data):
+        _, _, caplen, _ = struct.unpack(endian + "IIII", data[off:off + 16])
+        if caplen > 65535 or off + 16 + caplen > len(data):
+            break
+        frames.append(data[off + 16:off + 16 + caplen])
+        off += 16 + caplen
+
+    return frames
+
+
+def inet_checksum(b: bytes) -> int:
+    """RFC 1071, written independently of the kernel's version so that the two
+    agreeing means something."""
+    total = 0
+
+    for i in range(0, len(b) - 1, 2):
+        total += (b[i] << 8) | b[i + 1]
+    if len(b) % 2:
+        total += b[-1] << 8
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+
+    return (~total) & 0xFFFF
+
+
+GUEST_IP = bytes([10, 0, 2, 15])
+GATEWAY_IP = bytes([10, 0, 2, 2])
+
+
+def check_pcap(path: Path) -> list[str]:
+    """Assert on the frames the kernel actually transmitted."""
+    problems: list[str] = []
+
+    if not path.exists():
+        return [f"no packet capture at {path}"]
+
+    frames = parse_pcap(path)
+
+    if not frames:
+        return [f"the capture at {path} holds no frames"]
+
+    our_mac: bytes | None = None
+    arp_requests = 0
+    arp_replies_in = 0
+    icmp_requests_out = 0
+    icmp_replies_in = 0
+    ip_from_us = 0
+    bad_eth_src = 0
+    bad_ip_checksum = 0
+    bad_icmp_checksum = 0
+
+    for f in frames:
+        if len(f) < 14:
+            continue
+
+        dst, src = f[0:6], f[6:12]
+        ethertype = struct.unpack(">H", f[12:14])[0]
+        body = f[14:]
+
+        # ARP, which is also where our MAC is learned - from a frame the
+        # kernel sent, not from anything it claimed in a log line.
+        if ethertype == 0x0806 and len(body) >= 28:
+            op = struct.unpack(">H", body[6:8])[0]
+            sender_mac, sender_ip = body[8:14], body[14:18]
+
+            if op == 1 and sender_ip == GUEST_IP:
+                arp_requests += 1
+                if our_mac is None:
+                    our_mac = sender_mac
+                # A frame whose sender hardware address is all zeros is the
+                # bug described above. Checked explicitly so that it can
+                # never come back silently.
+                if sender_mac == b"\x00" * 6:
+                    bad_eth_src += 1
+                if src == b"\x00" * 6:
+                    bad_eth_src += 1
+                if dst != b"\xff" * 6:
+                    problems.append(
+                        "an ARP request was not sent to the broadcast address")
+            elif op == 2 and sender_ip == GATEWAY_IP:
+                arp_replies_in += 1
+            continue
+
+        if ethertype != 0x0800 or len(body) < 20:
+            continue
+
+        ihl = (body[0] & 0x0F) * 4
+        if ihl < 20 or ihl > len(body):
+            continue
+
+        # Every IPv4 header the kernel sent, checksummed here rather than
+        # trusted. This is the assertion that the kernel's checksum code is
+        # right, made by code that shares none of it.
+        if body[12:16] == GUEST_IP:
+            ip_from_us += 1
+            if inet_checksum(body[:ihl]) != 0:
+                bad_ip_checksum += 1
+            if src == b"\x00" * 6:
+                bad_eth_src += 1
+
+        proto = body[9]
+        total = struct.unpack(">H", body[2:4])[0]
+        payload = body[ihl:total] if total <= len(body) else body[ihl:]
+
+        if proto == 1 and len(payload) >= 8:
+            icmp_type = payload[0]
+            if icmp_type == 8 and body[12:16] == GUEST_IP:
+                icmp_requests_out += 1
+                if inet_checksum(payload) != 0:
+                    bad_icmp_checksum += 1
+            elif icmp_type == 0 and body[16:20] == GUEST_IP:
+                icmp_replies_in += 1
+
+    if our_mac is None:
+        problems.append("no ARP request from 10.0.2.15 in the capture")
+    elif our_mac == b"\x00" * 6:
+        problems.append("the kernel sent frames with a zero source MAC")
+
+    if bad_eth_src:
+        problems.append(
+            f"{bad_eth_src} frame(s) had a zero source hardware address")
+    if not arp_requests:
+        problems.append("the kernel never sent an ARP request")
+    if not arp_replies_in:
+        problems.append("no ARP reply from the gateway reached the capture")
+    if not icmp_requests_out:
+        problems.append("the kernel never sent an ICMP echo request")
+    if not icmp_replies_in:
+        problems.append("no ICMP echo reply came back")
+    if bad_ip_checksum:
+        problems.append(
+            f"{bad_ip_checksum} IPv4 header(s) the kernel sent had a bad "
+            f"checksum (verified independently of the kernel)")
+    if bad_icmp_checksum:
+        problems.append(
+            f"{bad_icmp_checksum} ICMP message(s) the kernel sent had a bad "
+            f"checksum")
+    if ip_from_us == 0:
+        problems.append("the kernel sent no IPv4 datagrams at all")
+
+    return problems
+
+
+NETWORK_EXPECTED = [
+    ("the controller was found",
+     r"e1000: 8254\dEM at \d\d:\d\d\.\d, MMIO 0x[0-9a-f]+ -> 0x[0-9a-f]+, "
+     r"IRQ \d+, MAC (?!00:00:00:00:00:00)[0-9a-f:]{17}"),
+    ("the link came up", r"e1000: link up"),
+    ("the rings were set up", r"\d+ rx / \d+ tx descriptors of \d+ bytes"),
+    ("an address was configured",
+     r"net: address 10\.0\.2\.15 netmask 255\.255\.255\.0 "
+     r"gateway 10\.0\.2\.2"),
+    ("the echo ports are listening", r"tcp: listening on port 7"),
+    ("the boot step reported the link",
+     r"boot: network\s+\[ok\] [0-9a-f:]{17}, 10\.0\.2\.15, link up"),
+    # The suite has two paths and this scenario must take the one that
+    # reaches the wire. Asserting the path, not just the pass.
+    ("the suite reached the hardware",
+     r"ktest net: controller present, link up"),
+    ("the net suite passed its wider path",
+     r"ktest: net \.\.\. PASS \(9\d checks\)"),
+]
+
+
+def run_network(build_dir: Path, keep_logs: Path | None) -> Outcome:
+    """Boot with an e1000, and assert on the frames it put on the wire."""
+    image = build_dir / "stratum-test.img"
+    sc = Scenario(
+        name="network",
+        description="an e1000, and the frames the kernel actually transmits",
+        image=image,
+        qemu_args=[],
+        timeout=180,
+    )
+
+    failures: list[str] = []
+
+    with tempfile.TemporaryDirectory() as tmp:
+        log_path = Path(tmp) / "serial.log"
+        pcap_path = Path(tmp) / "network.pcap"
+
+        cmd = [
+            QEMU, "-m", "128M", "-no-reboot", "-display", "none",
+            "-serial", f"file:{log_path}",
+            "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+            # An explicit controller rather than QEMU's default, so the
+            # device model is pinned, and a filter that writes every frame in
+            # both directions to a file.
+            "-netdev", "user,id=n0",
+            "-device", "e1000,netdev=n0",
+            "-object", f"filter-dump,id=d0,netdev=n0,file={pcap_path}",
+            "-drive", f"format=raw,file={image},index=0,media=disk",
+        ]
+
+        qemu_exit: int | None
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=sc.timeout)
+            qemu_exit = proc.returncode
+        except subprocess.TimeoutExpired:
+            qemu_exit = None
+            failures.append(
+                f"QEMU did not exit within {sc.timeout}s")
+
+        log = log_path.read_text(errors="replace") if log_path.exists() else ""
+        frames = len(parse_pcap(pcap_path)) if pcap_path.exists() else 0
+        failures += check_pcap(pcap_path)
+
+        if keep_logs:
+            keep_logs.mkdir(parents=True, exist_ok=True)
+            (keep_logs / "network.log").write_text(log, errors="replace")
+            if pcap_path.exists():
+                (keep_logs / "network.pcap").write_bytes(
+                    pcap_path.read_bytes())
+
+    for label, pattern in NETWORK_EXPECTED:
+        if not re.search(pattern, log):
+            failures.append(f"missing: {label}  (no match for /{pattern}/)")
+
+    for label, pattern in FORBIDDEN:
+        match = re.search(pattern, log)
+        if match:
+            failures.append(f"forbidden: {label} -> {match.group(0)}")
+
+    if qemu_exit is not None and qemu_exit != EXIT_PASS:
+        failures.append(f"unexpected QEMU exit status {qemu_exit}")
+
+    summary = re.search(r"ktest: summary (\d+)/(\d+) suites passed", log)
+    suites = (int(summary.group(1)), int(summary.group(2))) if summary else None
+
+    if not summary:
+        failures.append("no 'ktest: summary' line - the suites never finished")
+    elif summary.group(1) != summary.group(2):
+        failures.append(f"only {summary.group(1)} of {summary.group(2)} "
+                        f"suites passed")
+
+    return Outcome(sc, not failures, qemu_exit, log, failures, suites), frames
 
 
 def run_interactive(build_dir: Path, keep_logs: Path | None) -> Outcome:
@@ -820,6 +1116,34 @@ def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
             ],
         ),
         Scenario(
+            name="no-network",
+            description="the same kernel on a machine with no Ethernet at all",
+            image=build_dir / "stratum-test.img",
+            qemu_args=[
+                # QEMU adds a default e1000 unless told not to, which means
+                # every other scenario has a network whether it asked for one
+                # or not - and the path where there is no controller would
+                # never run. This scenario is the one that exercises it.
+                "-nic", "none",
+                "-drive",
+                f"format=raw,file={build_dir / 'stratum-test.img'},"
+                f"index=0,media=disk",
+            ],
+            extra_expected=[
+                ("the absence was reported, not failed",
+                 r"boot: network\s+\[ok\] no supported controller"),
+                ("the driver said so plainly",
+                 r"e1000: no supported Ethernet controller on the PCI bus"),
+                # The suite's narrower path. Asserting the count is what
+                # distinguishes "took the right branch" from "happened to
+                # pass".
+                ("the net suite took its narrower path",
+                 r"ktest net: controller absent, link down"),
+                ("and still tested everything that does not need hardware",
+                 r"ktest: net \.\.\. PASS \(6\d checks\)"),
+            ],
+        ),
+        Scenario(
             name="long-mode",
             description="32-bit protected mode to 64-bit long mode, and back",
             image=build_dir / "stratum-test.img",
@@ -940,8 +1264,8 @@ def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
         ),
     ]
 
-    if only in ("interactive-shell", "benchmarks", "syscall-fuzz") or \
-            (only or "").startswith("fault-"):
+    if only in ("interactive-shell", "benchmarks", "syscall-fuzz",
+                "network") or (only or "").startswith("fault-"):
         return []
 
     if only:
@@ -989,8 +1313,9 @@ def main() -> int:
         return 2
 
     emulators = sorted({s.qemu for s in scenarios})
-    print(f"run-tests: {len(scenarios)} boot scenario(s) under "
-          f"{', '.join(emulators)}\n")
+    if scenarios:
+        print(f"run-tests: {len(scenarios)} boot scenario(s) under "
+              f"{', '.join(emulators)}\n")
 
     outcomes = []
 
@@ -1017,6 +1342,32 @@ def main() -> int:
                     print("    --- end ---\n")
         else:
             print(f"  [interactive-shell] SKIP ({shell_image} not built)\n")
+
+    if args.only in (None, "network"):
+        test_image = args.build_dir / "stratum-test.img"
+        if test_image.is_file():
+            print("  [network] an e1000, and the frames the kernel actually "
+                  "transmits")
+            outcome, frames = run_network(args.build_dir, args.keep_logs)
+            outcomes.append(outcome)
+            print(f"    frames captured  : {frames}")
+            print(f"    qemu exit        : {outcome.qemu_exit}")
+            if outcome.suites:
+                print(f"    in-kernel suites : {outcome.suites[0]}/"
+                      f"{outcome.suites[1]} passed")
+            if outcome.passed:
+                print("    result           : PASS\n")
+            else:
+                print("    result           : FAIL")
+                for f in outcome.failures:
+                    print(f"      - {f}")
+                print()
+                print("    --- serial log ---")
+                for line in outcome.log.splitlines():
+                    print(f"    | {line}")
+                print("    --- end ---\n")
+        else:
+            print(f"  [network] SKIP ({test_image} not built)\n")
 
     if args.only in (None, "syscall-fuzz"):
         shell_image = args.build_dir / "stratum-shell.img"

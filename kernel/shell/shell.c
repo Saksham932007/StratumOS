@@ -21,6 +21,7 @@
 #include <arch/longmode.h>
 
 #include <drivers/ata.h>
+#include <drivers/e1000.h>
 #include <drivers/keyboard.h>
 #include <drivers/pci.h>
 #include <drivers/rtc.h>
@@ -50,6 +51,7 @@
 
 #include <fs/blockdev.h>
 #include <fs/fat16.h>
+#include <net/net.h>
 
 #define PROMPT "stratum> "
 
@@ -536,6 +538,322 @@ static int cmd_longmode(int argc, char **argv)
     kprintf("\n  result      : FAILED - %s\n",
             r.failure ? r.failure : "unknown");
     return 1;
+}
+
+/* ---- networking --------------------------------------------------------- */
+
+static int cmd_net(int argc, char **argv)
+{
+    UNUSED(argc);
+    UNUSED(argv);
+
+    struct e1000_info ei;
+    const struct net_config *cfg = net_get_config();
+    const struct net_stats *s = net_stats();
+    char b1[MAC_STR_LEN], b2[IPV4_STR_LEN], b3[IPV4_STR_LEN], b4[IPV4_STR_LEN];
+
+    e1000_get_info(&ei);
+
+    if (!ei.present) {
+        kprintf("no supported Ethernet controller on this machine\n");
+        kprintf("(QEMU: add -netdev user,id=n0 -device e1000,netdev=n0)\n");
+        return 1;
+    }
+
+    kprintf("Controller\n");
+    kprintf("  device    : %04x:%04x at %02x:%02x.%u, IRQ %u\n", ei.vendor_id,
+            ei.device_id, ei.bus, ei.slot, ei.func, ei.irq);
+    kprintf("  registers : phys %p, mapped uncached\n", (void *)ei.mmio_phys);
+    kprintf("  MAC       : %s%s\n", mac_str(&ei.mac, b1, sizeof(b1)),
+            ei.mac_from_eeprom ? " (read from the EEPROM)" : "");
+    kprintf("  link      : %s", ei.link_up ? "up" : "down");
+    if (ei.link_up)
+        kprintf(", %u Mb/s, %s duplex", ei.link_speed_mbps,
+                ei.full_duplex ? "full" : "half");
+    kprintf("\n");
+
+    kprintf("Rings\n");
+    kprintf("  receive   : %u descriptors at phys %p, head %u tail %u\n",
+            ei.rx_ring_entries, (void *)ei.rx_ring_phys, ei.rx_head,
+            ei.rx_tail);
+    kprintf("  transmit  : %u descriptors at phys %p, head %u tail %u\n",
+            ei.tx_ring_entries, (void *)ei.tx_ring_phys, ei.tx_head,
+            ei.tx_tail);
+    kprintf("  device    : %u rx, %u tx, %u CRC error(s), %u no-buffer\n",
+            ei.dev_rx_packets, ei.dev_tx_packets, ei.dev_crc_errors,
+            ei.dev_rx_no_buffers);
+    kprintf("  driver    : %u interrupt(s), %u tx-ring-full, %u overrun(s)\n",
+            ei.interrupts, ei.tx_ring_full, ei.rx_overruns);
+
+    kprintf("Addressing\n");
+    kprintf("  address   : %s\n", ipv4_str(cfg->addr, b2, sizeof(b2)));
+    kprintf("  netmask   : %s\n", ipv4_str(cfg->netmask, b3, sizeof(b3)));
+    kprintf("  gateway   : %s\n", ipv4_str(cfg->gateway, b4, sizeof(b4)));
+
+    kprintf("Frames\n");
+    kprintf("  ethernet  : %u in (%u B), %u out (%u B)\n", s->rx_frames,
+            s->rx_bytes, s->tx_frames, s->tx_bytes);
+    kprintf("  dropped   : %u short, %u not ours, %u unknown ethertype\n",
+            s->rx_dropped_short, s->rx_dropped_not_ours,
+            s->rx_unknown_ethertype);
+    kprintf("  arp       : %u in, %u out (%u request(s), %u reply(s) sent)\n",
+            s->arp_rx, s->arp_tx, s->arp_requests_sent, s->arp_replies_sent);
+    kprintf("  ipv4      : %u in, %u out; %u bad checksum, %u fragment(s), "
+            "%u not ours\n",
+            s->ip_rx, s->ip_tx, s->ip_bad_checksum, s->ip_fragments_dropped,
+            s->ip_not_ours);
+    kprintf("  icmp      : %u in; %u echo request(s) -> %u reply(s) sent; "
+            "%u reply(s) received\n",
+            s->icmp_rx, s->icmp_echo_requests, s->icmp_echo_replies_sent,
+            s->icmp_echo_replies_received);
+    kprintf("  udp       : %u in, %u out; %u no port, %u bad checksum\n",
+            s->udp_rx, s->udp_tx, s->udp_no_port, s->udp_bad_checksum);
+    kprintf("  tcp       : %u in, %u out; %u bad checksum, %u no port, "
+            "%u reset(s) sent\n",
+            s->tcp_rx, s->tcp_tx, s->tcp_bad_checksum, s->tcp_no_port,
+            s->tcp_resets_sent);
+
+    struct tcp_status ts;
+
+    tcp_get_status(&ts);
+    kprintf("Listening\n");
+    kprintf("  udp echo  : port %u\n", udp_echo_port());
+    kprintf("  tcp echo  : port %u, state %s\n", tcp_listen_port(),
+            tcp_state_name(ts.state));
+    if (ts.state != TCP_LISTEN && ts.state != TCP_CLOSED) {
+        char rb[IPV4_STR_LEN];
+
+        kprintf("  peer      : %s:%u\n", ipv4_str(ts.remote, rb, sizeof(rb)),
+                ts.remote_port);
+        kprintf("  sequence  : snd_una %u snd_nxt %u rcv_nxt %u\n", ts.snd_una,
+                ts.snd_nxt, ts.rcv_nxt);
+    }
+    kprintf("  accepted  : %u connection(s), %u byte(s) echoed, "
+            "%u retransmit(s), %u out of order\n",
+            s->tcp_connections_accepted, s->tcp_bytes_echoed, ts.retransmits,
+            ts.out_of_order_dropped);
+
+    const struct udp_last *ul = udp_last_datagram();
+
+    if (ul->valid) {
+        char sb[IPV4_STR_LEN];
+
+        kprintf("  last udp  : %u byte(s) from %s:%u to port %u\n", ul->len,
+                ipv4_str(ul->src, sb, sizeof(sb)), ul->src_port, ul->dst_port);
+    }
+
+    return 0;
+}
+
+static int cmd_arp(int argc, char **argv)
+{
+    if (!net_device()) {
+        kprintf("no network device\n");
+        return 1;
+    }
+
+    /* `arp <address>` asks; a bare `arp` shows the cache. */
+    if (argc >= 2) {
+        ipv4_addr target;
+
+        if (!ipv4_parse(argv[1], &target)) {
+            kprintf("'%s' is not an IPv4 address\n", argv[1]);
+            return 1;
+        }
+
+        struct mac_addr mac;
+
+        if (arp_resolve(target, &mac)) {
+            char mb[MAC_STR_LEN];
+
+            kprintf("already cached: %s\n", mac_str(&mac, mb, sizeof(mb)));
+            return 0;
+        }
+
+        kprintf("sent a who-has; polling for the reply\n");
+
+        /* Polled rather than blocking on a wait queue, because there is no
+         * wait queue - and polling here means `arp` works even if the
+         * network thread is not being scheduled. */
+        for (u32 i = 0; i < 200; i++) {
+            net_poll(8);
+            if (arp_resolve(target, &mac)) {
+                char mb[MAC_STR_LEN], ib[IPV4_STR_LEN];
+
+                kprintf("%s is at %s\n", ipv4_str(target, ib, sizeof(ib)),
+                        mac_str(&mac, mb, sizeof(mb)));
+                return 0;
+            }
+            task_sleep_ms(5);
+        }
+
+        kprintf("no reply after 1 second\n");
+        return 1;
+    }
+
+    u32 n = arp_cache_count();
+
+    if (!n) {
+        kprintf("the ARP cache is empty\n");
+        return 0;
+    }
+
+    kprintf("%-16s %-18s %s\n", "ADDRESS", "MAC", "AGE");
+    for (u32 i = 0; i < n; i++) {
+        const struct arp_entry *e = arp_cache_at(i);
+        char ib[IPV4_STR_LEN], mb[MAC_STR_LEN];
+
+        if (!e)
+            break;
+
+        kprintf("%-16s %-18s %llu ms\n", ipv4_str(e->ip, ib, sizeof(ib)),
+                mac_str(&e->mac, mb, sizeof(mb)), timer_ms() - e->learned_ms);
+    }
+
+    return 0;
+}
+
+static int cmd_ping(int argc, char **argv)
+{
+    if (argc < 2) {
+        kprintf("usage: ping <address> [count]\n");
+        return 1;
+    }
+
+    if (!net_up()) {
+        kprintf("no network, or the link is down\n");
+        return 1;
+    }
+
+    ipv4_addr target;
+
+    if (!ipv4_parse(argv[1], &target)) {
+        kprintf("'%s' is not an IPv4 address\n", argv[1]);
+        return 1;
+    }
+
+    u32 count = 4;
+
+    if (argc >= 3) {
+        u32 v = 0;
+
+        if (str_to_u32(argv[2], &v) && v >= 1 && v <= 20)
+            count = v;
+    }
+
+    char ib[IPV4_STR_LEN];
+    u32 sent = 0, received = 0;
+
+    kprintf("pinging %s, %u time(s), 32 bytes of payload\n",
+            ipv4_str(target, ib, sizeof(ib)), count);
+
+    /* The identifier distinguishes our replies from anyone else's on a busy
+     * link. Derived from the clock so two pings in the same boot do not
+     * collide. */
+    u16 id = (u16)(timer_ms() & 0xFFFF);
+
+    for (u32 seq = 1; seq <= count; seq++) {
+        icmp_clear_last_reply();
+
+        u64 start = timer_ms();
+
+        if (!icmp_echo_request(target, id, (u16)seq, 32)) {
+            /* The common cause is an unresolved ARP entry: the request went
+             * out and this datagram was dropped. Saying so is the difference
+             * between a confusing first failure and an expected one. */
+            kprintf("seq %u: not sent (address not resolved yet?)\n", seq);
+            net_poll(8);
+            task_sleep_ms(50);
+            continue;
+        }
+
+        sent++;
+
+        bool got = false;
+
+        for (u32 i = 0; i < 200 && !got; i++) {
+            net_poll(8);
+
+            const struct icmp_reply *r = icmp_last_reply();
+
+            if (r->valid && r->id == id && r->seq == seq) {
+                kprintf("seq %u: reply from %s in %llu ms\n", seq,
+                        ipv4_str(r->from, ib, sizeof(ib)), r->at_ms - start);
+                received++;
+                got = true;
+                break;
+            }
+
+            task_sleep_ms(5);
+        }
+
+        if (!got)
+            kprintf("seq %u: no reply within 1 second\n", seq);
+    }
+
+    kprintf("%u sent, %u received, %u lost\n", sent, received, sent - received);
+    return received ? 0 : 1;
+}
+
+static int cmd_udpsend(int argc, char **argv)
+{
+    if (argc < 4) {
+        kprintf("usage: udpsend <address> <port> <text...>\n");
+        return 1;
+    }
+
+    ipv4_addr target;
+
+    if (!ipv4_parse(argv[1], &target)) {
+        kprintf("'%s' is not an IPv4 address\n", argv[1]);
+        return 1;
+    }
+
+    u32 port = 0;
+
+    if (!str_to_u32(argv[2], &port) || port == 0 || port > 65535) {
+        kprintf("'%s' is not a port number\n", argv[2]);
+        return 1;
+    }
+
+    /* The remaining arguments, rejoined with spaces. The shell split them,
+     * and a datagram of one word is a poor test of a length field. */
+    char text[256];
+    size_t used = 0;
+
+    for (int i = 3; i < argc && used < sizeof(text) - 1; i++) {
+        size_t n = strlen(argv[i]);
+
+        if (used + n + 1 >= sizeof(text))
+            n = sizeof(text) - 1 - used;
+
+        memcpy(text + used, argv[i], n);
+        used += n;
+
+        if (i + 1 < argc && used < sizeof(text) - 1)
+            text[used++] = ' ';
+    }
+    text[used] = '\0';
+
+    char ib[IPV4_STR_LEN];
+
+    if (!udp_send(target, 12345, (u16)port, text, used)) {
+        kprintf("not sent (address not resolved yet? try `arp %s` first)\n",
+                argv[1]);
+        return 1;
+    }
+
+    kprintf("sent %u byte(s) to %s:%u from port 12345\n", (unsigned)used,
+            ipv4_str(target, ib, sizeof(ib)), port);
+
+    /* Poll briefly, so that an echo server's reply lands before the prompt
+     * comes back and `net` can show it. */
+    for (u32 i = 0; i < 100; i++) {
+        net_poll(8);
+        task_sleep_ms(5);
+    }
+
+    return 0;
 }
 
 static int cmd_cpus(int argc, char **argv)
@@ -1382,6 +1700,14 @@ static const struct shell_command commands[] = {
     {"fuzz", "fuzz", "attack the syscall boundary from ring 3", cmd_fuzz},
     {"programs", "programs", "list the programs exec() can run", cmd_programs},
     {"cpus", "cpus", "processors, ACPI and the local APIC", cmd_cpus},
+    {"net", "net", "the Ethernet controller, addressing and per-layer counters",
+     cmd_net},
+    {"arp", "arp [address]", "show the ARP cache, or resolve an address",
+     cmd_arp},
+    {"ping", "ping <address> [count]", "ICMP echo, and wait for the reply",
+     cmd_ping},
+    {"udpsend", "udpsend <address> <port> <text...>", "send one UDP datagram",
+     cmd_udpsend},
     {"longmode", "longmode", "enter 64-bit long mode, prove it, and return",
      cmd_longmode},
     {"ipi", "ipi", "ping every other processor and time a TLB shootdown",

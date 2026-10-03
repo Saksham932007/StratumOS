@@ -39,6 +39,7 @@ BIOS ─► stage 1 ─────► stage 2 ─────► protected mode
 - [Feature matrix](#feature-matrix)
 - [Two boot paths, one kernel](#two-boot-paths-one-kernel)
 - [Performance](#performance)
+- [Networking](#networking)
 - [64-bit long mode](#64-bit-long-mode)
 - [Testing](#testing)
 - [Fuzzing](#fuzzing)
@@ -52,7 +53,7 @@ BIOS ─► stage 1 ─────► stage 2 ─────► protected mode
 
 ## The parts worth looking at
 
-Seven things in here were harder than they look, and each has a document that
+Eight things in here were harder than they look, and each has a document that
 explains the reasoning rather than the code.
 
 **One binary, two boot protocols.** `build/stratum.elf` is a single file.
@@ -92,6 +93,16 @@ touches per sector, so seven of eight should hit — and fewer than half did,
 because FAT sectors and data sectors were evicting each other. Splitting the
 cache by purpose took the hit rate from 47% to 89%.
 → [docs/STORAGE.md](docs/STORAGE.md#the-cache-and-what-measuring-it-changed)
+
+**A network stack verified against a packet capture.** An e1000 driver,
+Ethernet, ARP, IPv4, ICMP, UDP and a small TCP — the machine answers a ping
+and accepts a TCP connection. The first working driver sent every frame with
+a source MAC of zero: the log printed the right address because it printed
+the driver's copy, while the stack sent frames built from a second copy that
+was never filled. Transmit worked, receive was silent, every log line was
+correct. Only a pcap showed it, which is why CI now parses one and
+recomputes the checksums independently.
+→ [docs/NETWORK.md](docs/NETWORK.md)
 
 **16-bit to 32-bit to 64-bit, and back.** The boot processor goes from
 protected mode into 64-bit long mode on a four-level page table and returns
@@ -223,7 +234,7 @@ StratumOS stage2
   [->] entering protected mode
 
   .-----------------------------------------------------.
-  | StratumOS 0.10.0  -  x86 kernel: real mode to ring 3 |
+  | StratumOS 0.11.0  -  x86 kernel: real mode to ring 3 |
   '-----------------------------------------------------'
 [    0.000] INFO  boot: serial COM1        [ok] 115200 8N1
 [    0.000] INFO  boot: CPU detect         [ok] GenuineIntel
@@ -250,7 +261,7 @@ StratumOS stage2
 [    0.070] INFO  boot: filesystem         [ok] FAT16 "STRATUM" on hd0p1
 [    0.070] INFO  sched: scheduler ready; boot context adopted as pid 0 (idle)
 [    0.070] INFO  syscall: syscall gate installed at int 0x80 (11 calls available)
-[    0.080] INFO  boot: StratumOS 0.10.0 is up: 127 MiB RAM, 6 PCI devices, 19 test suites
+[    0.080] INFO  boot: StratumOS 0.11.0 is up: 127 MiB RAM, 6 PCI devices, 19 test suites
 ```
 
 Ring 3, exercising the syscall boundary from the untrusted side, then
@@ -604,6 +615,73 @@ the profiler's limits are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 ---
 
+## Networking
+
+```bash
+make run-net                      # boot with an Ethernet card
+stratum> ping 10.0.2.2 3
+```
+
+```
+pinging 10.0.2.2, 3 time(s), 32 bytes of payload
+seq 1: reply from 10.0.2.2 in 0 ms
+seq 2: reply from 10.0.2.2 in 0 ms
+seq 3: reply from 10.0.2.2 in 0 ms
+3 sent, 3 received, 0 lost
+```
+
+An Intel e1000, Ethernet, ARP, IPv4, ICMP, UDP and a TCP that completes a
+three-way handshake, buffers and retransmits, and closes gracefully. Tested
+against a real host-side peer through QEMU's `hostfwd` — the host's own TCP
+did the other half of the handshake:
+
+```
+TCP echo result: (b'hello from the host\n', b'second line\n')
+```
+
+Two separate writes echoed in order, connection closed to TIME_WAIT, zero
+retransmits.
+
+**The bug worth telling you about.** The first working driver transmitted
+every frame with a source MAC of `00:00:00:00:00:00`. `struct net_device`
+was `const` and its `.mac` was never filled in, so the boot log printed the
+driver's own copy — correctly — while `eth_output()` built frames from a
+second copy that was all zeros. The peer replied, politely, *to the zero
+address*, and the controller's own receive filter dropped the reply because
+it was not addressed to the card.
+
+The result: transmit worked, 204 ARP requests went out, the device's own
+counter confirmed them, receive was completely silent, and **every log line
+was right**. No assertion inside the kernel could have caught it, because
+every value the kernel could compare was consistent with itself.
+
+So CI does not read the kernel's log for this. It asks QEMU to dump every
+frame to a pcap and parses the bytes, with its own checksum implementation:
+
+```python
+# Every IPv4 header the kernel sent, checksummed here rather than trusted.
+if body[12:16] == GUEST_IP:
+    if inet_checksum(body[:ihl]) != 0:
+        bad_ip_checksum += 1
+```
+
+The two agreeing is the whole value, so the duplication is deliberate. The
+scenario also requires that no frame had a zero source hardware address, so
+that bug can never come back silently. The checksum test vectors in the
+`net` suite are real headers lifted out of a capture — generated by somebody
+else's stack, because a checksum tested against its own output is a checksum
+tested against itself.
+
+**What it deliberately does not have**, because a stack that quietly lacks
+these is one that works in a lab: no congestion control (the biggest
+omission, and why this is not a general-purpose TCP), no out-of-order
+reassembly, no IP fragment reassembly, no DHCP, no routing table beyond one
+gateway, and no sockets API — ring 3 cannot open a connection, because this
+kernel has no file descriptors for a socket to be. Each has its reasoning in
+[docs/NETWORK.md](docs/NETWORK.md).
+
+---
+
 ## 64-bit long mode
 
 The repository this project merges was called
@@ -710,8 +788,8 @@ QEMU.
 | **Host unit tests** | the kernel's real `printf`/`string`/`div64` sources, compiled for the host, diffed against glibc | 92 checks |
 | **Pre-boot validation** | Multiboot2 header and checksum, ELF type, entry point inside a load segment, load address, `.bss` alignment, the higher-half split, every embedded ring-3 program, absence of SSE | 20 failure conditions, every link |
 | **Image validation** | the boot signature, stage 1 not overlapping its own partition table, the stage 2 header pointing at a real ELF, every partition inside the image, the FAT geometry, and every file in `/BIN` being an i386 ELF with `INIT` among them | every image, every build |
-| **In-kernel suites** | allocator, paging, address spaces, copy-on-write, heap coalescing, interrupts, scheduler, processes, hardening, ATA and partitions, FAT16, ACPI/APIC/locks/IPIs, the 32→64→32 transition, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 535 checks in 20 suites |
-| **Boot scenarios** | custom bootloader unattended, **the same image on four processors**, the same image on a CPU with SMEP and SMAP, **the same image on a CPU with x86-64**, GRUB/Multiboot2 unattended, 43 shell commands typed over serial, benchmarks + profile | 7 scenarios |
+| **In-kernel suites** | allocator, paging, address spaces, copy-on-write, heap coalescing, interrupts, scheduler, processes, hardening, ATA and partitions, FAT16, ACPI/APIC/locks/IPIs, the 32→64→32 transition, checksums and the wire, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 633 checks in 21 suites |
+| **Boot scenarios** | custom bootloader unattended, **the same image on four processors**, the same image on a CPU with SMEP and SMAP, **the same image on a CPU with x86-64**, **the frames it puts on the wire, parsed from a pcap**, the same image with no Ethernet at all, GRUB/Multiboot2 unattended, 50 shell commands typed over serial, benchmarks + profile | 9 scenarios |
 | **Deliberate faults** | a write to the kernel's own `.text`, and a write below a task's stack — each must panic, naming the address, the reason and the region, and exit with the panic code | 3 scenarios |
 | **Fuzzing** | four libFuzzer targets over the **real** `elf.c`/`fat16.c`/`heap.c`/`acpi.c` under AddressSanitizer, plus 40,000 malformed system calls issued from ring 3 | 6 bugs found |
 
@@ -729,7 +807,11 @@ $ make test
     calls refused    : 21770
     result           : PASS
   [long-mode] 32-bit protected mode to 64-bit long mode, and back
-    in-kernel suites : 20/20 passed
+    in-kernel suites : 21/21 passed
+    result           : PASS
+  [network] an e1000, and the frames the kernel actually transmits
+    frames captured  : 70
+    in-kernel suites : 21/21 passed
     result           : PASS
   [benchmarks] microbenchmarks and a sampling profile
     result           : PASS
@@ -740,7 +822,7 @@ $ make test
     in-kernel suites : 19/19 passed
     result           : PASS
 
-run-tests: all 10 scenario(s) passed
+run-tests: all 12 scenario(s) passed
 ```
 
 Three details that make this work unattended:
@@ -1018,6 +1100,7 @@ Being clear about scope is more useful than a longer feature list.
 | [docs/STORAGE.md](docs/STORAGE.md) | the ATA driver, the partition table, FAT16, and where a program comes from |
 | [docs/SMP.md](docs/SMP.md) | ACPI, the APIC, the AP trampoline, real locks, TLB shootdown |
 | [docs/LONGMODE.md](docs/LONGMODE.md) | 32-bit to 64-bit long mode and back, the four-level table, and the boundary of the claim |
+| [docs/NETWORK.md](docs/NETWORK.md) | the e1000, the ring protocol, the checksum's two classic bugs, and what the stack deliberately lacks |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | benchmark methodology, results with analysis, the profiler and its limits |
 | [docs/TESTING.md](docs/TESTING.md) | the five test layers and how to add to each |
 | [docs/FUZZING.md](docs/FUZZING.md) | both fuzzing harnesses, the shim's design, and the six bugs they found |

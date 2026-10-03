@@ -30,6 +30,7 @@
 #include <arch/longmode.h>
 
 #include <drivers/ata.h>
+#include <drivers/e1000.h>
 #include <drivers/keyboard.h>
 #include <drivers/pci.h>
 #include <drivers/rtc.h>
@@ -58,6 +59,7 @@
 
 #include <fs/blockdev.h>
 #include <fs/fat16.h>
+#include <net/net.h>
 
 /* QEMU `isa-debug-exit` turns a port write into a process exit status of
  * (code << 1) | 1, so these become 3, 5 and 35 respectively. */
@@ -409,9 +411,44 @@ void kmain(u32 magic, u32 info_addr)
         const char *why = NULL;
         bool usable = longmode_available(&why);
 
-        log_boot_step("x86-64", longmode_supported(),
+        /* `ok` is whether the detection worked, not whether the feature is
+         * there: a 32-bit processor without long mode is running this kernel
+         * exactly as intended, and a [FAIL] beside it reads as something
+         * broken. The hardening step words SMEP and SMAP the same way. */
+        log_boot_step("x86-64", true,
                       usable ? "long mode available; `longmode` to enter it"
-                             : (why ? why : "not available"));
+                             : (why ? why : "not available on this CPU"));
+    }
+
+    /* Networking. After the PCI scan that found the controller and after
+     * interrupts, because the driver installs a handler; before the
+     * filesystem only by convention. A machine with no supported controller
+     * carries on without one. */
+    {
+        bool have_net = e1000_init();
+
+        char net_detail[80];
+
+        if (have_net) {
+            net_init();
+
+            char mb[MAC_STR_LEN], ib[IPV4_STR_LEN];
+            struct e1000_info ei;
+
+            e1000_get_info(&ei);
+            ksnprintf(net_detail, sizeof(net_detail), "%s, %s, link %s",
+                      mac_str(&ei.mac, mb, sizeof(mb)),
+                      ipv4_str(net_get_config()->addr, ib, sizeof(ib)),
+                      ei.link_up ? "up" : "down");
+        } else {
+            strlcpy(net_detail, "no supported controller", sizeof(net_detail));
+        }
+
+        /* `ok` is whether the step did its job, not whether the hardware
+         * exists - a machine with no Ethernet controller boots exactly as
+         * intended, and [FAIL] beside it reads as something broken. Same
+         * reasoning as the x86-64 line above. */
+        log_boot_step("network", true, net_detail);
     }
 
     /* Storage. The ATA driver polls, so it needs nothing from the interrupt
@@ -451,6 +488,10 @@ void kmain(u32 magic, u32 info_addr)
     /* 11. Tasks, then the syscall gate they will use. */
     sched_init();
     log_boot_step("scheduler", true, "round robin, 100 Hz preemption");
+
+    /* The network's polling thread, now that there is something to schedule.
+     * Does nothing if no controller was found. */
+    net_start();
 
     syscall_init();
     log_boot_step("syscalls", true, "int 0x80");

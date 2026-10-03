@@ -8,7 +8,7 @@
 #include <kernel/types.h>
 
 #define STRATUM_NAME    "StratumOS"
-#define STRATUM_VERSION "0.10.0"
+#define STRATUM_VERSION "0.11.0"
 
 /* Address-space constants and phys/virt translation live in
  * kernel/layout.h, which this header re-exports. */

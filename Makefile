@@ -8,6 +8,7 @@
 #   make test         host unit tests + both boot paths under QEMU, headless
 #   make fuzz         libFuzzer over the real parsers, bounded (needs clang)
 #   make run-x86-64   boot on a CPU that has long mode, for `longmode`
+#   make run-net      boot with an Ethernet card, dumping frames to a pcap
 #   make debug        start QEMU stopped, waiting for GDB on :1234
 #   make gdb          attach GDB to a waiting QEMU
 #   make clean        remove build output
@@ -107,6 +108,7 @@ C_SOURCES := $(sort $(wildcard $(KSRC)/core/*.c) \
                     $(wildcard $(KSRC)/mm/*.c) \
                     $(wildcard $(KSRC)/drivers/*.c) \
                     $(wildcard $(KSRC)/fs/*.c) \
+                    $(wildcard $(KSRC)/net/*.c) \
                     $(wildcard $(KSRC)/shell/*.c))
 
 ASM_SOURCES := $(sort $(wildcard $(KSRC)/arch/x86/*.asm))
@@ -163,6 +165,7 @@ all: $(DISK_IMG) $(ISO) $(TEST_IMG) $(TEST_ISO) $(SHELL_IMG) $(BENCH_IMG)
 	@echo "  make run-iso  boot through GRUB"
 	@echo "  make test     run every test, headless"
 	@echo "  make fuzz     fuzz the parsers (see docs/FUZZING.md)"
+	@echo "  make run-net  boot with a network card (see docs/NETWORK.md)"
 	@echo
 
 .PHONY: kernel
@@ -429,6 +432,20 @@ run-iso: $(ISO)
 # qemu-system-i386 masks CPUID.80000001H:EDX.LM even with -cpu max, so on it
 # this kernel correctly reports that long mode is unavailable. Type
 # `longmode` at the shell. See docs/LONGMODE.md.
+# With an Ethernet controller attached, for `net`, `ping` and the echo ports.
+# QEMU attaches a default e1000 anyway, but naming it explicitly pins the
+# device model, and the dump gives a capture to read afterwards - which is how
+# the driver's first real bug was found. See docs/NETWORK.md.
+QEMU_NET := -netdev user,id=n0 \
+            -device e1000,netdev=n0 \
+            -object filter-dump,id=d0,netdev=n0,file=$(BUILD)/net.pcap
+
+.PHONY: run-net
+run-net: $(SHELL_IMG)
+	@echo "  frames will be dumped to $(BUILD)/net.pcap"
+	$(QEMU) $(QEMU_COMMON) $(QEMU_SERIAL) $(QEMU_NET) \
+		-drive format=raw,file=$(SHELL_IMG),index=0,media=disk
+
 QEMU64 ?= qemu-system-x86_64
 
 .PHONY: run-x86-64

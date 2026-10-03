@@ -10,7 +10,7 @@
 #   1. host-tests    pure unit tests, no emulator        (~10 s)
 #   2. build         cross-toolchain build + validation  (~1 min)
 #   3. fuzz          libFuzzer over real kernel sources  (~2 min)
-#   4. boot-tests    QEMU, ten scenarios                 (~7 min)
+#   4. boot-tests    QEMU, twelve scenarios              (~9 min)
 #   5. analysis      static analysis and style           (~1 min)
 
 name: CI
@@ -154,13 +154,18 @@ jobs:
       - name: Build
         run: make all
 
-      # Ten scenarios: the custom bootloader from a raw disk, Multiboot2 via
-      # GRUB from an ISO, the same image on four processors, the same image on
-      # a CPU that has SMEP and SMAP, the same image on a CPU that has x86-64,
-      # the shell driven command by command over the serial console, 40,000
-      # malformed system calls issued from ring 3, the benchmark image, and
-      # three faults that must panic and say why. Each asserts on the kernel's
-      # own output and on its exit status.
+      # Twelve scenarios: the custom bootloader from a raw disk, Multiboot2
+      # via GRUB from an ISO, the same image on four processors, the same
+      # image on a CPU that has SMEP and SMAP, the same image on a CPU that
+      # has x86-64, the same image with an e1000 attached and with none at
+      # all, the shell driven command by command over the serial console,
+      # 40,000 malformed system calls issued from ring 3, the benchmark
+      # image, and three faults that must panic and say why.
+      #
+      # Eleven assert on the kernel's own output and its exit status. The
+      # `network` one does not: it has QEMU dump every frame to a pcap and
+      # parses the bytes, because the driver's first real bug was invisible
+      # in the log. See docs/NETWORK.md.
       #
       # The x86-64 one runs under qemu-system-x86_64 rather than
       # qemu-system-i386: the i386 target masks CPUID.80000001H:EDX.LM even

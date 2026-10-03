@@ -112,13 +112,13 @@ Checking them takes 30 milliseconds.
 
 ## Layer 3: in-kernel suites
 
-`kernel/core/ktest.c` holds 20 suites and 535 assertions, run against
+`kernel/core/ktest.c` holds 21 suites and 633 assertions, run against
 real hardware state — a bitmap with actual firmware-reported memory in it, real
 page tables, a real heap, a real scheduler.
 
 ```
 stratum> selftest
-ktest: running 20 suites
+ktest: running 21 suites
 ktest: string ... PASS (15 checks)
 ktest: boot ... PASS (26 checks)
 ktest: cpu ... PASS (8 checks)
@@ -137,18 +137,24 @@ ktest: fs ... PASS (56 checks)
 ktest: smp ... PASS (74 checks)
 ktest: bootpd ... PASS (17 checks)
 ktest: longmode ... PASS (51 checks)
+ktest: net ... PASS (98 checks)
 ktest: ksyms ... PASS (12 checks)
 ktest: profile ... PASS (9 checks)
-ktest: summary 20/20 suites passed
+ktest: summary 21/21 suites passed
 ```
 
 That transcript is from a run with four processors on a machine that has
 x86-64, which is the configuration where every suite takes its widest path.
-Two of them scale with the machine: `smp` checks each processor's APIC id,
+Three of them scale with the machine: `smp` checks each processor's APIC id,
 stack, TSS and online transition, so one processor gives 49 rather than 74;
-and `longmode` gives 17 rather than 51 where the processor has no long mode
-to enter. On the default `qemu-system-i386` scenarios with one processor the
-total is 459. Every other suite's count is fixed.
+`longmode` gives 17 rather than 51 where the processor has no long mode to
+enter; and `net` gives 63 rather than 98 where there is no Ethernet
+controller. On one processor with no long mode the total is 539.
+
+Each of those three logs which path it took, and the scenario that exercises
+the wider path asserts the *check count* — see
+[DESIGN-DECISIONS.md](DESIGN-DECISIONS.md) entry 34 for why that matters more
+than it sounds.
 
 | Suite | What it establishes |
 | --- | --- |
@@ -207,8 +213,11 @@ table.
 
 ## Layer 4: boot scenarios
 
-`tools/run-tests.py` boots the kernel ten ways and asserts on what it says.
-Seven of them must come up clean; three of them must *panic*.
+`tools/run-tests.py` boots the kernel twelve ways and asserts on what it
+says. Nine of them must come up clean; three of them must *panic*.
+
+One of the twelve does not assert on what the kernel says at all: the
+`network` scenario asserts on the bytes it put on the wire. See below.
 
 Nine run under `qemu-system-i386`, which is the machine this kernel targets.
 One - `long-mode` - runs under `qemu-system-x86_64`, because the i386 target
@@ -390,6 +399,40 @@ not enough on its own: a scenario where the suite quietly took its
 17-check path would pass every other expectation while testing none of the
 feature. Checking the *count* is what distinguishes "it ran" from "it was
 skipped". See [LONGMODE.md](LONGMODE.md).
+
+### The network scenario, and the pcap
+
+The only scenario that does not assert on the kernel's own output. QEMU is
+given `filter-dump`, which writes every frame in both directions to a
+libpcap file, and the harness parses it.
+
+That distinction is not stylistic. The driver's first working version
+transmitted every frame with a source MAC of `00:00:00:00:00:00`, because
+`struct net_device` was `const` and its `.mac` was never filled: the log
+printed the driver's own copy, correctly, while the stack built frames from a
+second copy that was empty. The peer replied to the zero address and the
+controller's receive filter dropped the reply. Transmit worked, receive was
+silent, and **every log line was right**. No assertion inside the kernel
+could have found it.
+
+So the harness has its own checksum:
+
+```python
+def inet_checksum(b: bytes) -> int:
+    """RFC 1071, written independently of the kernel's version so that the
+    two agreeing means something."""
+```
+
+and asserts, over every frame the kernel sent: a well-formed ARP request from
+`10.0.2.15` to the broadcast address, a reply from the gateway, an echo
+request out, an echo reply in, a correct IPv4 header checksum on every
+datagram, a correct ICMP checksum, and — specifically, so it can never return
+silently — that no frame had a zero source hardware address.
+
+The `no-network` scenario is its counterpart. QEMU attaches a default e1000
+unless told otherwise, which means every other scenario has a network whether
+it asked for one or not, so the path where there is no controller would never
+run. `-nic none` is what exercises it.
 
 ### The benchmark scenario
 
