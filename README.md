@@ -1,31 +1,47 @@
 # StratumOS
 
-A 32-bit x86 kernel and bootloader, written from scratch in C and assembly.
-It takes a machine from the BIOS's first instruction in 16-bit real mode to a
-preemptively scheduled, higher-half, paged kernel with per-process address
-spaces, copy-on-write `fork`, `exec` from a FAT16 filesystem on disk, and a
-hardened kernel/user boundary enforced by SMEP, SMAP and `CR0.WP`.
+An operating system kernel and bootloader, written from scratch in C and
+assembly. It takes a machine from the BIOS's first instruction in 16-bit real
+mode to a preemptively scheduled, higher-half, paged kernel with per-process
+address spaces, copy-on-write `fork`, `exec` from a FAT16 filesystem on disk,
+a TCP/IP stack over a real Ethernet controller, and a hardened kernel/user
+boundary enforced by SMEP, SMAP and `CR0.WP`.
+
+It also reaches 64-bit long mode and back, and the portable half of it runs
+on RISC-V 64.
 
 [![CI](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml/badge.svg)](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml)
-![language](https://img.shields.io/badge/C11%20%2B%20NASM-22.4k%20lines-blue)
-![arch](https://img.shields.io/badge/arch-x86%20(i686)-lightgrey)
+![language](https://img.shields.io/badge/C11%20%2B%20asm-32.5k%20lines-blue)
+![arch](https://img.shields.io/badge/arch-i686%20%2B%20riscv64-lightgrey)
+![tests](https://img.shields.io/badge/tests-633%20assertions%2C%2012%20boot%20scenarios-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 The same kernel binary boots two ways — through a bootloader written for this
-project, and through GRUB via Multiboot2 — and every push runs 576 assertions
-across 92 host unit tests, 19 in-kernel suites, and eight QEMU boot scenarios.
-Two of those scenarios are required to **panic**, because a mitigation has two
-halves and only one of them can be checked by a test that passes.
+project, and through GRUB via Multiboot2 — and every push runs **633
+assertions across 92 host unit tests, 21 in-kernel suites and 12 QEMU boot
+scenarios**, plus four libFuzzer targets over the real kernel sources and the
+same kernel built and booted for a second architecture.
+
+Two of those scenarios are required to **panic**, because a mitigation has
+two halves and only one of them can be checked by a test that passes. One
+asserts on a **packet capture** rather than on anything the kernel says,
+because the driver's first real bug was invisible in the log.
 
 ```
 BIOS ─► stage 1 ─────► stage 2 ─────► protected mode ─► kernel ──────► /bin/INIT ─► ring 3
         512 B MBR      A20 gate       flat GDT          higher half    ATA PIO      fork
         LBA + CHS      E820 map       CR0.PE            @0xC0000000    MBR table    COW
         retry/verify   32 KiB reads   ELF32 loader      paging, heap   FAT16        exec
-        + partition                                     SMEP/SMAP                   wait
-          table                                         W^X                       int 0x80
+        + partition                                     SMEP/SMAP      e1000        wait
+          table                                         W^X            ARP/IP/TCP int 0x80
 
                GRUB ─► Multiboot2 ─────────────────────► (same kernel binary)
+
+                            on demand ─► 64-bit long mode ─► and back again
+                                         4-level paging       32-bit kernel intact
+
+   RISC-V 64 ─► machine mode ─► supervisor mode ─► Sv39 paging ─► the shared code
+                reset vector     mret               3 levels        same source files
 ```
 
 ---
@@ -55,7 +71,8 @@ BIOS ─► stage 1 ─────► stage 2 ─────► protected mode
 ## The parts worth looking at
 
 Nine things in here were harder than they look, and each has a document that
-explains the reasoning rather than the code.
+explains the reasoning rather than the code — plus one piece of test design
+that the rest depends on.
 
 **One binary, two boot protocols.** `build/x86/stratum.elf` is a single file.
 GRUB finds a Multiboot2 header in it; the bootloader in `boot/` parses its ELF
@@ -183,13 +200,30 @@ Concretely, from power-on:
    reset with INIT-SIPI-SIPI, each one repeating the 16-bit → 32-bit → paging
    → higher-half journey in a 176-byte trampoline before landing in C with
    its own GDT entry, TSS, stack and local APIC.
-9. **The shell** runs as a scheduled task, reachable from the VGA console or
-   over a serial line, with line editing and command history.
+9. **The network** comes up if there is an Intel e1000 on the PCI bus: the
+   driver sets up descriptor rings the device reads by DMA, answers an ARP
+   who-has so the machine can be found, replies to a ping, and listens on a
+   TCP port that completes a three-way handshake and echoes.
+10. **The shell** runs as a scheduled task, reachable from the VGA console or
+    over a serial line, with line editing and command history.
 
 Along the way the kernel narrows its own permissions: its `.text` and
 `.rodata` become read-only, SMEP and SMAP are enabled where the CPU has them,
 and every task stack gets an unmapped guard page below it. `harden` reports
 what is actually switched on, read back from CR4 and the page tables.
+
+Three more things are there but not on the boot path, because each takes
+interrupts down or costs time that every boot should not pay:
+
+- **`longmode`** drives the boot processor from 32-bit protected mode into
+  64-bit long mode on a four-level page table and brings it back, with the
+  32-bit kernel still running. Detection is reported at boot; the transition
+  happens on demand.
+- **`fuzz`** issues 40,000 deliberately malformed system calls from ring 3,
+  and the pass condition is that the kernel is still running afterwards.
+- **`make ARCH=riscv64`** builds the same kernel's portable half for RISC-V 64
+  and runs it on QEMU's `virt` board — machine mode to supervisor mode to
+  Sv39 paging.
 
 Every subsystem listed above is implemented and tested rather than announced.
 
@@ -202,29 +236,60 @@ Every subsystem listed above is implemented and tested rather than announced.
 sudo apt install build-essential nasm gcc-multilib libc6-dev-i386 \
                  qemu-system-x86 grub-pc-bin grub-common xorriso mtools
 
+# optional: the second architecture and the fuzzers
+sudo apt install clang lld llvm qemu-system-misc
+
 git clone https://github.com/Saksham932007/StratumOS.git
 cd StratumOS
 
 make              # kernel, disk image, GRUB ISO, and the test images
 make run          # boot through the custom bootloader
 make run-iso      # boot through GRUB / Multiboot2
-make test         # host unit tests + seven QEMU boot scenarios
+make test         # host unit tests + 12 QEMU boot scenarios
 ```
 
-`make toolchain` reports exactly which tools were found. An `i686-elf-gcc`
-cross-compiler is used automatically if one is on `PATH`; otherwise the host
-GCC is driven with `-m32`, which works on any x86-64 Linux with multilib.
+`make toolchain` reports exactly which tools were found, and for which
+architecture. An `i686-elf-gcc` cross-compiler is used automatically if one is
+on `PATH`; otherwise the host GCC is driven with `-m32`, which works on any
+x86-64 Linux with multilib. RISC-V needs no extra toolchain at all — clang
+cross-compiles to it and `ld.lld` links it.
 
-Other useful targets:
+### Two architectures, one variable
+
+`ARCH` selects the toolchain, the flags, the source set, the linker script,
+the object tree, and what `run` and `test` mean. Objects go to
+`build/$(ARCH)`, so both can be built side by side:
+
+```bash
+make                           # ARCH=x86, the default
+make ARCH=riscv64              # rv64imac on QEMU's virt board
+make ARCH=riscv64 run
+make ARCH=riscv64 test
+```
+
+The list of architectures is discovered from `kernel/arch/*/arch.mk` rather
+than written down, so the error cannot go stale:
+
+```
+$ make ARCH=sparc
+Makefile:47: *** unknown ARCH 'sparc' - available: riscv64 x86.  Stop.
+```
+
+### Other useful targets
 
 | Target | What it does |
 | --- | --- |
 | `make run-serial` | boot headless, serial on stdio — the shell works over it |
+| `make run-net` | boot with an e1000 attached, dumping every frame to a pcap |
+| `make run-x86-64` | the same 32-bit image on a CPU that has long mode |
 | `make debug` | start QEMU stopped, waiting for GDB on `:1234` |
 | `make gdb` | attach GDB with symbols, break at `kmain` |
 | `make sections` | dump the image layout and re-run the pre-boot validator |
 | `make bench` | run the microbenchmarks and a profile, then exit |
 | `make test-host` | host unit tests only (no emulator, ~1 second) |
+| `make fuzz` | four libFuzzer targets over the real parsers, bounded |
+| `make fuzz-repro TARGET=elf CASE=crash-…` | replay one crash, with kernel logging on |
+| `make portability` | measure how much of the kernel builds for riscv64 |
 | `make fs` | rebuild the FAT16 filesystem image and describe its layout |
 | `make image-check` | validate a built disk image: MBR, BPB, `/BIN` contents |
 | `make lines` | line counts by subsystem |
@@ -509,11 +574,50 @@ Everything marked ✅ is implemented and covered by a test.
 | ✅ | **IPIs and TLB shootdown**, acknowledged by every processor before the sender continues |
 | ✅ | Drivers: 16550 (in and out), VGA text, PIT, PS/2 keyboard, CMOS RTC, PCI |
 | ✅ | `kprintf` with width/precision/64-bit support, levelled logging |
+| ✅ | **Per-call-site log rate limiting**, so ring 3 cannot flood the console |
 | ✅ | 64-bit division helpers — the kernel links against nothing at all |
-| ✅ | 31-command shell with line editing, history, and fault injection |
+| ✅ | 37-command shell with line editing, history, and fault injection |
 | ✅ | Embedded symbol table: panics print `function+0x1c`, no addr2line needed |
 | ✅ | 14 TSC-calibrated microbenchmarks, overhead-subtracted, median of 24 |
 | ✅ | Timer-driven sampling profiler with symbol attribution |
+
+### Networking
+
+| | |
+| --- | --- |
+| ✅ | **Intel e1000 driver** — PCI probe, bus mastering, MMIO registers mapped uncached, MAC from RAL/RAH with an EEPROM fallback |
+| ✅ | **Descriptor rings the device reads by DMA**, with the one-slot-unused rule and compiler barriers on both |
+| ✅ | Interrupt-driven receive, plus a polling thread for the protocol timers |
+| ✅ | Ethernet framing and filtering; ARP with a cache that ages out |
+| ✅ | **IPv4** — header validation, the one's-complement checksum, one-gateway routing |
+| ✅ | **ICMP echo both ways** — the machine answers a ping, and `ping` works from the shell |
+| ✅ | **UDP** with the pseudo-header checksum, and the zero-means-none special case |
+| ✅ | **TCP**: three-way handshake, MSS option, a real send queue, retransmission with a bounded retry, half-open timeout, graceful close, and RFC 793 resets built from the offending segment |
+| ✅ | Per-layer counters, because "the ping did not come back" is a question about which layer stopped it |
+| ✅ | Verified against a **packet capture** parsed by CI, not against the kernel's own log |
+| ❌ | No congestion control, no out-of-order reassembly, no IP fragment reassembly, no DHCP, no sockets API — each with its reasoning in [docs/NETWORK.md](docs/NETWORK.md) |
+
+### Beyond 32-bit x86
+
+| | |
+| --- | --- |
+| ✅ | **64-bit long mode, entered and left** — four-level page table, the documented enable sequence, a payload that is impossible in 32-bit mode, and the kernel still running afterwards |
+| ✅ | **A second architecture**: RISC-V 64 on QEMU's `virt` board — machine mode to supervisor mode by `mret`, two trap vectors, the CLINT timer, Sv39 three-level paging |
+| ✅ | The formatter, string layer, 64-bit division and logger linked into it **from the same source files** the x86 kernel uses |
+| ✅ | **55% of the kernel outside the architecture layer** compiles for RISC-V unmodified, measured by `make portability` rather than claimed |
+| ✅ | One `ARCH` variable drives both builds; each architecture's build lives beside its code |
+| ❌ | Not a 64-bit kernel and not a full port — the boundary of each claim is in [docs/LONGMODE.md](docs/LONGMODE.md) and [docs/PORTING.md](docs/PORTING.md) |
+
+### Testing and tooling
+
+| | |
+| --- | --- |
+| ✅ | **21 in-kernel suites, 633 assertions**, run against real hardware state |
+| ✅ | **12 QEMU boot scenarios** — both boot paths, four processors, SMEP/SMAP, x86-64, an e1000, no e1000, and two that must panic |
+| ✅ | **Four libFuzzer targets over the real kernel sources** under AddressSanitizer, plus a ring-3 syscall fuzzer |
+| ✅ | 20 pre-boot validation checks on every link, before an image is ever booted |
+| ✅ | A disk-image validator: the MBR, the FAT geometry, every file in `/BIN` |
+| ✅ | 38 recorded design decisions, each with the alternatives that were rejected |
 
 ---
 
@@ -910,8 +1014,8 @@ QEMU.
 | **Pre-boot validation** | Multiboot2 header and checksum, ELF type, entry point inside a load segment, load address, `.bss` alignment, the higher-half split, every embedded ring-3 program, absence of SSE | 20 failure conditions, every link |
 | **Image validation** | the boot signature, stage 1 not overlapping its own partition table, the stage 2 header pointing at a real ELF, every partition inside the image, the FAT geometry, and every file in `/BIN` being an i386 ELF with `INIT` among them | every image, every build |
 | **In-kernel suites** | allocator, paging, address spaces, copy-on-write, heap coalescing, interrupts, scheduler, processes, hardening, ATA and partitions, FAT16, ACPI/APIC/locks/IPIs, the 32→64→32 transition, checksums and the wire, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 633 checks in 21 suites |
-| **Boot scenarios** | custom bootloader unattended, **the same image on four processors**, the same image on a CPU with SMEP and SMAP, **the same image on a CPU with x86-64**, **the frames it puts on the wire, parsed from a pcap**, the same image with no Ethernet at all, GRUB/Multiboot2 unattended, 50 shell commands typed over serial, benchmarks + profile | 9 scenarios |
-| **Deliberate faults** | a write to the kernel's own `.text`, and a write below a task's stack — each must panic, naming the address, the reason and the region, and exit with the panic code | 3 scenarios |
+| **Boot scenarios** | custom bootloader unattended, **the same image on four processors**, the same image on a CPU with SMEP and SMAP, **the same image on a CPU with x86-64**, **the frames it puts on the wire, parsed from a pcap**, the same image with no Ethernet at all, GRUB/Multiboot2 unattended, 50 shell commands typed over serial, benchmarks + profile | 10 scenarios |
+| **Deliberate faults** | a write to the kernel's own `.text`, and a write below a task's stack — each must panic, naming the address, the reason and the region, and exit with the panic code | 2 scenarios |
 | **Fuzzing** | four libFuzzer targets over the **real** `elf.c`/`fat16.c`/`heap.c`/`acpi.c` under AddressSanitizer, plus 40,000 malformed system calls issued from ring 3 | 6 bugs found |
 
 ```
@@ -1028,15 +1132,26 @@ boot/                      the bootloader — real mode, then the PM switch
 
 kernel/
   arch/x86/                everything that is x86 rather than kernel
+    sources.mk arch.mk     what this architecture compiles, and how
     boot.asm               Multiboot2 header + the unified entry point
     isr.asm                256 generated interrupt stubs, one common tail
     switch.asm             context switch and the new-task trampoline
     usermode.asm           the forged IRET frame that reaches ring 3
     gdt.c idt.c irq.c      descriptor tables, dispatch, 8259 PIC
     cpu.c                  CPUID, reset, QEMU exit
+    harden.c               W^X, SMEP/SMAP, and reading them back
     acpi.c                 RSDP, RSDT/XSDT, the MADT
     apic.c                 the local APIC, IPIs, INIT-SIPI-SIPI
     ap_boot.asm            176 bytes: a second CPU, real mode to the higher half
+    longmode.c             four-level tables, and the boundary of the claim
+    longmode_tramp.asm     32-bit -> 64-bit -> 32-bit, from a low copy
+  arch/riscv64/            the second architecture
+    sources.mk arch.mk     the same contract, 160 lines instead of 520
+    boot.S                 park the other harts, then mret into S-mode
+    trap_entry.S           31 registers saved by hand; there is no pushad
+    trap.c                 two vectors, and decoding instruction length
+    paging.c               Sv39: three levels, and no recursive window
+    timer.c uart.c main.c  the CLINT, a 16550, and 58 assertions
   mm/
     pmm.c                  bitmap physical frame allocator
     vmm.c                  paging, recursive page directory, fault reporting
@@ -1044,6 +1159,11 @@ kernel/
   fs/
     blockdev.c             MBR partitions, and the bounds check for each
     fat16.c                read-only FAT16: BPB, chains, 8.3 names
+  net/                     the protocol stack, all of it portable
+    net.c                  addresses, the checksum, Ethernet, the frame builder
+    arp.c                  a cache that ages out, and why a miss drops
+    ipv4.c                 header validation, ICMP echo, the pseudo-header
+    udp.c tcp.c            and a TCP with a real send queue
   core/
     bootinfo.c             the two boot protocols, normalised
     sched.c                scheduler, tasks, fork, wait, the zombie reaper
@@ -1055,13 +1175,15 @@ kernel/
     bench.c profile.c      microbenchmarks and the sampling profiler
     ksyms.c                the embedded symbol table
     printf.c log.c panic.c string.c div64.c ktest.c kmain.c
-  drivers/                 serial, vga, timer, keyboard, rtc, pci, ata
-  shell/shell.c            31 commands, line editing, history
+  drivers/                 serial, vga, timer, keyboard, rtc, pci, ata, e1000
+  shell/shell.c            37 commands, line editing, history
   include/                 headers, grouped by subsystem
+    kernel/irqflags.h      the one thing portable code needs from the CPU
 
 user/                      ring-3 programs, built as separate ELFs
   init.c                   started at boot; probes the boundary, forks, execs
   hello.c                  what exec() replaces a process with
+  fuzz.c                   40,000 malformed syscalls, from the untrusted side
   syscall.h                the stubs, and the little runtime a libc-less
                            program needs
   user.ld                  linked at 0x00400000 — a user address
@@ -1071,12 +1193,21 @@ tools/
   mkfat.py                 write a FAT16 filesystem from a directory tree
   check-image.py           validate a built image: MBR, BPB, /BIN contents
   check-kernel.py          validate a linked kernel before it is ever booted
-  run-tests.py             the QEMU harness
+  run-tests.py             the QEMU harness, including the pcap assertions
+  run-riscv64.py           the second architecture's harness
+  portability.py           how much of the kernel builds for riscv64
+  fuzz-seed.py             40 corpus inputs from the build's own artefacts
+  gen-ksyms.py             the embedded symbol table, in three passes
+  link-riscv64.ld          and the riscv64 link map
   grub.cfg grub-test.cfg
 
-tests/host/                unit tests that need no emulator
-linker/kernel.ld           the link script, with its constraints documented
-docs/                      architecture, boot, memory, testing, debugging
+tests/
+  host/                    unit tests that need no emulator
+  fuzz/                    four libFuzzer targets over the real kernel sources
+    shim.c                 what a kernel provides, so elf.c is fuzzed unmodified
+
+linker/kernel.ld           the x86 link script, with its constraints documented
+docs/                      17 documents: one per subsystem, plus the decisions
 ```
 
 ---
@@ -1174,8 +1305,7 @@ Being clear about scope is more useful than a longer feature list.
   updates both copies, extends a directory entry's chain, and survives being
   interrupted between any two of those — a journalling problem rather than a
   filesystem-format one.
-- **No long filenames, no `argv`, no file descriptors.** FAT's 8.3 names only;
-  `exec` takes a path and nothing else.
+- **No long filenames.** FAT's 8.3 names only.
 - **No DMA and no disk interrupts.** The ATA driver is PIO and polled, which
   burns a timeslice per read on real hardware. The trade-off, and what it
   buys, is in [docs/STORAGE.md](docs/STORAGE.md#ata-by-programmed-io).
@@ -1188,7 +1318,10 @@ Being clear about scope is more useful than a longer feature list.
   distribution and no affinity.
 - **No `argv`, environment or file descriptors.** `exec` takes a program
   name and nothing else; `write` goes to the console unconditionally, so
-  `fork` has no descriptor table to duplicate.
+  `fork` has no descriptor table to duplicate. This is also why the network
+  stack has no sockets API: there is no `open`, so there is nothing a socket
+  could be. It is the first item on the roadmap, as a process-model change
+  rather than a network one.
 - **No signals, process groups or `kill`.** A process leaves through `exit`
   or a fault.
 - **No demand paging.** A program's image is mapped eagerly; copy-on-write
@@ -1205,6 +1338,22 @@ Being clear about scope is more useful than a longer feature list.
   [docs/ROADMAP.md](docs/ROADMAP.md).
 - **Empty page tables are never reclaimed.** Unmapping the last page in a
   4 MiB region leaves its table allocated.
+- **TCP has no congestion control.** No slow start, no congestion window, no
+  fast retransmit. It sends what the peer's window allows, which on a
+  congested path is antisocial — the single biggest reason this is not a
+  general-purpose TCP. Nor is there out-of-order reassembly, IP fragment
+  reassembly, DHCP or window scaling; each has its reasoning in
+  [docs/NETWORK.md](docs/NETWORK.md).
+- **Long mode is a transition, not a 64-bit kernel.** The processor is driven
+  into it and back, under test — but the kernel's own code stays 32-bit. A
+  port needs a 64-bit IDT, new calling conventions in every stub,
+  `SYSCALL`/`SYSRET` and a four-level VMM; the five steps are enumerated in
+  [docs/LONGMODE.md](docs/LONGMODE.md).
+- **The RISC-V port is 55% of the shared code, not the whole kernel.** The
+  scheduler's mechanism, `mm/vmm.c`, ring 3, the other harts and the e1000
+  are not ported, each for a stated reason in
+  [docs/PORTING.md](docs/PORTING.md). The measurement is the deliverable, and
+  `make portability` regenerates it.
 
 ---
 

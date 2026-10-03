@@ -223,7 +223,7 @@ table.
 ## Layer 4: boot scenarios
 
 `tools/run-tests.py` boots the kernel twelve ways and asserts on what it
-says. Nine of them must come up clean; three of them must *panic*.
+says. Ten of them must come up clean; two of them must *panic*.
 
 One of the twelve does not assert on what the kernel says at all: the
 `network` scenario asserts on the bytes it put on the wire. See below.
