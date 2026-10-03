@@ -39,6 +39,7 @@ BIOS ─► stage 1 ─────► stage 2 ─────► protected mode
 - [Feature matrix](#feature-matrix)
 - [Two boot paths, one kernel](#two-boot-paths-one-kernel)
 - [Performance](#performance)
+- [64-bit long mode](#64-bit-long-mode)
 - [Testing](#testing)
 - [Fuzzing](#fuzzing)
 - [Repository layout](#repository-layout)
@@ -51,7 +52,7 @@ BIOS ─► stage 1 ─────► stage 2 ─────► protected mode
 
 ## The parts worth looking at
 
-Six things in here were harder than they look, and each has a document that
+Seven things in here were harder than they look, and each has a document that
 explains the reasoning rather than the code.
 
 **One binary, two boot protocols.** `build/stratum.elf` is a single file.
@@ -91,6 +92,17 @@ touches per sector, so seven of eight should hit — and fewer than half did,
 because FAT sectors and data sectors were evicting each other. Splitting the
 cache by purpose took the hit rate from 47% to 89%.
 → [docs/STORAGE.md](docs/STORAGE.md#the-cache-and-what-measuring-it-changed)
+
+**16-bit to 32-bit to 64-bit, and back.** The boot processor goes from
+protected mode into 64-bit long mode on a four-level page table and returns
+with the 32-bit kernel still running. The payload is chosen to be
+*impossible* in 32-bit mode rather than merely different — a 64-bit
+immediate, `0xFFFFFFFF + 1` carrying past bit 31 in one instruction,
+RIP-relative addressing, `EFER.LMA` read back from the processor — and the
+strongest check reads through a 64-bit pointer at an address the identity map
+does not cover, so only the four-level walk can resolve it. It is a tested
+transition, deliberately not a half-finished port.
+→ [docs/LONGMODE.md](docs/LONGMODE.md)
 
 **Fuzzing the real kernel sources, not a copy of them.** `build/fuzz/fuzz_elf`
 links `kernel/core/elf.c` — byte for byte the file that boots — against a shim
@@ -211,7 +223,7 @@ StratumOS stage2
   [->] entering protected mode
 
   .-----------------------------------------------------.
-  | StratumOS 0.9.0  -  x86 kernel: real mode to ring 3 |
+  | StratumOS 0.10.0  -  x86 kernel: real mode to ring 3 |
   '-----------------------------------------------------'
 [    0.000] INFO  boot: serial COM1        [ok] 115200 8N1
 [    0.000] INFO  boot: CPU detect         [ok] GenuineIntel
@@ -238,7 +250,7 @@ StratumOS stage2
 [    0.070] INFO  boot: filesystem         [ok] FAT16 "STRATUM" on hd0p1
 [    0.070] INFO  sched: scheduler ready; boot context adopted as pid 0 (idle)
 [    0.070] INFO  syscall: syscall gate installed at int 0x80 (11 calls available)
-[    0.080] INFO  boot: StratumOS 0.9.0 is up: 127 MiB RAM, 6 PCI devices, 19 test suites
+[    0.080] INFO  boot: StratumOS 0.10.0 is up: 127 MiB RAM, 6 PCI devices, 19 test suites
 ```
 
 Ring 3, exercising the syscall boundary from the untrusted side, then
@@ -592,6 +604,101 @@ the profiler's limits are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 ---
 
+## 64-bit long mode
+
+The repository this project merges was called
+*Advanced-Bootloader-16-bit-to-32-bit-C-Kernel*. This is the third step of
+that arc:
+
+```
+16-bit real mode  ->  32-bit protected mode  ->  64-bit long mode  ->  back
+   boot/stage1          boot/stage2 + _start      longmode_tramp.asm
+```
+
+```bash
+make run-x86-64      # the same 32-bit image on a CPU that has x86-64
+stratum> longmode
+```
+
+```
+Long mode (x86-64)
+  CPUID       : CPUID.80000001H:EDX.LM is set
+  transition  : 32-bit protected -> 64-bit long -> 32-bit protected
+
+Paging
+  4-level     : pml4 0x00358000 -> pdpt 0x00359000 -> pd 0x0035a000
+  identity    : 1024 MiB in 2 MiB pages (512 PD entries)
+  entries     : 64 bits wide; CR4.PAE required, so paging is disabled to set it
+
+Stages reached
+  [ok] the trampoline's own GDT, 32-bit, identity-mapped
+  [ok] CR0.PG set with the PML4: IA-32e compatibility mode
+  [ok] far jump to a descriptor with L set: 64-bit mode
+  [ok] the 64-bit payload ran to completion
+  [ok] back to 32-bit code, still on 64-bit paging
+  [ok] kernel CR3, kernel GDT, kernel stack restored
+
+What 64-bit mode proved
+  CS          : 0x18 (the descriptor whose L bit is set)
+  EFER        : 0x00000500  LME set, LMA set
+  CR4.PAE     : set
+  64-bit imm  : 0x0123456789abcdef
+  0xffffffff+1: 0x0000000100000000 (32-bit mode gives 0)
+  r15         : 0xfeedfacecafebeef (a register 32-bit mode lacks)
+  lea [rip+x] : 0x00009191, expected 0x00009191
+  [64-bit ptr]: 0x5452415455004f53 from phys 0x00400000 (only the 4-level walk maps it)
+
+  round trip  : 551716 cycles, trampoline 608 bytes
+  kernel      : still 32-bit, still running - CR4.PAE clear, paging on
+```
+
+**This is a tested transition, not a 64-bit kernel**, and saying so clearly
+matters more than the feature does. A port needs a 64-bit IDT (16-byte gate
+descriptors), every assembly stub rewritten for a new calling convention,
+`SYSCALL`/`SYSRET` instead of `int 0x80`, a four-level VMM — the recursive
+page-directory trick this kernel uses does not generalise past two levels —
+and an audit of every `u32` that is really an address. That is one commit
+that either boots or does not, which is why it is kept separate from the
+phase that made it testable.
+
+Three things in it were the actual work:
+
+**Paging has to come off.** `CR4.PAE` cannot be written while `CR0.PG` is
+set, and long mode requires PAE. With paging off, `EIP` is a physical
+address — so the only code that survives is code whose virtual and physical
+addresses are the same. The kernel is at `0xC0100000` and loaded at
+`0x00100000`, so none of it qualifies. The trampoline is therefore assembled
+into the image but **copied to physical `0x9000` and executed there**, with
+every absolute reference computed rather than written as a symbol, exactly as
+the SMP bring-up already does.
+
+**The far jump is the step people leave out.** Setting `EFER.LME` and
+`CR0.PG` gets IA-32e *compatibility* mode: 64-bit paging under 32-bit code.
+`EFER.LMA` is set, the tables are live, and it looks like it worked. The
+processor decodes 64-bit instructions only once `CS` holds a descriptor whose
+**L** bit is set — and in 64-bit mode there is no direct far jump to get back
+out with, because opcode `EA` is invalid there, so the return goes through
+memory.
+
+**The strongest check caught itself being wrong.** The probe reads through a
+64-bit pointer at a physical address that only the four-level walk can
+resolve. The first version allocated that frame with `pmm_alloc_frame()`,
+which hands out frames in ascending order, so it landed at 3.5 MiB — *inside*
+the 4 MiB identity map, where the read would have succeeded whether the PML4
+worked or not. The test passed and proved nothing. A warning that fired on
+the first run is the only reason that is not still the case.
+
+Tested on both kinds of processor, because `qemu-system-i386` masks
+`CPUID.80000001H:EDX.LM` even with `-cpu max`: **17 checks** asserting the
+kernel declines correctly there, **51** asserting the transition itself under
+`qemu-system-x86_64`. The CI scenario checks the *check count*, because a run
+where the suite quietly took its declining path would otherwise pass while
+testing none of the feature.
+
+More in [docs/LONGMODE.md](docs/LONGMODE.md).
+
+---
+
 ## Testing
 
 An OS that "boots on my machine" is not evidence of much. This project is set
@@ -603,8 +710,8 @@ QEMU.
 | **Host unit tests** | the kernel's real `printf`/`string`/`div64` sources, compiled for the host, diffed against glibc | 92 checks |
 | **Pre-boot validation** | Multiboot2 header and checksum, ELF type, entry point inside a load segment, load address, `.bss` alignment, the higher-half split, every embedded ring-3 program, absence of SSE | 20 failure conditions, every link |
 | **Image validation** | the boot signature, stage 1 not overlapping its own partition table, the stage 2 header pointing at a real ELF, every partition inside the image, the FAT geometry, and every file in `/BIN` being an i386 ELF with `INIT` among them | every image, every build |
-| **In-kernel suites** | allocator, paging, address spaces, copy-on-write, heap coalescing, interrupts, scheduler, processes, hardening, ATA and partitions, FAT16, ACPI/APIC/locks/IPIs, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 484 checks in 19 suites |
-| **Boot scenarios** | custom bootloader unattended, **the same image on four processors**, the same image on a CPU with SMEP and SMAP, GRUB/Multiboot2 unattended, 41 shell commands typed over serial, benchmarks + profile | 6 scenarios |
+| **In-kernel suites** | allocator, paging, address spaces, copy-on-write, heap coalescing, interrupts, scheduler, processes, hardening, ATA and partitions, FAT16, ACPI/APIC/locks/IPIs, the 32→64→32 transition, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 535 checks in 20 suites |
+| **Boot scenarios** | custom bootloader unattended, **the same image on four processors**, the same image on a CPU with SMEP and SMAP, **the same image on a CPU with x86-64**, GRUB/Multiboot2 unattended, 43 shell commands typed over serial, benchmarks + profile | 7 scenarios |
 | **Deliberate faults** | a write to the kernel's own `.text`, and a write below a task's stack — each must panic, naming the address, the reason and the region, and exit with the panic code | 3 scenarios |
 | **Fuzzing** | four libFuzzer targets over the **real** `elf.c`/`fat16.c`/`heap.c`/`acpi.c` under AddressSanitizer, plus 40,000 malformed system calls issued from ring 3 | 6 bugs found |
 
@@ -621,6 +728,9 @@ $ make test
     calls accepted   : 18230
     calls refused    : 21770
     result           : PASS
+  [long-mode] 32-bit protected mode to 64-bit long mode, and back
+    in-kernel suites : 20/20 passed
+    result           : PASS
   [benchmarks] microbenchmarks and a sampling profile
     result           : PASS
   [custom-bootloader] two-stage BIOS bootloader from a raw disk image
@@ -630,7 +740,7 @@ $ make test
     in-kernel suites : 19/19 passed
     result           : PASS
 
-run-tests: all 9 scenario(s) passed
+run-tests: all 10 scenario(s) passed
 ```
 
 Three details that make this work unattended:
@@ -907,6 +1017,7 @@ Being clear about scope is more useful than a longer feature list.
 | [docs/SECURITY.md](docs/SECURITY.md) | W^X, SMEP/SMAP, guard pages, and what is deliberately missing |
 | [docs/STORAGE.md](docs/STORAGE.md) | the ATA driver, the partition table, FAT16, and where a program comes from |
 | [docs/SMP.md](docs/SMP.md) | ACPI, the APIC, the AP trampoline, real locks, TLB shootdown |
+| [docs/LONGMODE.md](docs/LONGMODE.md) | 32-bit to 64-bit long mode and back, the four-level table, and the boundary of the claim |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | benchmark methodology, results with analysis, the profiler and its limits |
 | [docs/TESTING.md](docs/TESTING.md) | the five test layers and how to add to each |
 | [docs/FUZZING.md](docs/FUZZING.md) | both fuzzing harnesses, the shim's design, and the six bugs they found |

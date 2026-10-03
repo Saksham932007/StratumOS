@@ -27,6 +27,7 @@
 #include <arch/idt.h>
 #include <arch/io.h>
 #include <arch/irq.h>
+#include <arch/longmode.h>
 
 #include <drivers/ata.h>
 #include <drivers/keyboard.h>
@@ -397,6 +398,20 @@ void kmain(u32 magic, u32 info_addr)
         ksnprintf(detail, sizeof(detail), "%u of %u processor(s) online",
                   smp_cpu_count(), smp_cpus_present());
         log_boot_step("processors", true, detail);
+    }
+
+    /* Detection only. The transition itself takes interrupts down and is a
+     * demonstration rather than a step this kernel needs, so it happens on
+     * demand - `longmode` in the shell, or the `longmode` test suite - and
+     * not on every boot. Reporting it here costs one CPUID and answers the
+     * question a reader of this log would actually have. */
+    {
+        const char *why = NULL;
+        bool usable = longmode_available(&why);
+
+        log_boot_step("x86-64", longmode_supported(),
+                      usable ? "long mode available; `longmode` to enter it"
+                             : (why ? why : "not available"));
     }
 
     /* Storage. The ATA driver polls, so it needs nothing from the interrupt

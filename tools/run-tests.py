@@ -159,6 +159,13 @@ class Scenario:
     qemu_args: list[str]
     extra_expected: list[tuple[str, str]] = field(default_factory=list)
     timeout: int = 90
+    # Which emulator binary to boot under. Everything defaults to
+    # qemu-system-i386, because that is the machine this kernel targets. The
+    # long-mode scenario needs qemu-system-x86_64: the i386 target masks
+    # CPUID.80000001H:EDX.LM even with -cpu max, so long mode is
+    # undetectable there - which is itself worth knowing, and is why the
+    # longmode suite has two sets of assertions.
+    qemu: str = QEMU
 
 
 @dataclass
@@ -178,7 +185,7 @@ def run_scenario(sc: Scenario, keep_logs: Path | None) -> Outcome:
         log_path = Path(tmp) / "serial.log"
 
         cmd = [
-            QEMU,
+            sc.qemu,
             "-m", "128M",
             "-no-reboot",
             "-display", "none",
@@ -390,6 +397,11 @@ SHELL_SCRIPT: list[tuple[str, list[str]]] = [
     ("selftest fs", [r"ktest: fs \.\.\. PASS"]),
     ("selftest smp", [r"ktest: smp \.\.\. PASS"]),
     ("selftest bootpd", [r"ktest: bootpd \.\.\. PASS"]),
+    # The suite passes either way: on this emulator it asserts the kernel
+    # declines long mode correctly, and the `long-mode` scenario asserts the
+    # transition itself under qemu-system-x86_64.
+    ("selftest longmode", [r"ktest: longmode \.\.\. PASS"]),
+    ("longmode", [r"Long mode \(x86-64\)", r"CPUID\s+:"]),
     ("cpus", [r"Local APIC", r"CPU\s+APIC\s+ROLE\s+STATE",
               r"\s+0\s+0\s+bsp online", r"<- this one"]),
     ("disk", [r"DEV\s+MODEL\s+SECTORS\s+ADDR", r"hd0\s+\S",
@@ -808,6 +820,46 @@ def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
             ],
         ),
         Scenario(
+            name="long-mode",
+            description="32-bit protected mode to 64-bit long mode, and back",
+            image=build_dir / "stratum-test.img",
+            qemu="qemu-system-x86_64",
+            qemu_args=[
+                # The same 32-bit image, on a processor that has x86-64.
+                # qemu-system-i386 masks CPUID.80000001H:EDX.LM even with
+                # -cpu max, so on every other scenario the longmode suite
+                # takes its declining path and asserts the kernel leaves the
+                # machine alone. Here it takes the real one.
+                #
+                # This is also the realistic configuration: a 32-bit kernel
+                # on a 64-bit-capable machine is what actual hardware looks
+                # like, and the one the transition would run on.
+                "-drive",
+                f"format=raw,file={build_dir / 'stratum-test.img'},"
+                f"index=0,media=disk",
+            ],
+            extra_expected=[
+                ("long mode was detected",
+                 r"CPUID\.80000001H:EDX\.LM is set|"
+                 r"64-bit long mode entered and left"),
+                # The kernel's own line, which only prints after the round
+                # trip validated: every stage reached, EFER.LMA seen set from
+                # inside 64-bit mode, and the kernel back in 32-bit paging.
+                ("the round trip completed",
+                 r"lm: 64-bit long mode entered and left: CS 0x18, "
+                 r"EFER\.LMA set, \d+ MiB identity-mapped by a 4-level "
+                 r"table, round trip \d+ cycles"),
+                # Twice: the suite runs it again to prove the tables are
+                # reused rather than rebuilt, which is where a cleanup bug
+                # would show.
+                ("the transition is repeatable",
+                 r"(?s)64-bit long mode entered and left.*"
+                 r"64-bit long mode entered and left"),
+                ("the suite took its real path, not its declining one",
+                 r"ktest: longmode \.\.\. PASS \(5\d checks\)"),
+            ],
+        ),
+        Scenario(
             name="hardened-cpu",
             description="the same kernel on a CPU that has SMEP and SMAP",
             image=build_dir / "stratum-test.img",
@@ -919,6 +971,16 @@ def main() -> int:
 
     scenarios = build_scenarios(args.build_dir, args.only)
 
+    # A scenario that needs an emulator this machine does not have is skipped
+    # loudly rather than failed. Only the long-mode scenario is in that
+    # position today, and only because it needs qemu-system-x86_64 to see a
+    # processor with x86-64 on it. Printing the name keeps a skip from
+    # reading as a pass.
+    unavailable = [s for s in scenarios if not shutil.which(s.qemu)]
+    for s in unavailable:
+        print(f"  [{s.name}] SKIP ({s.qemu} is not installed)\n")
+    scenarios = [s for s in scenarios if s not in unavailable]
+
     missing = [s for s in scenarios if not s.image.is_file()]
     if missing:
         for s in missing:
@@ -926,7 +988,9 @@ def main() -> int:
                   file=sys.stderr)
         return 2
 
-    print(f"run-tests: {len(scenarios)} boot scenario(s) under {QEMU}\n")
+    emulators = sorted({s.qemu for s in scenarios})
+    print(f"run-tests: {len(scenarios)} boot scenario(s) under "
+          f"{', '.join(emulators)}\n")
 
     outcomes = []
 

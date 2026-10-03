@@ -129,6 +129,51 @@ counters. The drivers are not fuzzed. Nothing fuzzes concurrency. Documented,
 with the reasoning for each accommodation the shim makes, in
 [FUZZING.md](FUZZING.md).
 
+### 64-bit long mode
+
+Landed in v0.10.0 as a tested transition, explicitly not a port. The boot
+processor goes from 32-bit protected mode into 64-bit long mode, runs a
+payload there, and comes back with the 32-bit kernel still running: a
+four-level page table (PML4 -> PDPT -> PD with 2 MiB pages, one gigabyte
+identity-mapped), the documented enable sequence, a 64-bit code descriptor
+whose L bit is the only part doing any work, and the reverse sequence out.
+
+Six stage flags, each set by the code that reached that point, and a payload
+chosen to be *impossible* in 32-bit mode rather than merely different: a
+64-bit immediate, `0xFFFFFFFF + 1` carrying past bit 31 in one instruction,
+`r15`, RIP-relative addressing checked against the address the trampoline was
+copied to, `EFER.LMA` read back with `rdmsr`, and a read through a 64-bit
+pointer at a physical address the identity map does not cover.
+
+Tested on both kinds of processor, because `qemu-system-i386` masks
+`CPUID.80000001H:EDX.LM` even with `-cpu max`: 17 checks asserting the kernel
+declines correctly there, 51 asserting the transition itself under
+`qemu-system-x86_64`.
+
+One bug worth recording. The probe frame - the strongest check - was
+allocated with `pmm_alloc_frame()` and landed at 3.5 MiB, *inside* the 4 MiB
+identity map, where the read would have succeeded whether the four-level walk
+worked or not. The test passed and proved nothing. Fixed with
+`pmm_alloc_frame_above()`, which is the general primitive memory zones exist
+for. Documented in [LONGMODE.md](LONGMODE.md).
+
+**What a port still needs**, in the order it has to happen:
+
+1. A 64-bit IDT. Gate descriptors are 16 bytes rather than 8, and there is an
+   interrupt stack table to set up. Nothing else can be developed first,
+   because an interrupt-free window is not somewhere a kernel can be built.
+2. The interrupt stubs rewritten for the new calling convention: arguments in
+   registers, a red zone, 16-byte stack alignment.
+3. `SYSCALL`/`SYSRET` with `STAR`, `LSTAR` and `SFMASK`, replacing `int 0x80`.
+4. A four-level VMM. The recursive page-directory mapping this kernel uses to
+   reach its own tables is specific to two levels and does not generalise, so
+   that is a design decision to make again rather than port.
+5. An audit of every `u32` that is really an address - `vaddr_t`, `paddr_t`,
+   and everything that has ever been assigned one.
+
+That is one commit that either boots or does not, which is why it is a
+project rather than a phase.
+
 ---
 
 ## Next
@@ -158,9 +203,11 @@ around a different entry format. The recursive-window trick survives, the
 software bits move from 9-11 to 9-11 and 52-62, and `CR4.PAE` has to go on
 before `CR0.PG` - which means `_start` changes too.
 
-Worth doing because it is the difference between claiming W^X and having it,
-and because it is the natural rehearsal for the 4-level paging that long mode
-needs. Everything else in [SECURITY.md](SECURITY.md#what-is-missing) is
+Worth doing because it is the difference between claiming W^X and having it.
+The 64-bit entry format is no longer unfamiliar ground either: the long-mode
+transition builds a four-level table out of the same entries, so the layout
+and the PAE-before-paging ordering are already written down and tested in
+`kernel/arch/x86/longmode.c`. Everything else in [SECURITY.md](SECURITY.md#what-is-missing) is
 smaller: UMIP is a CR4 bit, KASLR is relocations, and `-fstack-protector`
 wants the per-CPU area the SMP work brings.
 
@@ -259,14 +306,12 @@ them.
 These are bigger than the items above, and each one is a project in its own
 right rather than a weekend:
 
-### x86-64 long mode
+### A 64-bit kernel
 
-The natural continuation of the boot story this project is about: 16-bit
-real mode to 32-bit protected mode to 64-bit long mode, with 4-level
-paging. It is a second architecture port of the whole kernel, not a flag.
-Mentioned here because the boot path is the part of this project most worth
-extending, and the existing two-stage loader already does the hard half
-(A20, E820, a protected-mode GDT, ELF program headers).
+The transition itself landed in v0.10.0 and is listed under "Done" above;
+what remains is the port, and the five steps it needs are enumerated there.
+It is one commit that either boots or does not, which is why it is kept
+separate from the phase that made it testable.
 
 ### A network stack
 

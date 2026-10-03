@@ -32,6 +32,13 @@ void pmm_init(const struct boot_params *bp);
 /* Allocate one frame. Returns PMM_NO_FRAME when out of memory. */
 paddr_t pmm_alloc_frame(void);
 /* Allocate `count` physically contiguous frames (for DMA-style needs). */
+/* A frame whose physical address is at or above `floor`, or PMM_NO_FRAME.
+ * For a caller whose frame has to sit outside some window - a probe that must
+ * not land inside an identity map, or the DMA-style constraints real zoned
+ * allocators exist for. Does not move the search hint, so it does not
+ * perturb ordinary allocation. */
+paddr_t pmm_alloc_frame_above(paddr_t floor);
+
 paddr_t pmm_alloc_frames(size_t count);
 void pmm_free_frame(paddr_t frame);
 void pmm_free_frames(paddr_t frame, size_t count);

@@ -22,6 +22,7 @@
 #include <arch/harden.h>
 #include <arch/io.h>
 #include <arch/irq.h>
+#include <arch/longmode.h>
 
 #include <drivers/ata.h>
 #include <drivers/timer.h>
@@ -1852,6 +1853,129 @@ static void test_bootstrap_pd(struct ktest_result *r)
     KT_ASSERT(r, identity_pt != 0);
 }
 
+/* ---- 64-bit long mode -------------------------------------------------
+ *
+ * Written so that it is a real test on both kinds of machine, which is the
+ * only way it is worth having. QEMU's default i386 model has no long mode -
+ * not even with -cpu max, which masks it for a 32-bit target - so on the
+ * images CI boots by default this suite asserts that the kernel *declines*
+ * correctly and leaves the machine alone. The `long-mode` scenario boots the
+ * same image under qemu-system-x86_64, where the transition actually runs
+ * and every assertion below has teeth.
+ *
+ * That is the same arrangement as the `hardened-cpu` scenario, for the same
+ * reason: a feature test that silently skips is a feature test that stops
+ * being read.
+ */
+static void test_longmode(struct ktest_result *r)
+{
+    const char *why = NULL;
+    bool supported = longmode_supported();
+    bool available = longmode_available(&why);
+
+    /* Detection has to agree with itself: it is pure CPUID, so two calls in
+     * a row cannot disagree, and "available" cannot be true where
+     * "supported" is false. */
+    KT_EQ(r, supported, longmode_supported());
+    KT_ASSERT(r, available == false || supported == true);
+    KT_ASSERT(r, available || why != NULL);
+
+    /* Whatever the processor can do, the kernel's own state is 32-bit before
+     * and after - which is the invariant the whole feature is judged on. */
+    KT_ASSERT(r, (read_cr4() & CR4_PAE_BIT) == 0);
+    KT_ASSERT(r, (read_cr0() & 0x80000000u) != 0);
+
+    paddr_t cr3_before = read_cr3();
+    u32 pages_before = vmm_count_user_pages();
+
+    struct longmode_result lm;
+    bool ok = longmode_round_trip(&lm);
+
+    /* The address space is exactly as it was. The transition switches CR3
+     * twice and turns paging off and on twice; a caller must not be able to
+     * tell that any of it happened. */
+    KT_EQ(r, read_cr3(), cr3_before);
+    KT_EQ(r, vmm_count_user_pages(), pages_before);
+    KT_ASSERT(r, (read_cr4() & CR4_PAE_BIT) == 0);
+    KT_ASSERT(r, (read_cr0() & 0x80000000u) != 0);
+    KT_ASSERT(r, irq_enabled()); /* restored, not left masked */
+
+    KT_EQ(r, lm.supported, supported);
+    KT_EQ(r, lm.attempted, available);
+    KT_EQ(r, ok, lm.round_trip);
+
+    if (!available) {
+        /* The declining path. Nothing attempted, nothing built, and the
+         * reason is a sentence rather than a flag. */
+        KT_ASSERT(r, !lm.round_trip);
+        KT_EQ(r, lm.flags, 0u);
+        KT_ASSERT(r, lm.failure != NULL);
+        KT_EQ(r, lm.pml4_phys, 0u);
+        return;
+    }
+
+    /* --- the real thing -------------------------------------------------- */
+    KT_ASSERT(r, ok);
+    KT_ASSERT(r, lm.failure == NULL);
+
+    /* Every stage, individually, so a partial transition names its own
+     * stopping point instead of failing one aggregate assertion. */
+    KT_ASSERT(r, (lm.flags & LM_F_ENTERED) != 0);
+    KT_ASSERT(r, (lm.flags & LM_F_COMPAT) != 0);
+    KT_ASSERT(r, (lm.flags & LM_F_LONG) != 0);
+    KT_ASSERT(r, (lm.flags & LM_F_VERIFIED) != 0);
+    KT_ASSERT(r, (lm.flags & LM_F_BACK32) != 0);
+    KT_ASSERT(r, (lm.flags & LM_F_RETURNED) != 0);
+    KT_EQ(r, lm.flags, LM_F_ALL);
+
+    /* What only 64-bit mode can do. */
+    KT_ASSERT(r, lm.wide == LM_WIDE_VALUE);
+    KT_ASSERT(r, lm.crossed == LM_CROSSED_VALUE);
+    KT_ASSERT(r, lm.crossed > 0xFFFFFFFFull); /* the point of that one */
+    KT_ASSERT(r, lm.r15 == LM_R15_VALUE);
+    KT_ASSERT(r, lm.rip_lea == (u64)lm.rip_expected);
+    KT_ASSERT(r, lm.probe_value == LM_PROBE_MAGIC);
+
+    /* The processor's own statement that it was in long mode, rather than
+     * the kernel's belief that it put it there. */
+    KT_ASSERT(r, (lm.efer & EFER_LMA_BIT) != 0);
+    KT_ASSERT(r, (lm.efer & EFER_LME_BIT) != 0);
+    KT_ASSERT(r, (lm.cr4 & CR4_PAE_BIT) != 0);
+    KT_EQ(r, lm.cs, LM_SEL_CODE64); /* the descriptor with L set */
+
+    /* The probe frame has to be outside the 4 MiB identity map the
+     * transition runs under, or the pointer read proved nothing. This is the
+     * assertion the first run failed, when it landed inside. */
+    KT_ASSERT(r, lm.probe_phys >= 4 * MIB);
+    KT_ASSERT(r, lm.probe_phys < (paddr_t)lm.identity_mib * MIB);
+
+    /* Three distinct, page-aligned frames, none of them the probe. */
+    KT_ASSERT(r, lm.pml4_phys && lm.pdpt_phys && lm.pd_phys);
+    KT_ASSERT(r, lm.pml4_phys != lm.pdpt_phys);
+    KT_ASSERT(r, lm.pdpt_phys != lm.pd_phys);
+    KT_ASSERT(r, lm.pml4_phys != lm.pd_phys);
+    KT_ASSERT(r, lm.probe_phys != lm.pml4_phys);
+    KT_ASSERT(r, IS_ALIGNED(lm.pml4_phys, PAGE_SIZE));
+    KT_ASSERT(r, IS_ALIGNED(lm.pdpt_phys, PAGE_SIZE));
+    KT_ASSERT(r, IS_ALIGNED(lm.pd_phys, PAGE_SIZE));
+
+    KT_ASSERT(r, lm.cycles > 0);
+    KT_ASSERT(r, lm.trampoline_bytes > 0 && lm.trampoline_bytes <= 2048);
+
+    /* Twice. The tables are built once and reused, so a second run takes a
+     * path the first does not - and a transition that only works from a cold
+     * start is a transition with a bug in its cleanup. */
+    struct longmode_result again;
+
+    KT_ASSERT(r, longmode_round_trip(&again));
+    KT_EQ(r, again.flags, LM_F_ALL);
+    KT_EQ(r, again.pml4_phys, lm.pml4_phys); /* reused, not rebuilt */
+    KT_EQ(r, again.probe_phys, lm.probe_phys);
+    KT_ASSERT(r, again.probe_value == LM_PROBE_MAGIC);
+    KT_EQ(r, read_cr3(), cr3_before);
+    KT_ASSERT(r, (read_cr4() & CR4_PAE_BIT) == 0);
+}
+
 static const struct ktest tests[] = {
     {"string", "string and formatting primitives", test_string},
     {"boot", "boot protocol normalisation", test_boot},
@@ -1871,6 +1995,7 @@ static const struct ktest tests[] = {
     {"fs", "FAT16: geometry, paths, cluster chains", test_filesystem},
     {"smp", "ACPI, the local APIC, per-CPU state, locks, IPIs", test_smp},
     {"bootpd", "the AP bootstrap page directory", test_bootstrap_pd},
+    {"longmode", "the 32 -> 64 -> 32 mode transition", test_longmode},
     {"ksyms", "embedded symbol table lookup", test_ksyms},
     {"profile", "sampling profiler attribution", test_profile},
 };

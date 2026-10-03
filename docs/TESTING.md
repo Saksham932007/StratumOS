@@ -112,13 +112,13 @@ Checking them takes 30 milliseconds.
 
 ## Layer 3: in-kernel suites
 
-`kernel/core/ktest.c` holds 19 suites and 484 assertions, run against
+`kernel/core/ktest.c` holds 20 suites and 535 assertions, run against
 real hardware state — a bitmap with actual firmware-reported memory in it, real
 page tables, a real heap, a real scheduler.
 
 ```
 stratum> selftest
-ktest: running 19 suites
+ktest: running 20 suites
 ktest: string ... PASS (15 checks)
 ktest: boot ... PASS (26 checks)
 ktest: cpu ... PASS (8 checks)
@@ -136,15 +136,19 @@ ktest: storage ... PASS (44 checks)
 ktest: fs ... PASS (56 checks)
 ktest: smp ... PASS (74 checks)
 ktest: bootpd ... PASS (17 checks)
+ktest: longmode ... PASS (51 checks)
 ktest: ksyms ... PASS (12 checks)
 ktest: profile ... PASS (9 checks)
-ktest: summary 19/19 suites passed
+ktest: summary 20/20 suites passed
 ```
 
-That transcript is from the four-processor scenario. The `smp` suite scales
-with the number of processors - it checks each one's APIC id, stack, TSS and
-online transition - so on one processor it does 49 checks and the total is
-459. Every other suite's count is fixed.
+That transcript is from a run with four processors on a machine that has
+x86-64, which is the configuration where every suite takes its widest path.
+Two of them scale with the machine: `smp` checks each processor's APIC id,
+stack, TSS and online transition, so one processor gives 49 rather than 74;
+and `longmode` gives 17 rather than 51 where the processor has no long mode
+to enter. On the default `qemu-system-i386` scenarios with one processor the
+total is 459. Every other suite's count is fixed.
 
 | Suite | What it establishes |
 | --- | --- |
@@ -203,8 +207,15 @@ table.
 
 ## Layer 4: boot scenarios
 
-`tools/run-tests.py` boots the kernel nine ways and asserts on what it says.
-Six of them must come up clean; three of them must *panic*.
+`tools/run-tests.py` boots the kernel ten ways and asserts on what it says.
+Seven of them must come up clean; three of them must *panic*.
+
+Nine run under `qemu-system-i386`, which is the machine this kernel targets.
+One - `long-mode` - runs under `qemu-system-x86_64`, because the i386 target
+masks `CPUID.80000001H:EDX.LM` even with `-cpu max`, so long mode is
+undetectable there. `Scenario.qemu` carries the choice, and a scenario whose
+emulator is not installed is skipped with the binary's name printed, so a
+skip cannot read as a pass.
 
 ### Unattended boots
 
@@ -352,6 +363,33 @@ it with a corrupted heap has not survived the fuzzer.
 
 The nine forbidden patterns do the rest of the work. See
 [FUZZING.md](FUZZING.md).
+
+### The long-mode scenario
+
+The same 32-bit image, booted on a processor that has x86-64, so the
+`longmode` suite takes its real path instead of its declining one. That is
+the whole purpose of the scenario: the suite has two sets of assertions, and
+without this one only the smaller set would ever run.
+
+| Where | What `longmode` asserts | Checks |
+| --- | --- | --- |
+| `qemu-system-i386` | the kernel declines correctly - nothing attempted, nothing built, a reason given, the machine left alone | 17 |
+| `qemu-system-x86_64` | the transition itself: six stage flags, every 64-bit probe, and that nothing was disturbed | 51 |
+
+```python
+("the round trip completed",
+ r"lm: 64-bit long mode entered and left: CS 0x18, "
+ r"EFER\.LMA set, \d+ MiB identity-mapped by a 4-level "
+ r"table, round trip \d+ cycles"),
+("the suite took its real path, not its declining one",
+ r"ktest: longmode \.\.\. PASS \(5\d checks\)"),
+```
+
+The last pattern is the one that matters. Asserting the transition worked is
+not enough on its own: a scenario where the suite quietly took its
+17-check path would pass every other expectation while testing none of the
+feature. Checking the *count* is what distinguishes "it ran" from "it was
+skipped". See [LONGMODE.md](LONGMODE.md).
 
 ### The benchmark scenario
 

@@ -931,3 +931,101 @@ what makes the static inside the macro the right shape.
 that can make a system call fail, and the fix belongs in the logging layer: a
 `pr_warn` on a user-reachable path is a resource the kernel hands out, and
 resources the kernel hands out get accounted for.
+
+---
+
+## 31. Long mode is a tested transition, not a half-finished port
+
+**Decision.** The kernel can drive the boot processor from 32-bit protected
+mode into 64-bit long mode, run a payload there that proves it, and come back
+with the 32-bit kernel still running. The kernel itself stays 32-bit.
+
+**Rejected: starting the port.** The tempting version of this phase is to
+begin converting the kernel — a 64-bit IDT, `vaddr_t` widened to `u64`, the
+interrupt stubs rewritten for the new calling convention — and get some way
+in. It is the wrong shape of work to do partially, for a reason that is
+specific rather than general: the pieces are not independently testable. A
+64-bit IDT cannot be exercised without 64-bit interrupt stubs, which cannot
+be exercised without a 64-bit scheduler to interrupt. A port lands as one
+commit that either boots or does not, and "does not" has no diagnosis.
+
+So the first deliverable is the thing every later piece needs and nothing
+else depends on: the ability to get into the mode and back out, under test,
+with a reported reason when it fails. The second 64-bit instruction this
+kernel ever runs will run inside the window this phase built.
+
+**Rejected: doing the transition at boot.** It would make the arc the project
+is named for literal - real mode, protected mode, long mode, all before the
+first log line. It would also put an unavoidable interrupt-free window on
+every boot of every machine, in service of a demonstration, and it would make
+the detection path - which is most of what runs on real 32-bit hardware -
+the untested one. Detection is reported at boot; the transition happens on
+demand.
+
+**Cost.** Three things, each of which is a real limitation rather than a
+rough edge:
+
+- **No IDT is valid in the window.** Long mode's gate descriptors are 16
+  bytes where the kernel's are 8, so one table cannot serve both halves of
+  the transition. Interrupts are masked throughout and an NMI would be fatal.
+  Acceptable for a demonstration, not for a port - which is precisely why a
+  port needs its own IDT before anything else.
+- **The payload is assembly, and small.** No 64-bit C, because that needs a
+  second compilation target, a second linker script and a calling convention
+  the rest of the kernel does not speak. What is in there is chosen to be
+  *impossible* in 32-bit mode rather than merely different: a 64-bit
+  immediate, a carry across bit 31 in one instruction, `r15`, RIP-relative
+  addressing, and `EFER.LMA` read back from the processor.
+- **It is one more thing that runs from a low physical copy.** `ap_boot.asm`
+  already does this; now two files do, with the same `PHYS()` idiom and the
+  same reason. A third would be an argument for a shared trampoline region
+  with a real allocator rather than two hardcoded page numbers.
+
+**Why.** Because the claim "this kernel can reach 64-bit mode" is either
+tested or it is marketing, and the test is the hard part. `EFER.LMA` read
+back from inside the window is the processor's own statement; a read through a
+64-bit pointer at an address the 4 MiB identity map does not cover is the
+four-level walk's. Both are assertions in a suite that runs on every push,
+on two different processor models, with different expectations for each.
+
+See `docs/LONGMODE.md`.
+
+---
+
+## 32. The long-mode probe frame is allocated above a floor
+
+**Decision.** `pmm_alloc_frame_above(paddr_t floor)`, used by the long-mode
+code to get its probe frame from above 4 MiB.
+
+**Rejected: `pmm_alloc_frame()`, which is what the first version did.** The
+probe is the strongest check in the suite: a read through a 64-bit pointer at
+a physical address that *only* the four-level walk can resolve. The frame
+allocator hands out frames in roughly ascending order, so the frame landed at
+`0x0035B000` - 3.5 MiB, inside the 4 MiB identity map the transition runs
+under, where the read would have succeeded whether the PML4 worked or not.
+
+The test passed. It proved nothing. A warning that fired on the first run is
+the only reason that is not still true, and the lesson is the one worth
+keeping: a positive result from a test whose precondition was never checked
+is indistinguishable from a positive result.
+
+**Rejected: allocating repeatedly until a frame lands high enough.** It
+works, needs no new API, and would hold a thousand frames at once on the way
+past 4 MiB early in boot. It also hides the requirement inside a loop instead
+of stating it.
+
+**Cost.** One more entry point into the allocator, and it deliberately does
+*not* move the search hint - so a caller with an unusual constraint cannot
+degrade ordinary allocation for everyone else. That asymmetry is worth a
+comment, which it has.
+
+**Why.** The constraint is not a quirk of this one caller. "A frame from a
+particular range" is why real kernels have memory zones: ISA DMA needs one
+below 16 MiB, some devices below 4 GiB. Writing the general primitive cost
+about fifteen lines more than the special case, and the warning became a hard
+failure plus two assertions in the suite:
+
+```c
+KT_ASSERT(r, lm.probe_phys >= 4 * MIB);
+KT_ASSERT(r, lm.probe_phys < (paddr_t)lm.identity_mib * MIB);
+```

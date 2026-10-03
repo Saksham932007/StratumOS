@@ -18,6 +18,7 @@
 #include <arch/harden.h>
 #include <arch/io.h>
 #include <arch/irq.h>
+#include <arch/longmode.h>
 
 #include <drivers/ata.h>
 #include <drivers/keyboard.h>
@@ -445,6 +446,97 @@ static int cmd_selftest(int argc, char **argv)
 }
 
 /* ---- processors --------------------------------------------------------- */
+
+/* Drive the boot processor into 64-bit long mode, run a payload there, come
+ * back, and print everything the payload saw. */
+static int cmd_longmode(int argc, char **argv)
+{
+    UNUSED(argc);
+    UNUSED(argv);
+
+    const char *why = NULL;
+
+    kprintf("Long mode (x86-64)\n");
+    kprintf("  CPUID       : %s\n", longmode_supported()
+                                        ? "CPUID.80000001H:EDX.LM is set"
+                                        : "this processor has no long mode");
+
+    if (!longmode_available(&why)) {
+        kprintf("  available   : no - %s\n", why);
+        return 1;
+    }
+
+    struct longmode_result r;
+
+    kprintf("  transition  : 32-bit protected -> 64-bit long -> 32-bit "
+            "protected\n");
+
+    bool ok = longmode_round_trip(&r);
+
+    kprintf("\nPaging\n");
+    kprintf("  4-level     : pml4 %p -> pdpt %p -> pd %p\n",
+            (void *)r.pml4_phys, (void *)r.pdpt_phys, (void *)r.pd_phys);
+    kprintf("  identity    : %u MiB in 2 MiB pages (%u PD entries)\n",
+            r.identity_mib, r.identity_mib / 2);
+    kprintf("  entries     : 64 bits wide; CR4.PAE required, so paging is "
+            "disabled to set it\n");
+
+    kprintf("\nStages reached\n");
+    static const struct {
+        u32 bit;
+        const char *what;
+    } stages[] = {
+        {LM_F_ENTERED, "the trampoline's own GDT, 32-bit, identity-mapped"},
+        {LM_F_COMPAT, "CR0.PG set with the PML4: IA-32e compatibility mode"},
+        {LM_F_LONG, "far jump to a descriptor with L set: 64-bit mode"},
+        {LM_F_VERIFIED, "the 64-bit payload ran to completion"},
+        {LM_F_BACK32, "back to 32-bit code, still on 64-bit paging"},
+        {LM_F_RETURNED, "kernel CR3, kernel GDT, kernel stack restored"},
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(stages); i++)
+        kprintf("  [%s] %s\n", (r.flags & stages[i].bit) ? "ok" : "--",
+                stages[i].what);
+
+    kprintf("\nWhat 64-bit mode proved\n");
+    kprintf("  CS          : 0x%02x (the descriptor whose L bit is set)\n",
+            r.cs);
+    kprintf("  EFER        : 0x%08llx  LME %s, LMA %s\n", r.efer,
+            (r.efer & EFER_LME_BIT) ? "set" : "CLEAR",
+            (r.efer & EFER_LMA_BIT) ? "set" : "CLEAR");
+    kprintf("  CR4.PAE     : %s\n", (r.cr4 & CR4_PAE_BIT) ? "set" : "CLEAR");
+    kprintf("  64-bit imm  : 0x%016llx %s\n", r.wide,
+            r.wide == LM_WIDE_VALUE ? "" : "<- WRONG");
+    kprintf("  0xffffffff+1: 0x%016llx %s\n", r.crossed,
+            r.crossed == LM_CROSSED_VALUE ? "(32-bit mode gives 0)"
+                                          : "<- WRONG");
+    kprintf("  r15         : 0x%016llx %s\n", r.r15,
+            r.r15 == LM_R15_VALUE ? "(a register 32-bit mode lacks)"
+                                  : "<- WRONG");
+    kprintf("  lea [rip+x] : %p, expected %p %s\n", (void *)(u32)r.rip_lea,
+            (void *)r.rip_expected,
+            (u64)r.rip_expected == r.rip_lea ? "" : "<- WRONG");
+    kprintf("  [64-bit ptr]: 0x%016llx from phys %p %s\n", r.probe_value,
+            (void *)r.probe_phys,
+            r.probe_value == LM_PROBE_MAGIC ? "(only the 4-level walk maps it)"
+                                            : "<- WRONG");
+
+    kprintf("\n  round trip  : %llu cycles, trampoline %u bytes\n", r.cycles,
+            r.trampoline_bytes);
+    kprintf("  kernel      : still 32-bit, still running - CR4.PAE %s, "
+            "paging %s\n",
+            (read_cr4() & CR4_PAE_BIT) ? "SET (wrong)" : "clear",
+            (read_cr0() & 0x80000000u) ? "on" : "OFF (wrong)");
+
+    if (ok) {
+        kprintf("\n  result      : round trip complete\n");
+        return 0;
+    }
+
+    kprintf("\n  result      : FAILED - %s\n",
+            r.failure ? r.failure : "unknown");
+    return 1;
+}
 
 static int cmd_cpus(int argc, char **argv)
 {
@@ -1290,6 +1382,8 @@ static const struct shell_command commands[] = {
     {"fuzz", "fuzz", "attack the syscall boundary from ring 3", cmd_fuzz},
     {"programs", "programs", "list the programs exec() can run", cmd_programs},
     {"cpus", "cpus", "processors, ACPI and the local APIC", cmd_cpus},
+    {"longmode", "longmode", "enter 64-bit long mode, prove it, and return",
+     cmd_longmode},
     {"ipi", "ipi", "ping every other processor and time a TLB shootdown",
      cmd_ipi},
     {"disk", "disk", "ATA drives and block devices", cmd_disk},

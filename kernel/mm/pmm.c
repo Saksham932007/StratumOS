@@ -221,6 +221,52 @@ paddr_t pmm_alloc_frame(void)
     return PMM_NO_FRAME;
 }
 
+paddr_t pmm_alloc_frame_above(paddr_t floor)
+{
+    /* A frame from above a given physical address.
+     *
+     * The allocator hands out frames in roughly ascending order, so early in
+     * boot pmm_alloc_frame() returns something a few megabytes up and a
+     * caller that needs a frame outside some low window silently does not get
+     * one. The long-mode code needs exactly that: its pointer probe only
+     * proves the four-level page walk resolved if the frame it reads is
+     * outside the 4 MiB identity map the transition runs under. With a frame
+     * inside that window the test passes for the wrong reason.
+     *
+     * The same shape of constraint is why real kernels have memory zones -
+     * ISA DMA needs a frame below 16 MiB, some devices below 4 GiB - so this
+     * is the general primitive rather than a one-off for one caller.
+     */
+    u32 first = PFN(floor + PAGE_SIZE - 1); /* round the floor up */
+
+    alloc_calls++;
+
+    for (u32 word = first / BITS_PER_WORD; word < bitmap_words; word++) {
+        if (bitmap[word] == 0xFFFFFFFFu)
+            continue;
+
+        for (u32 bit = 0; bit < BITS_PER_WORD; bit++) {
+            u32 pfn = word * BITS_PER_WORD + bit;
+
+            if (pfn >= total_frames)
+                break;
+            if (pfn < first)
+                continue;
+            if (frame_is_set(pfn))
+                continue;
+
+            frame_set(pfn);
+            refcounts[pfn] = 1;
+            used_frames++;
+            return PFN_PHYS(pfn);
+        }
+    }
+
+    pr_err("no free frame above %p (%u/%u frames in use)", (void *)floor,
+           used_frames, total_frames);
+    return PMM_NO_FRAME;
+}
+
 paddr_t pmm_alloc_frames(size_t count)
 {
     if (count == 0)

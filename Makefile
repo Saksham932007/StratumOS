@@ -7,6 +7,7 @@
 #   make run-iso      boot via GRUB/Multiboot2 in QEMU
 #   make test         host unit tests + both boot paths under QEMU, headless
 #   make fuzz         libFuzzer over the real parsers, bounded (needs clang)
+#   make run-x86-64   boot on a CPU that has long mode, for `longmode`
 #   make debug        start QEMU stopped, waiting for GDB on :1234
 #   make gdb          attach GDB to a waiting QEMU
 #   make clean        remove build output
@@ -112,6 +113,16 @@ ASM_SOURCES := $(sort $(wildcard $(KSRC)/arch/x86/*.asm))
 
 C_OBJECTS   := $(C_SOURCES:%.c=$(BUILD)/%.o)
 ASM_OBJECTS := $(ASM_SOURCES:%.asm=$(BUILD)/%.o)
+
+# A .c and a .asm with the same base name in the same directory would both
+# compile to the same object path, and whichever rule ran second would
+# silently win - which presents as an undefined reference to a symbol that is
+# plainly there in the source. Caught once, while adding longmode.c beside
+# what is now longmode_tramp.asm; not worth catching twice.
+OBJECT_COLLISIONS := $(strip $(filter $(ASM_OBJECTS),$(C_OBJECTS)))
+ifneq ($(OBJECT_COLLISIONS),)
+$(error two sources compile to the same object: $(OBJECT_COLLISIONS) - rename one of them, as gdt.c and gdt_flush.asm already do)
+endif
 
 # The ring-3 programs are separate ELFs, linked for user space and embedded in
 # the kernel image as blobs. Defined here, before LINK_ORDER, because that is
@@ -412,6 +423,20 @@ run: $(DISK_IMG)
 .PHONY: run-iso
 run-iso: $(ISO)
 	$(QEMU) $(QEMU_COMMON) $(QEMU_SERIAL) -cdrom $(ISO)
+
+# The same 32-bit image on a processor that has x86-64, which is what real
+# hardware looks like and the only way to exercise the long-mode transition:
+# qemu-system-i386 masks CPUID.80000001H:EDX.LM even with -cpu max, so on it
+# this kernel correctly reports that long mode is unavailable. Type
+# `longmode` at the shell. See docs/LONGMODE.md.
+QEMU64 ?= qemu-system-x86_64
+
+.PHONY: run-x86-64
+run-x86-64: $(SHELL_IMG)
+	@command -v $(QEMU64) >/dev/null 2>&1 || \
+		{ echo "  $(QEMU64) is not installed"; exit 1; }
+	$(QEMU64) $(QEMU_COMMON) $(QEMU_SERIAL) \
+		-drive format=raw,file=$(SHELL_IMG),index=0,media=disk
 
 # `-kernel` makes QEMU act as the Multiboot loader itself, which is the
 # fastest way to iterate: no ISO rebuild, no GRUB menu.
