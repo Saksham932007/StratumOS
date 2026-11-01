@@ -69,10 +69,16 @@ Every task's kernel stack lives in the kernel heap at `0xD0000000`, which is
 mapped identically in every address space. So the stack the code is standing
 on survives the `CR3` load, and the swap that follows is an ordinary one.
 
-Entry 1023 points the directory at itself — the recursive mapping — so
-`0xFFFFF000` is the current directory and `0xFFC00000 + i * 4096` is page
-table *i*. That is how the VMM edits the *current* address space's tables
-without a permanent mapping for each one.
+Entry 511 of each page directory points at that directory — the self-mapping
+window — so within the kernel's gigabyte `0xFFFFF000` is the current
+directory and `0xFFE00000 + i * 4096` is page table *i*. That is how the VMM
+edits the *current* address space's tables without a permanent mapping for
+each one.
+
+Under PAE the kernel's gigabyte is one entry of the top-level table, so
+"shared" is literal: every address space holds the *same* kernel page
+directory, not a copy of its entries. A kernel mapping made after a process
+forked appears in that process immediately.
 
 The `ps` command shows which address space each task is in:
 
@@ -104,7 +110,7 @@ is catastrophic.
 
 ### Editing an address space that is not current
 
-The recursive window only reaches the current directory, and `fork` has to
+The page-table window only reaches the current directory, and `fork` has to
 build the child's tables while the parent's are loaded. So the VMM reserves
 two kernel pages as temporary mapping slots:
 
@@ -548,6 +554,5 @@ checked before being written through. See
   or a fault.
 - **32 task slots, statically allocated.** `fork` fails with -1 when they run
   out, which the caller is expected to handle.
-- **No NX.** Without PAE, x86 cannot mark a page non-executable, so
-  "read-only" is enforced and "non-executable" is not. That is the next item
-  in [ROADMAP.md](ROADMAP.md).
+- **No `argv` or environment.** A new process is told its own name and
+  nothing else, so a shell cannot pass arguments to a program it starts.

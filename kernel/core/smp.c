@@ -62,6 +62,7 @@ extern const u8 ap_param_pagedir_off[];
 extern const u8 ap_param_entry_off[];
 extern const u8 ap_param_stack_off[];
 extern const u8 ap_param_flag_off[];
+extern const u8 ap_param_nx_off[];
 
 static struct cpu cpus[SMP_MAX_CPUS];
 static u32 cpu_count;    /* online  */
@@ -233,7 +234,7 @@ NORETURN void ap_main(void)
      * kernel halves, so this changes nothing about what is reachable; it just
      * stops this processor holding a reference to a directory the boot
      * processor is about to free. */
-    vmm_switch_address_space(vmm_kernel_pd_phys());
+    vmm_switch_address_space(vmm_kernel_root_phys());
 
     apic_init_ap();
 
@@ -278,14 +279,23 @@ static void install_trampoline(paddr_t bootstrap_pd)
 
     memcpy(dst, ap_trampoline_start, size);
 
-    /* Patch in the two parameters that are the same for every processor. The
+    /* Patch in the parameters that are the same for every processor. The
      * stack is per-processor and is written just before each startup. */
     *(volatile u32 *)(dst + (u32)ap_param_pagedir_off) = bootstrap_pd;
     *(volatile u32 *)(dst + (u32)ap_param_entry_off) = (u32)&ap_main;
 
-    pr_debug("trampoline: %u bytes at phys %p, entry %p, bootstrap pd %p",
+    /* Whether to set EFER.NXE before loading CR3. The tables this processor
+     * is handed already have NX bits in them if the boot processor enabled
+     * the feature, and a reserved bit set in a live entry faults every walk
+     * through it - so this is not an optimisation, it is the difference
+     * between the core starting and the core triple-faulting on its first
+     * instruction fetch. */
+    *(volatile u32 *)(dst + (u32)ap_param_nx_off) = vmm_nx_enabled() ? 1 : 0;
+
+    pr_debug("trampoline: %u bytes at phys %p, entry %p, bootstrap PDPT %p, "
+             "nx %u",
              (unsigned)size, (void *)TRAMPOLINE_PHYS, (void *)&ap_main,
-             (void *)bootstrap_pd);
+             (void *)bootstrap_pd, vmm_nx_enabled() ? 1u : 0u);
 }
 
 /* Map a per-CPU stack with a guard page below it, exactly as the task stacks

@@ -11,21 +11,39 @@
 ;
 ;   1. Publishes a Multiboot2 header, so GRUB can load the ELF directly. It is
 ;      in .boot because a loader searches the first 32 KiB of the *file*.
-;   2. Builds a page directory with three entries:
-;        - PDE 0    identity-maps the first 4 MiB, so that the instruction
-;                   after `mov cr0` is still fetchable
-;        - PDE 768  maps 0xC0000000 -> 0x00000000, which is where the kernel
-;                   is linked and is also how it reaches low physical memory
-;                   (the VGA framebuffer, the loader's tables) afterwards
-;        - PDE 1023 points at the directory itself, so the VMM's recursive
-;                   window works from the very first instruction of C
-;   3. Enables paging and long-jumps into the higher half.
-;   4. Clears the BSS, sets up the stack, and calls kmain.
+;   2. Checks that the processor has PAE, and says so and stops if it does
+;      not. The kernel is PAE-only because the no-execute bit does not exist
+;      in the 32-bit page-table entry format - see mm/vmm.h.
+;   3. Builds a three-level PAE page table set:
+;        - two page tables covering the first 4 MiB, one per 2 MiB
+;        - a page directory per gigabyte, each with entry 511 pointing at
+;          itself, which is the window the VMM writes page tables through
+;        - gigabyte 0's directory maps the first 4 MiB identity, so that the
+;          instruction after `mov cr0` is still fetchable
+;        - gigabyte 3's directory maps 0xC0000000 -> 0x00000000, which is
+;          where the kernel is linked and is also how it reaches low physical
+;          memory (the VGA framebuffer, the loader's tables) afterwards
+;        - a PDPT of four entries, one per directory
+;   4. Enables PAE, enables paging, and long-jumps into the higher half.
+;   5. Clears the BSS, sets up the stack, and calls kmain.
 ;
-; Register discipline matters here. The loader hands over `EAX` = protocol
-; magic and `EBX` = info pointer, and neither may be clobbered before kmain.
-; The page-table loop uses EAX/ECX/EDX/EDI, so the magic is parked in ESI and
-; EBX is simply left alone.
+; Nothing here sets the no-execute bit, although every table it builds is in
+; the format that has one. Bit 63 is *reserved* until EFER.NXE is set, and a
+; reserved bit in a live entry faults every walk through it - so the bit
+; cannot be set before C has read CPUID and written the MSR. vmm_init() goes
+; back and sets it on the self-map entries once that is done.
+;
+; Register discipline matters here, and it is not free. The loader hands over
+; `EAX` = protocol magic and `EBX` = info pointer, and neither may reach kmain
+; clobbered. The magic is parked in ESI. EBX cannot simply be left alone any
+; more, because the PAE check uses CPUID and CPUID writes EBX - so it is
+; parked in EBP across that one instruction. The page-table loops use
+; EAX/ECX/EDX/EDI and touch neither.
+;
+; The first version of this file did leave EBX alone, and adding the CPUID
+; check broke the handover: the kernel panicked with "no usable boot
+; information" on both loaders at once, which is what a clobbered info pointer
+; looks like from the far end.
 ; =============================================================================
 
 KERNEL_VIRT_BASE equ 0xC0000000
@@ -36,10 +54,27 @@ PDE_PRESENT      equ 0x001
 PDE_WRITE        equ 0x002
 CR0_PG           equ 0x80000000
 CR0_WP           equ 0x00010000
+CR4_PAE          equ 0x00000020
+CPUID_PAE        equ (1 << 6)             ; leaf 1, EDX
 
-; The directory slot covering 0xC0000000: 0xC0000000 >> 22 == 768.
-KERNEL_PDE_INDEX equ (KERNEL_VIRT_BASE >> 22)
-RECURSIVE_SLOT   equ 1023
+; A PAE entry is eight bytes, so an index is scaled by 8 and a table holds 512
+; of them. The PDPT slot covering 0xC0000000 is 0xC0000000 >> 30 == 3, and the
+; self-map lives in slot 511 of every directory.
+ENTRY_SIZE       equ 8
+PD_ENTRIES       equ 512
+KERNEL_PDPT_SLOT equ (KERNEL_VIRT_BASE >> 30)
+PD_SELF_SLOT     equ 511
+
+; Point a directory's slot 511 at the directory itself. A macro rather than a
+; subroutine because there is no stack yet: Multiboot leaves ESP undefined,
+; and the kernel's own stack is in .bss, which is not addressable until the
+; jump into the higher half.
+%macro SELF_MAP 1
+                mov     eax, %1
+                or      eax, PDE_PRESENT | PDE_WRITE
+                mov     [%1 + PD_SELF_SLOT * ENTRY_SIZE], eax
+                mov     dword [%1 + PD_SELF_SLOT * ENTRY_SIZE + 4], 0
+%endmacro
 
 ; -----------------------------------------------------------------------------
 ; Multiboot2 header. Must be 8-byte aligned and inside the first 32 KiB.
@@ -71,21 +106,40 @@ mb2_start:
 mb2_end:
 
 ; -----------------------------------------------------------------------------
-; The boot page directory and its single page table.
+; The boot paging structures.
 ;
-; One page table is enough for both mappings, and it is deliberately shared:
-; the identity window maps 0x00000000-0x003FFFFF, and the kernel window maps
-; 0xC0000000-0xC03FFFFF to the same physical range, so the same 1024 entries
-; serve both. That is also what makes low physical memory reachable from the
-; higher half once the identity map is gone.
+; Seven pages, built once and then owned by the VMM. The two page tables are
+; deliberately shared between the identity window (0x00000000-0x003FFFFF) and
+; the kernel window (0xC0000000-0xC03FFFFF), which map the same physical
+; range: the same 1024 entries serve both, and that sharing is also what makes
+; low physical memory reachable from the higher half once the identity map is
+; gone.
+;
+; All four directories exist from the start, even though gigabytes 1 and 2 are
+; empty, so that "every PDPT entry is present" holds in the kernel's own
+; address space as well as in the ones the VMM creates. The page-table window
+; relies on it, and the alternative is a PDPT written at runtime - which the
+; processor caches in four internal registers and does not re-read until CR3
+; is reloaded. Writing it exactly once, here, removes that trap.
 ; -----------------------------------------------------------------------------
 section .boot.pagetables
                 align   4096
+global boot_pdpt
+boot_pdpt:
+                times   4096 db 0
+boot_pd0:                                       ; gigabyte 0: the identity map
+                times   4096 db 0
+boot_pd1:                                       ; gigabyte 1: empty
+                times   4096 db 0
+boot_pd2:                                       ; gigabyte 2: empty
+                times   4096 db 0
 global boot_page_directory
-boot_page_directory:
+boot_page_directory:                            ; gigabyte 3: the kernel
                 times   4096 db 0
 global boot_page_table
-boot_page_table:
+boot_page_table:                                ; 0x000000-0x1FFFFF
+                times   4096 db 0
+boot_page_table2:                               ; 0x200000-0x3FFFFF
                 times   4096 db 0
 
 ; -----------------------------------------------------------------------------
@@ -112,13 +166,52 @@ _start:
                 cld
 
                 ; EAX = magic, EBX = info pointer. Park the magic in ESI; the
-                ; loop below does not touch ESI or EBX.
+                ; loops below do not touch ESI or EBX.
                 mov     esi, eax
 
-                ; --- fill the page table: 1024 entries covering 0-4 MiB ----
+                ; --- PAE or nothing ----------------------------------------
+                ; CPUID itself is assumed here, which is safe: a processor
+                ; without CPUID is a 486 or earlier and has no PAE either, so
+                ; the check would reach the same conclusion by a longer
+                ; route. The message goes straight to the VGA text buffer,
+                ; because there is no console, no paging and no C yet.
+                ; CPUID clobbers EBX, which is the loader's information
+                ; pointer and must survive to kmain. EBP is the one register
+                ; nothing between here and the higher-half jump touches.
+                mov     ebp, ebx
+
+                mov     eax, 1
+                cpuid
+                test    edx, CPUID_PAE
+                jnz     .has_pae
+
+                mov     edi, 0xB8000
+                mov     esi, no_pae_msg
+.say:
+                mov     al, [esi]
+                test    al, al
+                jz      .said
+                mov     [edi], al
+                mov     byte [edi + 1], 0x4F    ; white on red
+                inc     esi
+                add     edi, 2
+                jmp     .say
+.said:
+                cli
+.dead:
+                hlt
+                jmp     .dead
+
+.has_pae:
+                mov     ebx, ebp                ; the information pointer back
+
+                ; --- fill the two page tables: 1024 entries, 0-4 MiB -------
                 ; .boot has VMA == LMA, so these symbols are already physical
                 ; and need no adjustment. That is the whole reason this code
                 ; lives in its own section.
+                ;
+                ; The high dword of every entry is zero: the frame is below
+                ; 4 GiB, and bit 63 must stay clear until EFER.NXE is set.
                 mov     edi, boot_page_table
                 xor     eax, eax                ; physical address being mapped
                 mov     ecx, 1024
@@ -126,35 +219,68 @@ _start:
                 mov     edx, eax
                 or      edx, PDE_PRESENT | PDE_WRITE
                 mov     [edi], edx
-                add     edi, 4
+                mov     dword [edi + 4], 0
+                add     edi, ENTRY_SIZE
                 add     eax, 4096
                 dec     ecx
                 jnz     .fill_pt
 
-                ; --- three directory entries -------------------------------
-                mov     edi, boot_page_directory
+                ; --- the four directories ----------------------------------
+                ; Entry 511 of each points at the directory itself, so that
+                ; every page table is reachable at a computable address from
+                ; the first instruction of C. See the comment at the top of
+                ; kernel/mm/vmm.c.
+                SELF_MAP boot_pd0
+                SELF_MAP boot_pd1
+                SELF_MAP boot_pd2
+                SELF_MAP boot_page_directory
 
+                ; The first 4 MiB, twice: identity in gigabyte 0, and at
+                ; 0xC0000000 in gigabyte 3. 0xC0000000 is 1 GiB-aligned, so
+                ; its directory index is 0 and the two look identical.
                 mov     eax, boot_page_table
                 or      eax, PDE_PRESENT | PDE_WRITE
+                mov     edx, boot_page_table2
+                or      edx, PDE_PRESENT | PDE_WRITE
 
-                ; PDE 0: identity. Needed only for the handful of instructions
-                ; between enabling paging and jumping high; dropped later by
-                ; vmm_init() once nothing holds a low pointer.
+                mov     [boot_pd0], eax
+                mov     dword [boot_pd0 + 4], 0
+                mov     [boot_pd0 + ENTRY_SIZE], edx
+                mov     dword [boot_pd0 + ENTRY_SIZE + 4], 0
+
+                mov     [boot_page_directory], eax
+                mov     dword [boot_page_directory + 4], 0
+                mov     [boot_page_directory + ENTRY_SIZE], edx
+                mov     dword [boot_page_directory + ENTRY_SIZE + 4], 0
+
+                ; --- the PDPT ----------------------------------------------
+                ; A PDPT entry has a present bit, two cache-control bits and
+                ; an address. Bits 1, 2 and 5-8 are reserved and a non-zero
+                ; one faults, so there is no WRITE bit to set at this level.
+                mov     edi, boot_pdpt
+                mov     eax, boot_pd0
+                or      eax, PDE_PRESENT
                 mov     [edi], eax
-
-                ; PDE 768: the kernel's own window, and its view of low
-                ; physical memory from then on.
-                mov     [edi + KERNEL_PDE_INDEX * 4], eax
-
-                ; PDE 1023: the directory itself, so that page tables are
-                ; reachable at 0xFFC00000 + i*4096 as soon as paging is on.
-                ; See the comment at the top of kernel/mm/vmm.c.
+                mov     eax, boot_pd1
+                or      eax, PDE_PRESENT
+                mov     [edi + 1 * ENTRY_SIZE], eax
+                mov     eax, boot_pd2
+                or      eax, PDE_PRESENT
+                mov     [edi + 2 * ENTRY_SIZE], eax
                 mov     eax, boot_page_directory
-                or      eax, PDE_PRESENT | PDE_WRITE
-                mov     [edi + RECURSIVE_SLOT * 4], eax
+                or      eax, PDE_PRESENT
+                mov     [edi + KERNEL_PDPT_SLOT * ENTRY_SIZE], eax
 
                 ; --- enable paging -----------------------------------------
-                mov     eax, boot_page_directory
+                ; PAE first, and necessarily before CR0.PG: the processor
+                ; refuses to change CR4.PAE while paging is on, and loading
+                ; CR3 with a PDPT while it is off would have it read the
+                ; 32-bit entry format out of 64-bit tables.
+                mov     eax, cr4
+                or      eax, CR4_PAE
+                mov     cr4, eax
+
+                mov     eax, boot_pdpt
                 mov     cr3, eax
 
                 mov     eax, cr0
@@ -168,6 +294,11 @@ _start:
                 ; one would stay down here.
                 lea     eax, [higher_half]
                 jmp     eax
+
+no_pae_msg:
+                db      "StratumOS needs a processor with PAE (Pentium Pro "
+                db      "or later): the no-execute bit does not exist "
+                db      "without it.", 0
 
 ; -----------------------------------------------------------------------------
 ; From here on, EIP is in the higher half and every symbol means what it says.

@@ -172,6 +172,54 @@ static void test_vmm(struct ktest_result *r)
     /* A user pointer to the null page must be refused too. */
     KT_ASSERT(r, !user_range_ok(0, 4));
 
+    /* --- the no-execute bit, which is why this kernel uses PAE ----------
+     *
+     * Tested on a scratch mapping rather than on the kernel's own pages,
+     * because what is being checked here is the rule vmm_map() applies: a
+     * caller that says nothing gets a non-executable page, and only
+     * PTE_EXEC produces an executable one. The kernel's .text and .rodata
+     * are checked in the `harden` suite, which is where the policy lives.
+     *
+     * Both branches are real tests. On a processor without the bit,
+     * vmm_nx_enabled() is false and every entry must come back *without*
+     * NX set - because setting bit 63 there would make it a reserved bit
+     * and fault every walk through the entry. The legacy-cpu scenario is
+     * what runs that side. */
+    KT_ASSERT(r, vmm_map(scratch, PAGE_SIZE, PTE_PRESENT | PTE_WRITE));
+
+    pte_t data_pte = vmm_pte(scratch);
+
+    KT_ASSERT(r, data_pte & PTE_PRESENT);
+    KT_EQ(r, (data_pte & PTE_NX) ? 1u : 0u, vmm_nx_enabled() ? 1u : 0u);
+
+    /* PTE_EXEC is a positive permission, so asking for it clears the
+     * hardware bit. */
+    KT_ASSERT(r, vmm_protect(scratch, PTE_PRESENT | PTE_EXEC));
+    KT_EQ(r, (vmm_pte(scratch) & PTE_NX) ? 1u : 0u, 0u);
+    KT_EQ(r, (vmm_pte(scratch) & PTE_WRITE) ? 1u : 0u, 0u);
+
+    /* And it is not sticky: a page made writable again loses it. This is the
+     * assertion that would catch vmm_protect() preserving the old flags
+     * instead of replacing them, which would let a page be writable and
+     * executable at once without anyone asking for that. */
+    KT_ASSERT(r, vmm_protect(scratch, PTE_PRESENT | PTE_WRITE));
+    KT_EQ(r, (vmm_pte(scratch) & PTE_NX) ? 1u : 0u, vmm_nx_enabled() ? 1u : 0u);
+
+    /* The frame survived all three, because protect changes permissions and
+     * nothing else. */
+    KT_ASSERT(r, vmm_translate(scratch, &phys) && phys == PAGE_SIZE);
+
+    vmm_unmap(scratch);
+    KT_ASSERT(r, !vmm_translate(scratch, NULL));
+
+    /* The directory entry above it must never carry NX: the bit is OR-ed
+     * down the walk, so an NX directory entry would make its whole 2 MiB
+     * non-executable whatever the page entries say. */
+    KT_EQ(r,
+          (vmm_pde_raw(PDPT_INDEX(scratch), PDE_INDEX(scratch)) & PTE_NX) ? 1u
+                                                                          : 0u,
+          0u);
+
     /* --- an owned mapping ------------------------------------------------
      * vmm_alloc_at() allocates a frame and records PTE_OWNED, so the matching
      * vmm_unmap() is responsible for returning it to the allocator. */
@@ -770,7 +818,7 @@ static void upoke(volatile u32 *p, u32 v)
 static void test_address_spaces(struct ktest_result *r)
 {
     struct task *self = task_current();
-    const paddr_t kernel_pd = vmm_kernel_pd_phys();
+    const paddr_t kernel_pd = vmm_kernel_root_phys();
     const vaddr_t up = USER_IMAGE_BASE;
     struct pmm_stats pm_before, pm_after;
     struct vmm_stats vs_before, vs_after;
@@ -921,7 +969,7 @@ static void test_processes(struct ktest_result *r)
     /* A kernel thread shares the kernel's address space; only a process gets
      * one of its own. Conflating the two is how fork() ends up cloning the
      * kernel's user half. */
-    KT_ASSERT(r, self->page_dir == vmm_kernel_pd_phys());
+    KT_ASSERT(r, self->page_dir == vmm_kernel_root_phys());
     KT_ASSERT(r, !self->user);
 
     /* No frame, no fork. The alternative - trusting a NULL - would have
@@ -1033,28 +1081,112 @@ static void test_hardening(struct ktest_result *r)
      * everything. */
     KT_ASSERT(r, (vmm_pte((vaddr_t)__data_start) & PTE_WRITE) != 0);
 
-    /* --- the kernel half is unreachable from ring 3 --------------------- */
-    /* A directory entry's USER bit gates its whole 4 MiB, and ensure_table()
-     * widens one when a page inside becomes user-accessible. That must never
-     * have happened to a kernel slot: it would expose 4 MiB of kernel space
-     * to ring 3 in one bit. */
-    u32 kernel_slots = 0, slots_absent = 0, slots_user = 0;
+    /* --- W^X, the other half ---------------------------------------------
+     *
+     * Read-only .text was always checkable; executable-only .text was not,
+     * because the 32-bit page table entry has nowhere to say it. This is
+     * what PAE bought, and it is asserted as an exclusive-or rather than as
+     * two separate facts: for every page of the kernel's linear map, at most
+     * one of "writable" and "executable" may be true.
+     *
+     * On a processor with no NX bit the exclusion cannot hold - every page is
+     * executable - so the assertion is made conditional on the feature and
+     * the count is reported either way. The legacy-cpu scenario runs that
+     * side, and `hardening` says which it took. */
+    u32 wx_pages = 0, exec_pages = 0, linear_pages = 0;
 
-    for (u32 pdi = KERNEL_PDE_FIRST; pdi < 1023; pdi++) {
-        u32 pde = vmm_pde_raw(pdi);
+    for (vaddr_t va = KERNEL_VIRT_BASE; va < KERNEL_VIRT_BASE + VMM_LINEAR_SIZE;
+         va += PAGE_SIZE) {
+        pte_t pte = vmm_pte(va);
+
+        if (!(pte & PTE_PRESENT))
+            continue;
+
+        linear_pages++;
+        if (!(pte & PTE_NX))
+            exec_pages++;
+        if ((pte & PTE_WRITE) && !(pte & PTE_NX))
+            wx_pages++;
+    }
+
+    /* The window is fully backed, so this is also a check that the linear
+     * map survived the W^X pass intact. */
+    KT_EQ(r, linear_pages, (u32)(VMM_LINEAR_SIZE / PAGE_SIZE));
+
+    if (vmm_nx_enabled()) {
+        KT_EQ(r, wx_pages, 0u);
+
+        /* And .text is the executable part - all of it, and not much more.
+         * ".boot" holds the tables _start built and stays writable, so it is
+         * non-executable too; what is left executable is .text alone. */
+        KT_EQ(r, exec_pages,
+              (u32)((PAGE_ALIGN((vaddr_t)__text_end) -
+                     PAGE_TRUNC((vaddr_t)__text_start)) /
+                    PAGE_SIZE));
+
+        KT_EQ(r, (vmm_pte((vaddr_t)__text_start) & PTE_NX) ? 1u : 0u, 0u);
+        KT_ASSERT(r, vmm_pte((vaddr_t)__rodata_start) & PTE_NX);
+        KT_ASSERT(r, vmm_pte((vaddr_t)__data_start) & PTE_NX);
+        KT_ASSERT(r, vmm_pte(KHEAP_BASE) & PTE_NX);
+
+        /* This task's own kernel stack. A stack that is executable is the
+         * single most useful page in the address space to an attacker who
+         * can overflow one, and it is outside the linear map, so the loop
+         * above does not cover it. */
+        KT_ASSERT(r, vmm_pte((vaddr_t)task_current()->stack_base) & PTE_NX);
+    } else {
+        /* Every page is executable, including .text - which is the honest
+         * statement of what this processor can enforce, and is exactly what
+         * `hardening` and the W^X log line say out loud.
+         *
+         * The reason to assert it rather than skip is that "no NX" has to
+         * mean the bit is never set anywhere. A kernel that set bit 63 on a
+         * processor without the feature would be setting a *reserved* bit,
+         * and every walk through that entry would fault for good. */
+        KT_EQ(r, exec_pages, linear_pages);
+        KT_EQ(r, (vmm_pte((vaddr_t)__data_start) & PTE_NX) ? 1u : 0u, 0u);
+        KT_EQ(r, (vmm_pte(KHEAP_BASE) & PTE_NX) ? 1u : 0u, 0u);
+        KT_ASSERT(r, wx_pages > 0); /* and that is the whole problem */
+    }
+
+    /* --- the kernel half is unreachable from ring 3 --------------------- */
+    /* A directory entry's USER bit gates its whole 2 MiB, and ensure_table()
+     * widens one when a page inside becomes user-accessible. That must never
+     * have happened to a slot in the kernel's directory: it would expose
+     * 2 MiB of kernel space to ring 3 in one bit.
+     *
+     * The slots no longer have to all be *present* - the kernel's page
+     * directory is shared by pointer between address spaces now, so a table
+     * created at runtime appears in all of them and there is nothing to
+     * pre-reserve. What matters is that the ones that do exist are
+     * supervisor-only. */
+    u32 kernel_slots = 0, slots_user = 0;
+
+    for (u32 pdi = 0; pdi < PD_SELF_SLOT; pdi++) {
+        pte_t pde = vmm_pde_raw(KERNEL_PDPT_INDEX, pdi);
+
+        if (!(pde & PTE_PRESENT))
+            continue;
 
         kernel_slots++;
-        /* Every kernel slot must be backed, so that no address space can be
-         * missing one. See vmm_reserve_kernel_tables(). */
-        if (!(pde & PTE_PRESENT))
-            slots_absent++;
         if (pde & PTE_USER)
             slots_user++;
     }
 
-    KT_EQ(r, kernel_slots, 1023u - KERNEL_PDE_FIRST);
-    KT_EQ(r, slots_absent, 0u);
+    /* The linear map alone is eight slots, so a plausible floor. */
+    KT_ASSERT(r, kernel_slots >= VMM_LINEAR_SIZE / (2 * MIB));
     KT_EQ(r, slots_user, 0u);
+
+    /* The self-map is the one slot in the directory that points at the
+     * directory, and it must be no-execute: it is writable, and every page
+     * table in the gigabyte is reachable through it. */
+    pte_t self_map = vmm_pde_raw(KERNEL_PDPT_INDEX, PD_SELF_SLOT);
+
+    KT_ASSERT(r, self_map & PTE_PRESENT);
+    KT_ASSERT(r, self_map & PTE_WRITE);
+    KT_EQ(r, (self_map & PTE_USER) ? 1u : 0u, 0u);
+    if (vmm_nx_enabled())
+        KT_ASSERT(r, self_map & PTE_NX);
 
     /* --- stack guard pages --------------------------------------------- */
     KT_ASSERT(r, h->stack_guard_pages);
@@ -1111,7 +1243,7 @@ static void test_hardening(struct ktest_result *r)
     /* Belongs here as much as in the vmm suite: an unmapped page zero is a
      * mitigation, not an implementation detail. */
     KT_ASSERT(r, !vmm_translate(0, NULL));
-    KT_ASSERT(r, (vmm_pde_raw(0) & PTE_PRESENT) == 0);
+    KT_ASSERT(r, (vmm_pde_raw(0, 0) & PTE_PRESENT) == 0);
 }
 
 /* ---- the disk, the partition table and the filesystem ------------------
@@ -1796,85 +1928,118 @@ static void test_bootstrap_pd(struct ktest_result *r)
     paddr_t pd = vmm_create_bootstrap_pd();
 
     KT_ASSERT(r, pd != 0);
-    KT_ASSERT(r, pd != vmm_kernel_pd_phys());
+    KT_ASSERT(r, pd != vmm_kernel_root_phys());
 
     if (!pd)
         return;
 
     /* Read it back through a temporary mapping, which is the access pattern
-     * that was being reordered. */
-    paddr_t identity_pt = 0;
-    bool kernel_half_ok = true;
+     * that was being reordered. vmm_inspect_entry() copies entries out under
+     * the same temp-slot discipline, so a reordering bug shows up here as a
+     * fault. */
+    paddr_t gigabytes[PDPT_ENTRIES] = {0};
+    bool all_present = true;
 
-    {
-        /* vmm_inspect_pd copies the entries out under the same temp-slot
-         * discipline, so a reordering bug shows up here as a fault. */
-        u32 slot0 = 0, recursive = 0, kernel_first = 0;
+    for (u32 k = 0; k < PDPT_ENTRIES; k++) {
+        pte_t entry = 0;
 
-        KT_ASSERT(r, vmm_inspect_pd(pd, 0, &slot0));
-        KT_ASSERT(r, vmm_inspect_pd(pd, 1023, &recursive));
-        KT_ASSERT(r, vmm_inspect_pd(pd, KERNEL_PDE_FIRST, &kernel_first));
+        KT_ASSERT(r, vmm_inspect_entry(pd, k, &entry));
+        if (!(entry & PTE_PRESENT))
+            all_present = false;
+        gigabytes[k] = (paddr_t)(entry & PTE_ADDR_MASK);
 
-        /* Slot 0 identity-maps the first 4 MiB: that is the whole reason this
-         * directory exists, because a processor enabling paging while
-         * executing at a low physical address needs the next instruction to
-         * still be fetchable. */
-        KT_ASSERT(r, (slot0 & PTE_PRESENT) != 0);
-        KT_ASSERT(r, (slot0 & PTE_WRITE) != 0);
-        identity_pt = slot0 & PTE_ADDR_MASK;
-        KT_ASSERT(r, identity_pt != 0);
+        /* Bits 1, 2 and 5-8 of a PDPT entry are reserved, and a non-zero one
+         * faults every walk through it. This is the assertion that would
+         * catch writing a WRITE or USER bit here out of habit. */
+        KT_EQ(r, (u32)(entry & 0x1E6u), 0u);
+    }
 
-        /* The recursive entry points at this directory and not at the
-         * kernel's. Copying the kernel's would give the new address space a
-         * window onto somebody else's page tables. */
-        KT_EQ(r, recursive & PTE_ADDR_MASK, pd);
-        KT_ASSERT(r, (recursive & PTE_PRESENT) != 0);
+    /* Every gigabyte is present, including the two empty ones: the
+     * page-table window is used without checking, so that is an invariant
+     * and not a detail. */
+    KT_ASSERT(r, all_present);
 
-        /* And the kernel's half came across, which is what makes the jump
-         * into the higher half work the instant paging is on. */
-        u32 expect = vmm_pde_raw(KERNEL_PDE_FIRST);
+    /* The kernel's gigabyte is the kernel's own page directory, by pointer
+     * and not by copy. That single identity is what used to take 255 copied
+     * directory entries and a test that compared all of them. */
+    KT_EQ(r, gigabytes[KERNEL_PDPT_INDEX], vmm_kernel_pd_phys());
 
-        KT_EQ(r, kernel_first, expect);
+    /* Each user gigabyte has its own directory, and they are distinct. */
+    for (u32 k = 0; k < USER_PDPT_COUNT; k++) {
+        KT_ASSERT(r, gigabytes[k] != 0);
+        KT_ASSERT(r, gigabytes[k] != vmm_kernel_pd_phys());
+        for (u32 j = 0; j < k; j++)
+            KT_ASSERT(r, gigabytes[k] != gigabytes[j]);
+    }
 
-        u32 kernel_slots = 0;
+    /* Gigabyte 0 maps the first 4 MiB and nothing else; 1 and 2 hold nothing
+     * but their self-maps. This address space is for a processor, not a
+     * process. Counted rather than asserted per slot - 1533 passing slots are
+     * one property, not 1533 pieces of evidence. */
+    u32 identity_slots = 0, unexpected = 0, self_maps = 0;
 
-        for (u32 i = KERNEL_PDE_FIRST; i < 1023; i++) {
-            u32 got = 0;
+    for (u32 k = 0; k < USER_PDPT_COUNT; k++) {
+        for (u32 pdi = 0; pdi < PD_ENTRIES; pdi++) {
+            pte_t got = 0;
 
-            kernel_slots++;
-            if (!vmm_inspect_pd(pd, i, &got) || got != vmm_pde_raw(i))
-                kernel_half_ok = false;
+            if (!vmm_inspect_entry(gigabytes[k], pdi, &got)) {
+                unexpected++;
+                continue;
+            }
+
+            if (pdi == PD_SELF_SLOT) {
+                /* Points at its own directory, not at the kernel's: a copied
+                 * self-map would give this address space a window onto
+                 * somebody else's page tables. */
+                if ((got & PTE_PRESENT) &&
+                    (paddr_t)(got & PTE_ADDR_MASK) == gigabytes[k])
+                    self_maps++;
+                else
+                    unexpected++;
+            } else if (k == 0 && pdi < VMM_BOOT_MAPPED / (2 * MIB)) {
+                /* The identity map: the whole reason this address space
+                 * exists, because a processor enabling paging while executing
+                 * at a low physical address needs the next instruction to
+                 * still be fetchable. */
+                if ((got & PTE_PRESENT) && (got & PTE_WRITE) &&
+                    (got & PTE_ADDR_MASK) != 0)
+                    identity_slots++;
+                else
+                    unexpected++;
+            } else if (got != 0) {
+                unexpected++;
+            }
         }
-
-        KT_EQ(r, kernel_slots, 1023u - KERNEL_PDE_FIRST);
     }
 
-    KT_ASSERT(r, kernel_half_ok);
+    KT_EQ(r, self_maps, (u32)USER_PDPT_COUNT);
+    KT_EQ(r, identity_slots, (u32)(VMM_BOOT_MAPPED / (2 * MIB)));
+    KT_EQ(r, unexpected, 0u);
 
-    /* The user half below the identity map is empty: this directory is for a
-     * processor, not a process. Counted rather than asserted per slot - 767
-     * passing slots are one property, not 767 pieces of evidence. */
-    u32 user_slots = 0, user_nonempty = 0;
+    /* The identity pages are executable, and have to be: the instruction
+     * after `mov cr0` on an application processor is fetched through them. */
+    pte_t identity_pde = 0;
 
-    for (u32 i = 1; i < KERNEL_PDE_FIRST; i++) {
-        u32 got = 1;
+    KT_ASSERT(r, vmm_inspect_entry(gigabytes[0], 0, &identity_pde));
 
-        user_slots++;
-        if (!vmm_inspect_pd(pd, i, &got) || got != 0)
-            user_nonempty++;
-    }
+    pte_t identity_pte = 0;
 
-    KT_EQ(r, user_slots, KERNEL_PDE_FIRST - 1);
-    KT_EQ(r, user_nonempty, 0u);
+    KT_ASSERT(r, vmm_inspect_entry((paddr_t)(identity_pde & PTE_ADDR_MASK), 1,
+                                   &identity_pte));
+    KT_ASSERT(r, identity_pte & PTE_PRESENT);
+    KT_EQ(r, (u32)(identity_pte & PTE_ADDR_MASK), (u32)PAGE_SIZE);
+    KT_EQ(r, (identity_pte & PTE_NX) ? 1u : 0u, 0u);
 
     vmm_destroy_bootstrap_pd(pd);
 
-    /* Two frames in, two frames out: the directory and its identity page
-     * table. The kernel's own page tables are shared and must not have been
-     * touched, which is what the frame count proves. */
+    /* Six frames in, six frames out: a PDPT, three user page directories and
+     * two identity page tables. The kernel's own page directory is shared and
+     * must not have been touched, which is what the frame count proves - a
+     * destroy that followed the kernel's PDPT entry would free page tables
+     * the running kernel is using, and the count would come back *lower* than
+     * it started. */
     pmm_get_stats(&after);
     KT_EQ(r, after.used_frames, before.used_frames);
-    KT_ASSERT(r, identity_pt != 0);
 }
 
 /* ---- 64-bit long mode -------------------------------------------------
@@ -1905,8 +2070,11 @@ static void test_longmode(struct ktest_result *r)
     KT_ASSERT(r, available || why != NULL);
 
     /* Whatever the processor can do, the kernel's own state is 32-bit before
-     * and after - which is the invariant the whole feature is judged on. */
-    KT_ASSERT(r, (read_cr4() & CR4_PAE_BIT) == 0);
+     * and after - which is the invariant the whole feature is judged on.
+     * CR4.PAE is set and stays set: the kernel is PAE either way, and long
+     * mode's four-level walk is PAE's entry format with one more level on
+     * top. What must not survive the trip is EFER.LME. */
+    KT_ASSERT(r, (read_cr4() & CR4_PAE_BIT) != 0);
     KT_ASSERT(r, (read_cr0() & 0x80000000u) != 0);
 
     paddr_t cr3_before = read_cr3();
@@ -1920,7 +2088,7 @@ static void test_longmode(struct ktest_result *r)
      * tell that any of it happened. */
     KT_EQ(r, read_cr3(), cr3_before);
     KT_EQ(r, vmm_count_user_pages(), pages_before);
-    KT_ASSERT(r, (read_cr4() & CR4_PAE_BIT) == 0);
+    KT_ASSERT(r, (read_cr4() & CR4_PAE_BIT) != 0);
     KT_ASSERT(r, (read_cr0() & 0x80000000u) != 0);
     KT_ASSERT(r, irq_enabled()); /* restored, not left masked */
 
@@ -1997,7 +2165,7 @@ static void test_longmode(struct ktest_result *r)
     KT_EQ(r, again.probe_phys, lm.probe_phys);
     KT_ASSERT(r, again.probe_value == LM_PROBE_MAGIC);
     KT_EQ(r, read_cr3(), cr3_before);
-    KT_ASSERT(r, (read_cr4() & CR4_PAE_BIT) == 0);
+    KT_ASSERT(r, (read_cr4() & CR4_PAE_BIT) != 0);
 }
 
 /* ---- networking --------------------------------------------------------

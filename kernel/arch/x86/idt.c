@@ -148,6 +148,14 @@ void page_fault_describe(const struct regs *r)
                 "directory or table entry\n");
     } else if (!present) {
         kprintf("  reason          : nothing is mapped at that address\n");
+    } else if (fetch) {
+        /* Present, and the fault was an instruction fetch: either the page is
+         * no-execute or it is supervisor-only. Both are the NX bit's whole
+         * reason for existing, so they are worth separating from the generic
+         * protection message below. */
+        kprintf("  reason          : the page is mapped %s, so it cannot be "
+                "executed\n",
+                user ? "supervisor-only" : "no-execute");
     } else if (write) {
         kprintf("  reason          : the page is mapped read-only%s\n",
                 user ? "" : " (CR0.WP applies to ring 0 too)");

@@ -165,10 +165,14 @@ lm_entry32:
                 pushfd
 
                 ; Everything needed to undo this, saved before anything is
-                ; changed. CR4 is saved whole rather than having PAE cleared
-                ; on the way back, because this kernel also sets SMEP, SMAP
-                ; and PSE in there and restoring the register verbatim cannot
-                ; get any of them wrong.
+                ; changed. CR4 is saved and restored whole rather than having
+                ; individual bits put back, because this kernel also sets
+                ; PAE, SMEP, SMAP and PSE in there and restoring the register
+                ; verbatim cannot get any of them wrong. That became the only
+                ; correct way to do it when the kernel went to PAE: PAE is
+                ; now set on the way in and must still be set on the way out,
+                ; so "clear PAE afterwards" would have broken paging for
+                ; good.
                 mov     [PHYS(lm_saved_esp)], esp
                 mov     eax, cr0
                 mov     [PHYS(lm_saved_cr0)], eax
@@ -210,9 +214,11 @@ lm_on_our_gdt:
                 mov     cr0, eax
 
                 ; 2. CR4.PAE. Long mode is PAE-only - its four-level walk is
-                ;    PAE's 64-bit entry format with one more level on top -
-                ;    and this bit cannot be written while paging is on, which
-                ;    is the whole reason for step 1.
+                ;    PAE's 64-bit entry format with one more level on top.
+                ;    The kernel already runs with this set, so the OR is a
+                ;    no-op today; it stays because the sequence is only
+                ;    correct if the bit is on, and nothing here should depend
+                ;    on what the caller happened to leave in CR4.
                 mov     eax, cr4
                 or      eax, CR4_PAE
                 mov     cr4, eax
@@ -363,8 +369,8 @@ lm_back32:
                 and     eax, ~EFER_LME
                 wrmsr
 
-                ; 3. CR4 back to exactly what the kernel had, which clears
-                ;    PAE and restores SMEP, SMAP and PSE in one write.
+                ; 3. CR4 back to exactly what the kernel had: PAE still set,
+                ;    SMEP, SMAP and PSE restored, in one write.
                 mov     eax, [PHYS(lm_saved_cr4)]
                 mov     cr4, eax
 

@@ -337,7 +337,7 @@ bool vmm_translate(vaddr_t va, paddr_t *out)
     return true;
 }
 
-u32 vmm_pte(vaddr_t va)
+pte_t vmm_pte(vaddr_t va)
 {
     struct shim_page *p = find_page(va);
 

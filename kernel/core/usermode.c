@@ -339,7 +339,7 @@ bool usermode_exec(const char *name, struct regs *r)
     /* A kernel thread has no user half to replace, and a process without its
      * own address space would be replacing the kernel's. Neither is a thing
      * exec can do. */
-    if (!self->page_dir || self->page_dir == vmm_kernel_pd_phys()) {
+    if (!self->page_dir || self->page_dir == vmm_kernel_root_phys()) {
         pr_err("pid %u called exec() without an address space of its own",
                self->pid);
         kfree(from_disk);

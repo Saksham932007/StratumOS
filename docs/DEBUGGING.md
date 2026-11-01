@@ -22,7 +22,7 @@ p/x read_cr3()
 x/16xw 0x100000               # the kernel's first 16 words
 x/8i $eip                     # disassemble around the current instruction
 p *(struct task *)task_current()
-p/x *(u32 *)0xFFFFF000        # the page directory, via the recursive window
+p/x *(u32 *)0xFFFFF000        # the page directory, via the page-table window
 ```
 
 ### Debugging the bootloader

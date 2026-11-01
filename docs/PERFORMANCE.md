@@ -88,7 +88,7 @@ QEMU 8.2.2 TCG, calibrated TSC 2099 MHz, 128 MiB. Median of 24 samples.
 
 **`vmm-xlate` at 60 cycles** is the cheapest thing measured, and it should be:
 a bounds check, then two loads — the page directory entry and the page table
-entry — both reached through the recursive mapping window. No TLB involvement,
+entry — both reached through the self-mapping window. No TLB involvement,
 because this is a software walk.
 
 **`pmm` at 376 cycles** for an allocate-and-free pair. The allocator scans the

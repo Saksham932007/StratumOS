@@ -194,6 +194,47 @@ static inline void write_cr4(u32 v)
     __asm__ volatile("movl %0, %%cr4" : : "r"(v) : "memory");
 }
 
+/* Control-register bits this kernel sets by name, so that the places that set
+ * them read as what they mean rather than as a hex constant. */
+#define CR0_WP  0x00010000u
+#define CR0_PG  0x80000000u
+#define CR4_PAE 0x00000020u
+
+/* Model-specific registers, low half only.
+ *
+ * Every MSR this kernel touches - EFER, and nothing else so far - has what it
+ * needs in the low 32 bits, and a read-modify-write of the whole 64 would
+ * have to preserve a high half it does not understand. rdmsr returns both
+ * halves whatever we ask for, so the write pairs with the read and the high
+ * half is carried through untouched.
+ *
+ * Both faults with #GP on a processor without MSRs, so the caller checks
+ * CPUID first. */
+static inline u64 rdmsr(u32 msr)
+{
+#ifdef STRATUM_FUZZING
+    (void)msr;
+    return 0;
+#else
+    u32 lo, hi;
+
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((u64)hi << 32) | lo;
+#endif
+}
+
+static inline void wrmsr(u32 msr, u64 value)
+{
+#ifdef STRATUM_FUZZING
+    (void)msr;
+    (void)value;
+#else
+    __asm__ volatile("wrmsr"
+                     :
+                     : "c"(msr), "a"((u32)value), "d"((u32)(value >> 32)));
+#endif
+}
+
 static inline void invlpg(vaddr_t va)
 {
 #ifdef STRATUM_FUZZING

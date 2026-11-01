@@ -164,8 +164,8 @@ for. Documented in [LONGMODE.md](LONGMODE.md).
 2. The interrupt stubs rewritten for the new calling convention: arguments in
    registers, a red zone, 16-byte stack alignment.
 3. `SYSCALL`/`SYSRET` with `STAR`, `LSTAR` and `SFMASK`, replacing `int 0x80`.
-4. A four-level VMM. The recursive page-directory mapping this kernel uses to
-   reach its own tables is specific to two levels and does not generalise, so
+4. A four-level VMM. The self-mapping window this kernel uses to reach its
+   own tables is specific to the number of levels, so
    that is a design decision to make again rather than port.
 5. An audit of every `u32` that is really an address - `vaddr_t`, `paddr_t`,
    and everything that has ever been assigned one.
@@ -314,6 +314,64 @@ being broken.
 
 ---
 
+### PAE, the no-execute bit, and W^X that the hardware enforces
+
+The fifth of the five gaps, and the one that was a project rather than a
+patch. `W^X` used to mean "`.text` is read-only": the other half, that data
+cannot be executed, is bit 63 of a page table entry, and a 32-bit entry does
+not have a bit 63. There was nowhere to say it.
+
+So the kernel is now PAE. `CR3` holds a page-directory-pointer table of four
+64-bit entries, one per gigabyte; the walk is three levels; `_start` sets
+`CR4.PAE` before `CR0.PG` and refuses to boot on a processor without it,
+printing why to the VGA text buffer because there is no console yet.
+
+The window onto the page tables had to change shape. The two-level trick of
+pointing the last directory entry at the directory itself does not transpose,
+because `CR3` now names a PDPT and a PDPT entry cannot be walked as a page
+table. What works is one self-map per *directory*, at entry 511, which gives
+each gigabyte its own window at `(k << 30) + 0x3FE00000`. That entry is the
+only directory entry in the kernel that carries NX, because it covers only
+the 2 MiB window it creates - and a writable, executable hole with every page
+table in it visible through it would be a strange thing to leave behind in a
+kernel that adopted PAE for W^X.
+
+The flag is called `PTE_EXEC`, not `PTE_NX`, and that is the design: a caller
+who says nothing gets a non-executable page, so `grep PTE_EXEC` is the whole
+list of exceptions rather than the whole list of places someone remembered.
+Two entries: the kernel's `.text`, and a user segment with `PF_X`. The ELF
+loader's permission pass was rewritten per-page for the second one, taking
+the union of the flags of every segment overlapping each page, because `PF_X`
+had never been more than a comment before.
+
+`vmm_protect_kernel_text()` now makes three passes rather than two -
+executable and read-only for `.text`, no-execute and read-only for
+`.rodata`, no-execute and writable for everything else in the linear map -
+and `fault nx` is the negative half, calling into a page holding a single
+`0xC3`. It panics with a message no other fault produces: an instruction
+fetch on a page that is *present*.
+
+Two things came free. The kernel's gigabyte is exactly one PDPT entry, so
+every address space now shares the kernel's page directory **by pointer**
+instead of copying 256 entries at creation - which deleted the bug that made
+a kernel mapping created after a fork visible in only one address space, and
+with it the 1 MiB of page tables and the panic that used to defend against
+it. And frames may live above 4 GiB, which nothing here uses.
+
+The bit has to be earned: on a processor where `EFER.NXE` is clear, bit 63 is
+*reserved* and a reserved bit makes every walk through that entry fault
+forever. So `vmm_enable_nx()` checks CPUID, writes the MSR and reads it back,
+and each application processor does the same for itself in the trampoline -
+before `mov cr3`, because by then the tables already have the bit in them. A
+core that got that ordering wrong would look exactly like a core that never
+started.
+
+Where the feature is absent the kernel says so instead of pretending. The new
+`legacy-cpu` scenario boots the same image on a Pentium II - PAE, no NX - and
+asserts both that the warning appears and that all 24 suites still pass; the
+`harden` suite asserts the exclusive-or where the bit exists and asserts it is
+set *nowhere* where it does not.
+
 ## Next
 
 ### 1. Per-CPU run queues
@@ -325,31 +383,10 @@ when one queue empties, a reschedule IPI, and every scheduler invariant
 re-examined for two processors entering it at once.
 
 It needs the local APIC timer first - the single 8254 cannot drive four
-processors - which is item 7 below, and that makes this the one item in this
+processors - which is item 6 below, and that makes this the one item in this
 list whose dependencies are not already in place.
 
-### 2. NX, and therefore real W^X
-
-The one piece of hardening that is a project rather than a patch. A 32-bit
-page table entry has no execute-disable bit, so the kernel's text is
-read-only but its data is still executable as far as the hardware is
-concerned.
-
-Getting NX means PAE: 64-bit page table entries, a three-level walk through
-a page-directory-pointer table, and every function in `mm/vmm.c` rewritten
-around a different entry format. The recursive-window trick survives, the
-software bits move from 9-11 to 9-11 and 52-62, and `CR4.PAE` has to go on
-before `CR0.PG` - which means `_start` changes too.
-
-Worth doing because it is the difference between claiming W^X and having it.
-The 64-bit entry format is no longer unfamiliar ground either: the long-mode
-transition builds a four-level table out of the same entries, so the layout
-and the PAE-before-paging ordering are already written down and tested in
-`kernel/arch/x86/longmode.c`. Everything else in [SECURITY.md](SECURITY.md#what-is-missing) is
-smaller: UMIP is a CR4 bit, KASLR is relocations, and `-fstack-protector`
-wants the per-CPU area the SMP work brings.
-
-### 3. Interrupt-driven serial transmit
+### 2. Interrupt-driven serial transmit
 
 `console_write` currently holds interrupts off for the whole of a polled UART
 write. On QEMU that is free; on real hardware at 115200 it is ~87 µs per
@@ -359,28 +396,28 @@ Needs: a transmit ring buffer, the THR-empty interrupt enabled in IER, and a
 drain path in the existing `serial_irq`. The panic path has to keep polling,
 because it cannot rely on interrupts.
 
-### 4. Reclaim empty page tables
+### 3. Reclaim empty page tables
 
-Unmapping the last page in a 4 MiB region leaves its table allocated. Needs a
+Unmapping the last page in a 2 MiB region leaves its table allocated. Needs a
 per-table mapped-page count, decremented in `vmm_unmap`, freeing the frame and
-clearing the directory entry at zero — and a `tlb` flush of the recursive
-window entry for that slot.
+clearing the directory entry at zero — and an `invlpg` of that slot's address
+in the page-table window.
 
-### 5. Symbolising the profiler's call graph
+### 4. Symbolising the profiler's call graph
 
 Samples are attributed to the leaf function only, so a helper called from
 several places aggregates all of its callers together. Walking the
 frame-pointer chain at sample time would fix it, and the backtrace code
 already exists - see [PERFORMANCE.md](PERFORMANCE.md).
 
-### 6. A slab allocator over the heap
+### 5. A slab allocator over the heap
 
 The heap is one arena, so a long-lived small allocation can keep a large region
 from coalescing. Per-size caches for the common fixed-size objects (`struct
 task`, page-table wrappers) would fix the fragmentation and speed up the common
 path. `heap_check()` already exists to validate the result.
 
-### 7. The I/O APIC, and the local APIC timer
+### 6. The I/O APIC, and the local APIC timer
 
 The MADT's I/O APIC entries and its interrupt source overrides are already
 parsed - including that IRQ 0 arrives as GSI 2 on QEMU, which a kernel that
@@ -392,7 +429,7 @@ The local APIC timer belongs with it, and is the prerequisite for item 1: the
 single 8254 cannot drive four processors, so per-CPU preemption needs a timer
 per CPU.
 
-### 8. A `/proc`
+### 7. A `/proc`
 
 The introspection the shell does through direct calls - `ps`, `meminfo`,
 `irq`, `disk`, `mount`, `harden` - belongs behind readable files instead.
@@ -401,7 +438,7 @@ third backend whose files are generated on read - which is the one thing
 neither `devfs` nor the FAT driver does, and the reason this is still an item
 rather than done.
 
-### 9. A negative-lookup cache for `exec`
+### 8. A negative-lookup cache for `exec`
 
 The one item the VFS work left open deliberately. `exec()` of a path that does
 not exist does a disk lookup every time, so a ring-3 loop can make the kernel
@@ -469,7 +506,7 @@ Two findings made it worth doing:
 
 What is deliberately not ported, with a reason per file, is in
 [PORTING.md](PORTING.md): the scheduler's mechanism, `mm/vmm.c` (x86's
-recursive page-directory window does not generalise past two levels), ring 3,
+the self-mapping window is specific to the number of levels), ring 3,
 the other harts, and the e1000 - whose reliance on cache-coherent DMA was
 flagged in a comment written before this port existed.
 

@@ -267,47 +267,78 @@ bool elf_load_user(const void *image, size_t size, struct elf_load_info *out)
     }
 
     /* --- apply the real permissions -------------------------------------
-     * Done as a second pass so that a page shared between a read-only and a
-     * writable segment ends up writable rather than depending on which
-     * segment was processed last. */
+     *
+     * Done as a second pass, and per page rather than per segment, because a
+     * page can belong to two segments at once: the linker is free to pack a
+     * read-only segment and a writable one into the same page, and then
+     * whichever was processed last would otherwise decide the page's
+     * permissions. The permissions a page gets are the union of the flags of
+     * every segment that overlaps it, which is the only answer that cannot
+     * leave a byte less accessible than its own segment asked for.
+     *
+     * PF_X is now a real distinction rather than a comment: a page with no
+     * executable segment on it is mapped no-execute, so a program whose data
+     * is overwritten by its own input cannot have that data executed. That is
+     * the user-space half of what PAE was for.
+     */
+    u32 exec_pages = 0, wx_pages = 0;
+
     for (u32 i = 0; i < eh->phnum; i++) {
         const struct elf32_phdr *ph = phdr_at(image, i);
 
         if (ph->type != PT_LOAD || ph->memsz == 0)
             continue;
-        if (ph->flags & PF_W)
-            continue; /* leave writable segments writable */
 
         vaddr_t first = PAGE_TRUNC(ph->vaddr);
         vaddr_t last = PAGE_ALIGN(ph->vaddr + ph->memsz);
 
         for (vaddr_t page = first; page < last; page += PAGE_SIZE) {
-            bool shared_with_writable = false;
+            u32 want = PTE_PRESENT | PTE_USER;
 
             for (u32 j = 0; j < eh->phnum; j++) {
                 const struct elf32_phdr *other = phdr_at(image, j);
 
-                if (j == i || other->type != PT_LOAD || other->memsz == 0)
+                if (other->type != PT_LOAD || other->memsz == 0)
                     continue;
-                if (!(other->flags & PF_W))
+                if (page >= PAGE_ALIGN(other->vaddr + other->memsz) ||
+                    page + PAGE_SIZE <= PAGE_TRUNC(other->vaddr))
                     continue;
-                if (page < PAGE_ALIGN(other->vaddr + other->memsz) &&
-                    page + PAGE_SIZE > PAGE_TRUNC(other->vaddr))
-                    shared_with_writable = true;
+
+                if (other->flags & PF_W)
+                    want |= PTE_WRITE;
+                if (other->flags & PF_X)
+                    want |= PTE_EXEC;
             }
 
-            if (!shared_with_writable)
-                vmm_protect(page, PTE_PRESENT | PTE_USER);
+            if (want & PTE_EXEC)
+                exec_pages++;
+
+            /* Writable *and* executable, which can only happen when the
+             * program's own segments overlap within a page. Allowed, because
+             * refusing would reject a valid ELF, but never silent: it is the
+             * one way a loaded program ends up with a page this kernel would
+             * not otherwise create. */
+            if ((want & PTE_WRITE) && (want & PTE_EXEC)) {
+                wx_pages++;
+                pr_warn("%p is both writable and executable: two segments "
+                        "share it",
+                        (void *)page);
+            }
+
+            vmm_protect(page, want);
         }
     }
+
+    info.exec_pages = exec_pages;
+    info.wx_pages = wx_pages;
 
     if (out)
         *out = info;
 
-    pr_info("loaded a %u-segment program: entry %p, %u pages mapped "
-            "%p-%p",
+    pr_info("loaded a %u-segment program: entry %p, %u pages mapped %p-%p, "
+            "%u of them executable",
             info.segments, (void *)info.entry, info.pages,
-            (void *)info.image_low, (void *)info.image_high);
+            (void *)info.image_low, (void *)info.image_high, info.exec_pages);
     return true;
 }
 

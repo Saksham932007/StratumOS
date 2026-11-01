@@ -19,25 +19,35 @@
 ;
 ; The parameter block
 ; -------------------
-; The C code fills in four words before sending the startup message: the page
-; directory to load, the entry point to jump to, the stack to use, and a flag
-; the trampoline sets so the boot processor can tell "reached 32-bit mode"
-; apart from "reached C". Their offsets are exported as absolute symbols, so
-; there is one definition of the layout rather than one here and one in C.
+; The C code fills in five words before sending the startup message: the PDPT
+; to load, the entry point to jump to, the stack to use, a flag the trampoline
+; sets so the boot processor can tell "reached 32-bit mode" apart from
+; "reached C", and whether to enable the no-execute bit. Their offsets are
+; exported as absolute symbols, so there is one definition of the layout
+; rather than one here and one in C.
 ;
-; The bootstrap page directory
-; ----------------------------
-; Not the kernel's. The kernel's page directory has no identity mapping - it
+; The bootstrap address space
+; ---------------------------
+; Not the kernel's. The kernel's address space has no identity mapping - it
 ; was dropped in vmm_init(), which is what frees the bottom of the address
 ; space for user processes - so enabling paging with it would unmap the
 ; instruction after `mov cr0`. The boot processor solved this at startup by
-; having one temporarily; an application processor is handed a directory that
-; identity-maps the first 4 MiB *and* contains the kernel's half, and C
-; switches to the real one once it is running at a kernel address.
+; having one temporarily; an application processor is handed a PDPT that
+; identity-maps the first 4 MiB *and* shares the kernel's page directory, and
+; C switches to the real one once it is running at a kernel address.
 ;
 ; Doing it this way rather than briefly adding a low mapping to the kernel's
-; own directory means the kernel's address space is never in a state its own
-; test suite would reject.
+; own address space means the kernel's address space is never in a state its
+; own test suite would reject.
+;
+; The no-execute bit
+; ------------------
+; EFER.NXE is per-processor state, and the tables this processor is about to
+; load already have bit 63 set in some of their entries - the boot processor
+; put it there. On a processor where NXE is clear that bit is *reserved*, and
+; a reserved bit in any entry on the walk faults every access through it. So
+; NXE has to be set here, before CR3, and an application processor that got
+; this wrong would look exactly like one that never came out of reset.
 ; =============================================================================
 
 %include "selectors.inc"
@@ -46,9 +56,12 @@ AP_TRAMPOLINE_PHYS equ 0x8000
 
 %define PHYS(label) (AP_TRAMPOLINE_PHYS + ((label) - ap_trampoline_start))
 
-CR0_PE equ 0x00000001
-CR0_WP equ 0x00010000
-CR0_PG equ 0x80000000
+CR0_PE   equ 0x00000001
+CR0_WP   equ 0x00010000
+CR0_PG   equ 0x80000000
+CR4_PAE  equ 0x00000020
+MSR_EFER equ 0xC0000080
+EFER_NXE equ 0x00000800
 
 section .text
 
@@ -58,6 +71,7 @@ global ap_param_pagedir_off
 global ap_param_entry_off
 global ap_param_stack_off
 global ap_param_flag_off
+global ap_param_nx_off
 
 [bits 16]
 align 16
@@ -74,11 +88,14 @@ ap_param_stack:
                 dd      0
 ap_param_flag:
                 dd      0
+ap_param_nx:
+                dd      0
 
 ap_param_pagedir_off equ ap_param_pagedir - ap_trampoline_start
 ap_param_entry_off   equ ap_param_entry - ap_trampoline_start
 ap_param_stack_off   equ ap_param_stack - ap_trampoline_start
 ap_param_flag_off    equ ap_param_flag - ap_trampoline_start
+ap_param_nx_off      equ ap_param_nx - ap_trampoline_start
 
 ; ---- 16-bit real mode ------------------------------------------------------
 align 16
@@ -122,8 +139,27 @@ ap_entry32:
                 mov     gs, ax
                 mov     ss, ax
 
-                ; Paging, with the bootstrap directory. Its identity map is
-                ; what keeps the next instruction fetchable.
+                ; The no-execute bit, before anything loads a page table
+                ; that has it set. Conditional, because wrmsr to EFER on a
+                ; processor without it is a #GP: the boot processor already
+                ; established whether this machine has NX, and says so here
+                ; rather than making every core work it out again.
+                cmp     dword [PHYS(ap_param_nx)], 0
+                je      .no_nx
+                mov     ecx, MSR_EFER
+                rdmsr
+                or      eax, EFER_NXE
+                wrmsr
+.no_nx:
+
+                ; PAE before CR0.PG, and necessarily so: the processor
+                ; refuses to change CR4.PAE while paging is enabled.
+                mov     eax, cr4
+                or      eax, CR4_PAE
+                mov     cr4, eax
+
+                ; Paging, with the bootstrap PDPT. Its identity map is what
+                ; keeps the next instruction fetchable.
                 mov     eax, [PHYS(ap_param_pagedir)]
                 mov     cr3, eax
 

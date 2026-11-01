@@ -63,8 +63,13 @@ struct elf_load_info {
     vaddr_t entry;      /* where to begin execution              */
     vaddr_t image_low;  /* lowest mapped page                    */
     vaddr_t image_high; /* one past the highest mapped page      */
-    u32 segments;       /* PT_LOAD segments mapped               */
-    u32 pages;          /* pages allocated                       */
+    /* How many of those pages ended up executable, and how many ended up
+     * both executable and writable - which should be none, and is worth
+     * reporting rather than assuming. */
+    u32 exec_pages;
+    u32 wx_pages;
+    u32 segments; /* PT_LOAD segments mapped               */
+    u32 pages;    /* pages allocated                       */
 };
 
 /* Map every PT_LOAD segment of `image` into the current address space with

@@ -7,27 +7,30 @@ address spaces, copy-on-write `fork`, `exec` from a FAT16 filesystem on disk,
 a writable FAT16 filesystem behind a VFS, a TCP/IP stack with congestion
 control over a real Ethernet controller, DHCP, DNS and an HTTP client, BSD
 sockets usable from ring 3, and a hardened kernel/user boundary enforced by
-SMEP, SMAP and `CR0.WP`.
+PAE no-execute, SMEP, SMAP and `CR0.WP`.
 
 It also reaches 64-bit long mode and back, and the portable half of it runs
 on RISC-V 64.
 
 [![CI](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml/badge.svg)](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml)
-![language](https://img.shields.io/badge/C11%20%2B%20asm-38.7k%20lines-blue)
+![language](https://img.shields.io/badge/C11%20%2B%20asm-46.3k%20lines-blue)
 ![arch](https://img.shields.io/badge/arch-i686%20%2B%20riscv64-lightgrey)
-![tests](https://img.shields.io/badge/tests-1123%20assertions%2C%2013%20boot%20scenarios-brightgreen)
+![tests](https://img.shields.io/badge/tests-1183%20assertions%2C%2015%20boot%20scenarios-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 The same kernel binary boots two ways — through a bootloader written for this
-project, and through GRUB via Multiboot2 — and every push runs **1123
-assertions across 92 host unit tests, 24 in-kernel suites and 13 QEMU boot
+project, and through GRUB via Multiboot2 — and every push runs **1183
+assertions across 92 host unit tests, 24 in-kernel suites and 15 QEMU boot
 scenarios**, plus four libFuzzer targets over the real kernel sources and the
 same kernel built and booted for a second architecture.
 
-Two of those scenarios are required to **panic**, because a mitigation has
+Three of those scenarios are required to **panic**, because a mitigation has
 two halves and only one of them can be checked by a test that passes. One
 asserts on a **packet capture** rather than on anything the kernel says,
-because the driver's first real bug was invisible in the log.
+because the driver's first real bug was invisible in the log. Two boot the
+same image on deliberately *worse* processors — one without SMEP or SMAP, one
+without the no-execute bit — because a fallback path that nothing exercises
+is a fallback path that does not work.
 
 ```
 BIOS ─► stage 1 ─────► stage 2 ─────► protected mode ─► kernel ──────► /bin/INIT ─► ring 3
@@ -74,7 +77,7 @@ BIOS ─► stage 1 ─────► stage 2 ─────► protected mode
 
 ## The parts worth looking at
 
-Nine things in here were harder than they look, and each has a document that
+Ten things in here were harder than they look, and each has a document that
 explains the reasoning rather than the code — plus one piece of test design
 that the rest depends on.
 
@@ -99,6 +102,21 @@ the code that issued `int 0x80` was in the image it just unmapped. So it
 edits `EIP` and `ESP` in the frame the syscall is about to `IRET` through, and
 the ordinary interrupt-return path delivers control into the new program.
 → [docs/PROCESSES.md](docs/PROCESSES.md#exec)
+
+**PAE, for one bit.** Bit 63 of a page table entry is "no-execute", and a
+32-bit entry does not have a bit 63 — so on classic two-level paging a kernel
+that maps its stack writable has also mapped it executable, and `W^X` is a
+statement about intent rather than something the hardware will enforce.
+Getting the bit means three levels, 64-bit entries, a page-table window that
+had to change shape, and `CR4.PAE` set before `CR0.PG` in `_start`. The flag
+callers pass is `PTE_EXEC`, not `PTE_NX`, so a mapping nobody annotated is a
+non-executable one and `grep PTE_EXEC` is the whole list of exceptions. Two
+things fell out that were not the point: the kernel's gigabyte is one
+top-level entry, so every address space now shares the kernel's page
+directory *by pointer* and a whole category of bug went away with 1 MiB of
+pre-allocated page tables; and `fault nx` can now exist, which calls into a
+page holding a single `0xC3` and must die.
+→ [docs/SECURITY.md](docs/SECURITY.md#and-the-other-half-nx)
 
 **SMAP turned "anywhere" into a list of five.** Enabling it forced every place
 the kernel deliberately touches user memory to declare itself with
@@ -216,7 +234,8 @@ Concretely, from power-on:
     over a serial line, with line editing and command history.
 
 Along the way the kernel narrows its own permissions: its `.text` and
-`.rodata` become read-only, SMEP and SMAP are enabled where the CPU has them,
+`.rodata` become read-only and everything else no-execute, SMEP and SMAP are
+enabled where the CPU has them,
 and every task stack gets an unmapped guard page below it. `harden` reports
 what is actually switched on, read back from CR4 and the page tables.
 
@@ -256,7 +275,7 @@ cd StratumOS
 make              # kernel, disk image, GRUB ISO, and the test images
 make run          # boot through the custom bootloader
 make run-iso      # boot through GRUB / Multiboot2
-make test         # host unit tests + 13 QEMU boot scenarios
+make test         # host unit tests + 15 QEMU boot scenarios
 ```
 
 `make toolchain` reports exactly which tools were found, and for which
@@ -337,7 +356,7 @@ StratumOS stage2
 [    0.030] INFO  heap: kernel heap at 0xd0000000, 1024 KiB committed, 64 MiB maximum
 [    0.040] INFO  vmm: kernel .text and .rodata mapped read-only (43 pages); CR0.WP makes that binding on ring 0 too
 [    0.050] INFO  harden: SMEP enabled, SMAP enabled
-[    0.050] INFO  boot: hardening          [ok] W^X, guard pages, SMEP + SMAP
+[    0.050] INFO  boot: hardening          [ok] W^X (NX), guard pages, SMEP + SMAP
 [    0.040] INFO  pci: 6 PCI devices found
 [    0.040] INFO  acpi: MADT: 4 processor(s), 1 I/O APIC(s), 5 interrupt override(s), local APIC at 0xfee00000, 8259 PICs present
 [    0.050] INFO  apic: local APIC at 0xfee00000 -> 0xce003000, id 0, version 14, 6 LVT entries
@@ -492,6 +511,31 @@ Stacks
   guard pages     : one unmapped page below every stack
   canaries        : checked on every context switch (0 failures)
   this task's guard page at 0xe000a000 is unmapped, as it should be
+W^X
+  paging          : PAE, three levels, 64-bit entries
+  no-execute      : EFER.NXE set; data pages are mapped bit-63 no-execute
+  read-only       : .text and .rodata, enforced on ring 0 by CR0.WP
+  try it          : `fault nx` jumps into a data page, `fault text`
+                    writes to .text; both must fault
+Address spaces
+  kernel half     : one page directory, shared by pointer, so every
+                    address space sees identical kernel mappings
+
+Not yet implemented: KASLR. See docs/SECURITY.md.
+
+stratum> pagemap 0xc0109000
+virtual   : 0xc0109000
+pdpt index: 3    dir index: 0    table index: 265
+physical  : 0x00109000
+pte       : 0000000000109001
+flags     : present read-only executable supervisor
+
+stratum> pagemap 0xd0000000
+virtual   : 0xd0000000
+pdpt index: 3    dir index: 128    table index: 0
+physical  : 0x002d3000
+pte       : 80000000002d3203
+flags     : present write no-execute supervisor kernel-owned
 
 stratum> irq
   IRQ  HANDLER               COUNT
@@ -559,18 +603,20 @@ Everything marked ✅ is implemented and covered by a test.
 | ✅ | Full register dump, page-fault error decoding, EBP backtrace |
 | ✅ | 8259 PIC remapping, per-line masking, spurious-interrupt detection |
 | ✅ | Bitmap physical frame allocator, built from the firmware map |
-| ✅ | Paging: 4 KiB pages, recursive page directory, `CR0.WP`, unmapped null page |
+| ✅ | **Paging: PAE, three levels, 64-bit entries**, self-mapping window, `CR0.WP`, unmapped null page |
 | ✅ | `map` / `unmap` / `protect` / `translate`, with frame-ownership tracking |
 | ✅ | Kernel heap: first-fit, coalescing, guard magics, grows on demand |
 | ✅ | Preemptive round-robin scheduler, per-task stacks, sleep/yield/exit |
-| ✅ | **A page directory per process**, kernel half shared, `CR3` switched on context switch |
+| ✅ | **An address space per process**, the kernel's page directory shared *by pointer*, `CR3` switched on context switch |
 | ✅ | **`fork` with copy-on-write** — software PTE bit, per-frame reference counts, no copy for the last sharer |
 | ✅ | **`exec`** by rewriting the syscall's own trap frame, so the return lands in the new image |
 | ✅ | **`wait` and real zombies** — resources released by either the reaper or the parent, exit status held until collected |
 | ✅ | Ring 3 via a forged IRET frame; `int 0x80` with pointer validation |
 | ✅ | Two real user programs: separate ELFs, linked for user space, own pages |
 | ✅ | Defensive ELF32 loader — no segment may reach into kernel space |
-| ✅ | **W^X for the kernel's own image** — `.text`/`.rodata` read-only, enforced by `CR0.WP` |
+| ✅ | **W^X, both halves** — `.text`/`.rodata` read-only via `CR0.WP`, every other page no-execute via PAE bit 63, asserted as an exclusive-or over the whole linear map |
+| ✅ | **`EFER.NXE` enabled per processor**, read back rather than assumed, and set on each AP *before* it loads a table that already has NX bits in it |
+| ✅ | **`PF_X` honoured for user programs** — a page with no executable segment on it is mapped no-execute |
 | ✅ | **SMEP and SMAP**, detected and read back from CR4, with `stac`/`clac` around every deliberate kernel access to user memory |
 | ✅ | **Guard pages** below every kernel stack, plus a canary checked on every switch |
 | ✅ | Every address space sees identical kernel mappings, by construction |
@@ -630,8 +676,8 @@ Everything marked ✅ is implemented and covered by a test.
 
 | | |
 | --- | --- |
-| ✅ | **24 in-kernel suites, 1123 assertions**, run against real hardware state |
-| ✅ | **13 QEMU boot scenarios** — both boot paths, four processors, SMEP/SMAP, x86-64, an e1000, no e1000, a real HTTP server on the host, and two that must panic |
+| ✅ | **24 in-kernel suites, 1183 assertions**, run against real hardware state |
+| ✅ | **15 QEMU boot scenarios** — both boot paths, four processors, SMEP/SMAP, a CPU with no NX bit, x86-64, an e1000, no e1000, a real HTTP server on the host, and three that must panic |
 | ✅ | **Four libFuzzer targets over the real kernel sources** under AddressSanitizer, plus a ring-3 syscall fuzzer |
 | ✅ | 20 pre-boot validation checks on every link, before an image is ever booted |
 | ✅ | A disk-image validator: the MBR, the FAT geometry, every file in `/BIN` |
@@ -682,7 +728,7 @@ the harness's own 2306-cycle overhead subtracted:
 
 | Benchmark | Cycles | Time | |
 |---|---:|---:|---|
-| virtual → physical translation | 55 | 26.3 ns | two loads through the recursive window |
+| virtual → physical translation | 55 | 26.3 ns | two loads through the page-table window |
 | heap integrity walk | 58 | 27.8 ns | every block's header and footer magic |
 | context switch | 654 | 311.3 ns | `CR3` swap, stack swap, canary check, bookkeeping |
 | physical frame alloc + free | 733 | 349.2 ns | bitmap scan, 32 frames per word |
@@ -852,7 +898,7 @@ means one guard.
 
 What is *not* ported, file by file with reasons, is in
 [docs/PORTING.md](docs/PORTING.md): the scheduler's mechanism, `vmm.c` (x86's
-recursive page-directory trick does not generalise past two levels), ring 3,
+the self-mapping window is specific to the number of levels), ring 3,
 SMP and the e1000, whose reliance on cache-coherent DMA was predicted in a
 comment written before this port existed.
 
@@ -1048,14 +1094,14 @@ What 64-bit mode proved
   [64-bit ptr]: 0x5452415455004f53 from phys 0x00400000 (only the 4-level walk maps it)
 
   round trip  : 551716 cycles, trampoline 608 bytes
-  kernel      : still 32-bit, still running - CR4.PAE clear, paging on
+  kernel      : still 32-bit, still running - CR4.PAE set (as always), paging on
 ```
 
 **This is a tested transition, not a 64-bit kernel**, and saying so clearly
 matters more than the feature does. A port needs a 64-bit IDT (16-byte gate
 descriptors), every assembly stub rewritten for a new calling convention,
-`SYSCALL`/`SYSRET` instead of `int 0x80`, a four-level VMM — the recursive
-page-directory trick this kernel uses does not generalise past two levels —
+`SYSCALL`/`SYSRET` instead of `int 0x80`, a four-level VMM — the self-mapping
+window this kernel uses is specific to the number of levels —
 and an audit of every `u32` that is really an address. That is one commit
 that either boots or does not, which is why it is kept separate from the
 phase that made it testable.
@@ -1109,8 +1155,8 @@ QEMU.
 | **Host unit tests** | the kernel's real `printf`/`string`/`div64` sources, compiled for the host, diffed against glibc | 92 checks |
 | **Pre-boot validation** | Multiboot2 header and checksum, ELF type, entry point inside a load segment, load address, `.bss` alignment, the higher-half split, every embedded ring-3 program, absence of SSE | 20 failure conditions, every link |
 | **Image validation** | the boot signature, stage 1 not overlapping its own partition table, the stage 2 header pointing at a real ELF, every partition inside the image, the FAT geometry, and every file in `/BIN` being an i386 ELF with `INIT` among them | every image, every build |
-| **In-kernel suites** | allocator, paging, address spaces, copy-on-write, heap coalescing, interrupts, scheduler, processes, hardening, ATA and partitions, FAT16 reads and writes, path resolution and descriptors, ACPI/APIC/locks/IPIs, the 32→64→32 transition, checksums and the wire, TCP's connection table, DNS name compression, sockets and loopback, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 1123 checks in 24 suites |
-| **Boot scenarios** | custom bootloader unattended, **the same image on four processors**, the same image on a CPU with SMEP and SMAP, **the same image on a CPU with x86-64**, **the frames it puts on the wire, parsed from a pcap**, the same image with no Ethernet at all, GRUB/Multiboot2 unattended, 50 shell commands typed over serial, benchmarks + profile | 10 scenarios |
+| **In-kernel suites** | allocator, paging, address spaces, copy-on-write, heap coalescing, interrupts, scheduler, processes, hardening, ATA and partitions, FAT16 reads and writes, path resolution and descriptors, ACPI/APIC/locks/IPIs, the 32→64→32 transition, checksums and the wire, TCP's connection table, DNS name compression, sockets and loopback, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 1183 checks in 24 suites |
+| **Boot scenarios** | custom bootloader unattended, **the same image on four processors**, the same image on a CPU with SMEP and SMAP, **the same image on a CPU with no NX bit**, **the same image on a CPU with x86-64**, **the frames it puts on the wire, parsed from a pcap**, the same image with no Ethernet at all, DHCP and HTTP against a real server, GRUB/Multiboot2 unattended, 68 shell commands typed over serial, benchmarks + profile | 12 scenarios |
 | **Deliberate faults** | a write to the kernel's own `.text`, and a write below a task's stack — each must panic, naming the address, the reason and the region, and exit with the panic code | 2 scenarios |
 | **Fuzzing** | four libFuzzer targets over the **real** `elf.c`/`fat16.c`/`heap.c`/`acpi.c` under AddressSanitizer, plus 40,000 malformed system calls issued from ring 3 | 6 bugs found |
 
@@ -1246,11 +1292,11 @@ kernel/
     boot.S                 park the other harts, then mret into S-mode
     trap_entry.S           31 registers saved by hand; there is no pushad
     trap.c                 two vectors, and decoding instruction length
-    paging.c               Sv39: three levels, and no recursive window
+    paging.c               Sv39: three levels, and no self-mapping window
     timer.c uart.c main.c  the CLINT, a 16550, and 58 assertions
   mm/
     pmm.c                  bitmap physical frame allocator
-    vmm.c                  paging, recursive page directory, fault reporting
+    vmm.c                  PAE paging, the self-map window, NX, fault reporting
     heap.c                 guarded first-fit kmalloc
   fs/
     blockdev.c             MBR partitions, and the bounds check for each
@@ -1313,19 +1359,24 @@ docs/                      17 documents: one per subsystem, plus the decisions
 The full set is in [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md). Four
 that shaped the most code:
 
-**A recursive page directory instead of identity-mapping all of RAM.**
+**A self-mapping page directory instead of identity-mapping all of RAM.**
 Once `CR0.PG` is set, a page table can only be edited through a virtual
 address — but page tables come from the physical allocator, which can return a
 frame anywhere. Mapping all of physical memory to solve that does not scale.
-Instead the last page directory entry points at the directory itself, so the
-hardware walk resolves `0xFFFFF000` to the directory and
-`0xFFC00000 + i*4096` to the table for entry *i*. Every page table in the
-system becomes addressable, at the cost of one 4 MiB slot.
+Instead entry 511 of every page directory points at that directory, so the
+hardware walk resolves `0xFFFFF000` to the kernel's directory and
+`0xFFE00000 + i*4096` to the table for its entry *i*. Every page table in the
+system becomes addressable, at the cost of the top 2 MiB of each gigabyte.
+The two-level version of this trick pointed `CR3`'s own last entry at itself;
+PAE does not allow that — `CR3` names a page-directory-pointer table and a
+PDPT entry cannot be walked as a page table — so the window moved down a
+level and became one per gigabyte.
 
 **The kernel is linked high and loaded low.**
 `_start` cannot run at `0xC0100000` — nothing is mapped there yet — so it
 lives in a section whose virtual address equals its load address, builds a
-page directory with a temporary identity map, enables paging, and jumps.
+PDPT and four page directories with a temporary identity map, sets
+`CR4.PAE`, enables paging, and jumps.
 `vmm_init` then drops that identity map, which is what frees the bottom of
 every address space for user processes and makes a NULL dereference fault for
 free. `check-kernel.py` verifies the arrangement at build time rather than
@@ -1397,11 +1448,10 @@ under [Fuzzing](#fuzzing) above.
 
 Being clear about scope is more useful than a longer feature list.
 
-- **The filesystem is read-only.** A correct write allocates from the FAT,
-  updates both copies, extends a directory entry's chain, and survives being
-  interrupted between any two of those — a journalling problem rather than a
-  filesystem-format one.
-- **No long filenames.** FAT's 8.3 names only.
+- **No long filenames.** FAT's 8.3 names only. Writes, creation, deletion,
+  truncation and directory extension all work, and are ordered so that an
+  interrupted write loses the data rather than the filesystem — but a name
+  is eleven bytes and that is that.
 - **No DMA and no disk interrupts.** The ATA driver is PIO and polled, which
   burns a timeslice per read on real hardware. The trade-off, and what it
   buys, is in [docs/STORAGE.md](docs/STORAGE.md#ata-by-programmed-io).
@@ -1411,41 +1461,44 @@ Being clear about scope is more useful than a longer feature list.
   the next large piece; see [docs/SMP.md](docs/SMP.md#what-is-missing).
 - **The I/O APIC is parsed but not programmed.** Device interrupts still go
   through the 8259s to the boot processor, so there is no interrupt
-  distribution and no affinity.
-- **No `argv`, environment or file descriptors.** `exec` takes a program
-  name and nothing else; `write` goes to the console unconditionally, so
-  `fork` has no descriptor table to duplicate. This is also why the network
-  stack has no sockets API: there is no `open`, so there is nothing a socket
-  could be. It is the first item on the roadmap, as a process-model change
-  rather than a network one.
+  distribution and no affinity. It is also what the per-CPU run queues need
+  first: one 8254 cannot drive four processors.
+- **No `argv` and no environment.** `exec` takes a program name and nothing
+  else. Descriptors exist — `open`, `read`, `write`, `close`, `dup`, a VFS
+  with three backends and sockets on top of the same table — but a program
+  still cannot be told anything at startup except its own name.
 - **No signals, process groups or `kill`.** A process leaves through `exit`
   or a fault.
 - **No demand paging.** A program's image is mapped eagerly; copy-on-write
   is the only laziness in the memory manager, and every other page fault is
   a bug and is reported as one.
-- **No NX, so W^X is only half.** A 32-bit page table entry has no
-  execute-disable bit, so the kernel's text is read-only but its data is
-  still executable as far as the hardware is concerned. Getting NX means PAE:
-  64-bit entries and a three-level walk. That and KASLR are the two largest
-  pieces of hardening still outstanding — see
-  [docs/SECURITY.md](docs/SECURITY.md#what-is-missing).
+- **No KASLR.** On a higher-half kernel it means relocating at load time, and
+  it is the largest piece of hardening still outstanding now that NX is in —
+  see [docs/SECURITY.md](docs/SECURITY.md#what-is-missing).
 - **Serial transmit is polled**, which holds interrupts off for the duration of
   a write. The fix is a transmit ring buffer, in
   [docs/ROADMAP.md](docs/ROADMAP.md).
 - **Empty page tables are never reclaimed.** Unmapping the last page in a
-  4 MiB region leaves its table allocated.
-- **TCP has no congestion control.** No slow start, no congestion window, no
-  fast retransmit. It sends what the peer's window allows, which on a
-  congested path is antisocial — the single biggest reason this is not a
-  general-purpose TCP. Nor is there out-of-order reassembly, IP fragment
-  reassembly, DHCP or window scaling; each has its reasoning in
-  [docs/NETWORK.md](docs/NETWORK.md).
+  2 MiB region leaves its table allocated.
+- **No 2 MiB pages**, although a PAE directory entry can map one. The linear
+  map would need eight fewer page tables and far fewer TLB entries.
+- **TCP has no out-of-order reassembly**, no IP fragment reassembly, no
+  window scaling, no SACK and no Nagle. It does have slow start, congestion
+  avoidance, fast retransmit, fast recovery and an RTT-estimated retransmit
+  timer, which is what makes it safe to point at a real network; each of the
+  omissions has its reasoning in [docs/NETWORK.md](docs/NETWORK.md).
+- **No TLS, and therefore no web browser.** There is a working HTTP/1.1
+  client, DHCP and a DNS resolver, and `fetch http://example.com/` returns a
+  real page from the real internet. HTTPS needs a TLS implementation and
+  certificate verification; rendering a page after that needs HTML and CSS
+  layout, a JavaScript engine, font rasterisation and a compositor. Each of
+  those is a larger project than this kernel.
 - **Long mode is a transition, not a 64-bit kernel.** The processor is driven
   into it and back, under test — but the kernel's own code stays 32-bit. A
   port needs a 64-bit IDT, new calling conventions in every stub,
   `SYSCALL`/`SYSRET` and a four-level VMM; the five steps are enumerated in
   [docs/LONGMODE.md](docs/LONGMODE.md).
-- **The RISC-V port is 55% of the shared code, not the whole kernel.** The
+- **The RISC-V port is 63% of the shared code, not the whole kernel.** The
   scheduler's mechanism, `mm/vmm.c`, ring 3, the other harts and the e1000
   are not ported, each for a stated reason in
   [docs/PORTING.md](docs/PORTING.md). The measurement is the deliverable, and
@@ -1462,7 +1515,7 @@ Being clear about scope is more useful than a longer feature list.
 | [docs/MEMORY.md](docs/MEMORY.md) | address-space layout, the higher-half transition, the three allocators |
 | [docs/USERSPACE.md](docs/USERSPACE.md) | the user programs, the ELF loader, and the privilege boundary |
 | [docs/PROCESSES.md](docs/PROCESSES.md) | address spaces, `fork`, copy-on-write, `exec`, `wait` |
-| [docs/SECURITY.md](docs/SECURITY.md) | W^X, SMEP/SMAP, guard pages, and what is deliberately missing |
+| [docs/SECURITY.md](docs/SECURITY.md) | W^X and the NX bit, SMEP/SMAP, guard pages, and what is deliberately missing |
 | [docs/STORAGE.md](docs/STORAGE.md) | the ATA driver, the partition table, FAT16, and where a program comes from |
 | [docs/SMP.md](docs/SMP.md) | ACPI, the APIC, the AP trampoline, real locks, TLB shootdown |
 | [docs/LONGMODE.md](docs/LONGMODE.md) | 32-bit to 64-bit long mode and back, the four-level table, and the boundary of the claim |

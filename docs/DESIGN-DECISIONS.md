@@ -33,11 +33,11 @@ that a third protocol could slot into unchanged.
 
 ---
 
-## 2. A recursive page directory
+## 2. A self-mapping page directory
 
-**Decision.** Page directory entry 1023 points at the directory itself, so
-`0xFFFFF000` resolves to the directory and `0xFFC00000 + i*4096` to the page
-table for entry *i*.
+**Decision.** Entry 511 of every page directory points at that directory, so
+within gigabyte *k*, `(k << 30) + 0x3FFFF000` resolves to the directory and
+`(k << 30) + 0x3FE00000 + i*4096` to the page table for its entry *i*.
 
 **The problem it solves.** After `CR0.PG`, page tables can only be written
 through virtual addresses, but they are allocated from the physical frame
@@ -53,10 +53,19 @@ table into it, edit, unmap. Correct, but every page-table edit becomes
 map/`invlpg`/edit/unmap, and it is not reentrant — which matters because
 `vmm_map` is called from the heap, which is called from interrupt handlers.
 
-**Cost.** One 4 MiB slot at the top of the address space is unusable, and
-`vmm_map()` has to refuse to map over it. Two accessor functions have to know
-whether paging is on yet. The mechanism is genuinely confusing the first time
-you meet it — hence the long comment at the top of `mm/vmm.c`.
+**Cost.** The top 2 MiB of each of the four gigabytes is unusable, and
+`vmm_map()` has to refuse to map over them — so a user process loses three
+2 MiB holes it would otherwise have had. The mechanism is genuinely confusing
+the first time you meet it — hence the long comment at the top of `mm/vmm.c`.
+
+**What PAE changed.** The original form of this was one entry: point `CR3`'s
+own last directory entry at the directory, and the hardware uses it as both
+levels. That does not survive the move to three levels, because `CR3` now
+names a page-directory-pointer table and a PDPT entry has no `WRITE` or
+`USER` bit — the hardware will not walk one as a page table. Moving the
+self-map down a level, into each page directory, keeps the whole mechanism at
+the cost of four windows instead of one. The decision stood; the
+implementation of it did not.
 
 ---
 

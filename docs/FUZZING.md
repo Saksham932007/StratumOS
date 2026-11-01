@@ -200,7 +200,7 @@ the interesting addresses are a vanishing fraction of 2^32:
 | `0xC0000000` | exactly the kernel boundary |
 | `0xBFFFFFFF` | one byte below it, so a length straddles |
 | `0xC0100000` | the kernel's own text |
-| `0xFFFFF000` | the recursive page-table window |
+| `0xFFFFF000` | the kernel gigabyte's page-table window |
 | `0xFFFFFFFF` | so that base + length wraps |
 | `0xD0000000` | the kernel heap |
 | `0x00400000` | our own image — legitimate |

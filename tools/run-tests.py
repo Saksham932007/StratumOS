@@ -70,13 +70,22 @@ COMMON_EXPECTED = [
     ("PCI", r"boot: PCI\s+\[ok\]"),
     ("scheduler", r"boot: scheduler\s+\[ok\]"),
     ("syscalls", r"boot: syscalls\s+\[ok\]"),
-    ("paging really enabled", r"vmm: paging: kernel at 0xc0000000"),
-    # Hardening. The kernel half being fully backed is what stops a kernel
-    # mapping made after a fork from existing in only one address space.
-    ("kernel half fully backed",
-     r"kernel half fully backed: 255 page tables"),
+    ("paging really enabled", r"vmm: paging: PAE, kernel at 0xc0000000"),
+    # The kernel's gigabyte being one PDPT entry is what stops a kernel
+    # mapping made after a fork from existing in only one address space:
+    # every address space holds the same page directory, by pointer.
+    ("kernel directory shared, not copied",
+     r"the kernel's gigabyte is one PDPT entry"),
     ("kernel text is read-only",
      r"kernel \.text and \.rodata mapped read-only \(\d+ pages\)"),
+    # W^X, and the thing PAE was adopted for. Either answer is acceptable
+    # here, because the legacy-cpu scenario runs a processor that has no
+    # no-execute bit - what is not acceptable is silence. Each scenario then
+    # pins the answer it expects: the strong form everywhere, and the warning
+    # on legacy-cpu.
+    ("W^X enforced, or explicitly declined",
+     r"W\^X: \d+ pages of the kernel's linear map marked no-execute"
+     r"|no NX bit on this processor"),
     ("hardening reported at boot", r"hardening\s+\[ok\]"),
     # Processors. One or four, the step has to report cleanly - and the
     # local-APIC line has to be there either way, because enabling it is what
@@ -161,6 +170,10 @@ class Scenario:
     image: Path
     qemu_args: list[str]
     extra_expected: list[tuple[str, str]] = field(default_factory=list)
+    # Patterns that must NOT appear, on top of the global FORBIDDEN list.
+    # One scenario needs this: legacy-cpu has to assert that the kernel does
+    # not claim a no-execute bit the processor does not have.
+    forbidden: list[tuple[str, str]] = field(default_factory=list)
     timeout: int = 90
     # Which emulator binary to boot under. Everything defaults to
     # qemu-system-i386, because that is the machine this kernel targets. The
@@ -169,6 +182,13 @@ class Scenario:
     # undetectable there - which is itself worth knowing, and is why the
     # longmode suite has two sets of assertions.
     qemu: str = QEMU
+    # Which processor to emulate. "max" everywhere by default, because the
+    # kernel's W^X depends on the no-execute bit and QEMU's default i386
+    # model does not have one - so without this the headline feature would be
+    # switched off in every scenario and nothing would say so. The
+    # legacy-cpu scenario sets an older model on purpose, to run the path
+    # where the bit is absent.
+    cpu: str | None = "max"
 
 
 @dataclass
@@ -194,6 +214,7 @@ def run_scenario(sc: Scenario, keep_logs: Path | None) -> Outcome:
             "-display", "none",
             "-serial", f"file:{log_path}",
             "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+            *(["-cpu", sc.cpu] if sc.cpu else []),
             *sc.qemu_args,
         ]
 
@@ -230,7 +251,7 @@ def run_scenario(sc: Scenario, keep_logs: Path | None) -> Outcome:
         if not re.search(pattern, log):
             failures.append(f"missing: {label}  (no match for /{pattern}/)")
 
-    for label, pattern in FORBIDDEN:
+    for label, pattern in FORBIDDEN + sc.forbidden:
         match = re.search(pattern, log)
         if match:
             line = next((l for l in log.splitlines() if match.group(0) in l),
@@ -370,8 +391,19 @@ SHELL_SCRIPT: list[tuple[str, list[str]]] = [
     # The kernel lives in the higher half now, so its own text is at
     # 0xC0100000 and low addresses are user space - unmapped at boot.
     ("pagemap 0xc0101000", [r"physical  : 0x0010", r"flags     :.*present"]),
-    ("pagemap 0xd0000000", [r"physical  : 0x", r"present"]),
     ("pagemap 0x1000", [r"mapping   : not present"]),
+    # W^X, read out of the live page tables rather than asserted. .text is
+    # read-only and executable; the heap is writable and not. Those two lines
+    # next to each other are the whole claim, and the second one is the half
+    # that did not exist before PAE.
+    #
+    # The addresses are inside .text and inside the heap window rather than
+    # at their starts: 0xc0100000 is .boot, which holds the tables _start
+    # built and is deliberately left writable.
+    ("pagemap 0xc0109000",
+     [r"flags     : present read-only executable supervisor"]),
+    ("pagemap 0xd0000000",
+     [r"physical  : 0x", r"flags     : present write no-execute supervisor"]),
     ("hexdump 0xc0100000 16", [r"c0100000 ", r"\|"]),
     ("echo interactive shell works", [r"interactive shell works"]),
     ("help", [r"selftest", r"meminfo", r"pagemap"]),
@@ -392,7 +424,9 @@ SHELL_SCRIPT: list[tuple[str, list[str]]] = [
                 r"canaries\s+: checked on every context switch \(0 "
                 r"failures\)",
                 r"guard page at 0xe[0-9a-f]+ is unmapped, as it should be",
-                r"all 255 directory slots pre-backed"]),
+                r"no-execute\s+: EFER\.NXE set; data pages are mapped "
+                r"bit-63 no-execute",
+                r"one page directory, shared by pointer"]),
     ("programs", [r"exec's namespace", r"init\s+\(started at boot\)",
                   r"\bhello\b", r"/bin/INIT\s+\d+ bytes",
                   r"image\(s\) loaded from disk"]),
@@ -576,7 +610,8 @@ def run_syscall_fuzz(build_dir: Path, keep_logs: Path | None) -> Outcome:
     failures: list[str] = []
 
     cmd = [
-        QEMU, "-m", "128M", "-no-reboot", "-display", "none",
+        QEMU, "-m", "128M", "-cpu", "max", "-no-reboot", "-display",
+        "none",
         "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
         "-serial", "stdio",
         "-drive", f"format=raw,file={image},index=0,media=disk",
@@ -612,7 +647,7 @@ def run_syscall_fuzz(build_dir: Path, keep_logs: Path | None) -> Outcome:
         if not re.search(pattern, log):
             failures.append(f"missing: {label}  (no match for /{pattern}/)")
 
-    for label, pattern in FORBIDDEN:
+    for label, pattern in FORBIDDEN + sc.forbidden:
         match = re.search(pattern, log)
         if match:
             failures.append(f"forbidden: {label} -> {match.group(0)}")
@@ -843,7 +878,8 @@ def run_network(build_dir: Path, keep_logs: Path | None) -> Outcome:
         pcap_path = Path(tmp) / "network.pcap"
 
         cmd = [
-            QEMU, "-m", "128M", "-no-reboot", "-display", "none",
+            QEMU, "-m", "128M", "-cpu", "max", "-no-reboot", "-display",
+        "none",
             "-serial", f"file:{log_path}",
             "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
             # An explicit controller rather than QEMU's default, so the
@@ -880,7 +916,7 @@ def run_network(build_dir: Path, keep_logs: Path | None) -> Outcome:
         if not re.search(pattern, log):
             failures.append(f"missing: {label}  (no match for /{pattern}/)")
 
-    for label, pattern in FORBIDDEN:
+    for label, pattern in FORBIDDEN + sc.forbidden:
         match = re.search(pattern, log)
         if match:
             failures.append(f"forbidden: {label} -> {match.group(0)}")
@@ -1064,7 +1100,8 @@ def run_internet(build_dir: Path, keep_logs: Path | None) -> Outcome:
     ]
 
     cmd = [
-        QEMU, "-m", "128M", "-no-reboot", "-display", "none",
+        QEMU, "-m", "128M", "-cpu", "max", "-no-reboot", "-display",
+        "none",
         "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
         "-serial", "stdio",
         "-netdev", "user,id=inet0",
@@ -1107,7 +1144,7 @@ def run_internet(build_dir: Path, keep_logs: Path | None) -> Outcome:
         keep_logs.mkdir(parents=True, exist_ok=True)
         (keep_logs / "internet.log").write_text(log, errors="replace")
 
-    for label, pattern in FORBIDDEN:
+    for label, pattern in FORBIDDEN + sc.forbidden:
         match = re.search(pattern, log)
         if match:
             failures.append(f"forbidden: {label} -> {match.group(0)}")
@@ -1132,7 +1169,8 @@ def run_interactive(build_dir: Path, keep_logs: Path | None) -> Outcome:
     failures: list[str] = []
 
     cmd = [
-        QEMU, "-m", "128M", "-no-reboot", "-display", "none",
+        QEMU, "-m", "128M", "-cpu", "max", "-no-reboot", "-display",
+        "none",
         "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
         "-serial", "stdio",
         "-drive", f"format=raw,file={image},index=0,media=disk",
@@ -1232,9 +1270,11 @@ def run_benchmarks(build_dir: Path, keep_logs: Path | None) -> Outcome:
     with tempfile.TemporaryDirectory() as tmp:
         log_path = Path(tmp) / "serial.log"
         cmd = [
-            QEMU, "-m", "128M", "-no-reboot", "-display", "none",
+            QEMU, "-m", "128M", "-cpu", "max", "-no-reboot", "-display",
+        "none",
             "-serial", f"file:{log_path}",
             "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+            *(["-cpu", sc.cpu] if sc.cpu else []),
             *sc.qemu_args,
         ]
 
@@ -1298,6 +1338,33 @@ FAULT_CASES: list[tuple[str, str, list[str]]] = [
             # The symbol table has to survive a fault in the kernel's own
             # text, which is where it is least convenient to need it.
             r"at\s+cmd_fault\+0x",
+        ],
+    ),
+    (
+        # The one that could not be written before PAE. `fault nx` allocates
+        # a writable data page, puts a single 0xC3 - `ret` - in it, and calls
+        # it. Before the no-execute bit existed, the processor would have
+        # executed that byte and the command would have returned normally;
+        # W^X was a claim about intent. What has to happen now is a page
+        # fault whose error code says instruction fetch on a page that is
+        # *present*, which no other fault in this kernel produces.
+        "fault-nx",
+        "fault nx",
+        [
+            r"calling into a no-execute data page",
+            r"faulting address: 0xc9200000",
+            r"access\s+: instruction fetch from ring 0",
+            r"reason\s+: the page is mapped no-execute, so it cannot be "
+            r"executed",
+            r"KERNEL PANIC",
+            # EIP *is* the data page. That is the strongest single piece of
+            # evidence available: the processor did transfer control there,
+            # and then refused to fetch the instruction.
+            r"EIP c9200000",
+            r"at\s+0xc9200000",
+            # And the backtrace still works, walking out of a frame whose
+            # code address has no symbol at all.
+            r"shell_run_line\+0x",
         ],
     ),
     (
@@ -1482,6 +1549,41 @@ def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
             ],
         ),
         Scenario(
+            name="legacy-cpu",
+            description="the same kernel on a processor with no NX bit",
+            image=build_dir / "stratum-test.img",
+            # A Pentium II has PAE - it is where PAE came from - but no
+            # no-execute bit, which arrived with AMD64. So this is the
+            # machine where the kernel's three-level paging works and its
+            # W^X does not, and the fallback has to be a boot that says so
+            # rather than a boot that faults: setting bit 63 of an entry on
+            # this processor would make it a reserved bit and every walk
+            # through that entry would fault forever.
+            #
+            # Same arrangement as hardened-cpu, for the same reason. A
+            # feature test that silently skips is a feature test that stops
+            # being read.
+            cpu="pentium2",
+            qemu_args=[
+                "-drive",
+                f"format=raw,file={build_dir / 'stratum-test.img'},"
+                f"index=0,media=disk",
+            ],
+            extra_expected=[
+                ("the absent bit was reported, not assumed",
+                 r"no NX bit on this processor: the kernel's data pages are "
+                 r"writable \*and\* executable"),
+                # And the kernel still works. The whole suite runs here, so
+                # what this really asserts is that nothing in the paging
+                # rewrite depends on NX being available.
+                ("every suite still passes", r"ktest: ALL TESTS PASSED"),
+            ],
+            forbidden=[
+                ("NX claimed on a CPU without it",
+                 r"W\^X: \d+ pages of the kernel's linear map"),
+            ],
+        ),
+        Scenario(
             name="hardened-cpu",
             description="the same kernel on a CPU that has SMEP and SMAP",
             image=build_dir / "stratum-test.img",
@@ -1494,7 +1596,6 @@ def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
                 # memory is actually exercised. A missing window shows up
                 # here as a page fault, which is how the first version of
                 # the vmspace suite was caught.
-                "-cpu", "max",
                 "-drive",
                 f"format=raw,file={build_dir / 'stratum-test.img'},"
                 f"index=0,media=disk",
@@ -1503,7 +1604,7 @@ def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
                 ("SMEP and SMAP both enabled",
                  r"harden: SMEP enabled, SMAP enabled"),
                 ("the boot step says so",
-                 r"hardening\s+\[ok\] W\^X, guard pages, SMEP \+ SMAP"),
+                 r"hardening\s+\[ok\] W\^X \(NX\), guard pages, SMEP \+ SMAP"),
             ],
         ),
         Scenario(
@@ -1518,7 +1619,6 @@ def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
                 # paths are all exercised - none of which a uniprocessor boot
                 # touches at all.
                 "-smp", "4",
-                "-cpu", "max",
                 "-drive",
                 f"format=raw,file={build_dir / 'stratum-test.img'},"
                 f"index=0,media=disk",

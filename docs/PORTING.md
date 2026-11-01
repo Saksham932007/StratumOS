@@ -271,11 +271,14 @@ Three levels of 512 entries, 4 KiB pages, a 39-bit address split 9 + 9 + 9 +
 2 MiB *megapage*, one at the leaf a 4 KiB page.
 
 **None of `kernel/mm/vmm.c` ports**, and the reason is not the entry format
-or the level count. It is that x86's two-level paging lets the kernel point
-the last page-directory entry at the directory itself, which makes every page
-table appear at a computable virtual address — the recursive mapping the
-whole of `vmm.c` is built around. With three levels there is no single window
-that reaches all of them.
+or the level count — x86 is three levels too, now that it is PAE. It is the
+*shape* of the self-mapping window `vmm.c` is built around.
+
+On x86 PAE there are four top-level entries, so giving each of the four page
+directories a self-map costs four windows of 2 MiB and covers the whole
+address space. Sv39's root table has 512 entries. The same trick would need
+512 windows, one per gigabyte, which is the entire address space — so there
+is no single window, and no affordable set of them either.
 
 So this port does the other thing: it identity-maps physical memory and walks
 the tables through those addresses. Simpler, costs an identity map the kernel

@@ -18,9 +18,10 @@ pmm_alloc_frame          ← 4 KiB physical frames, from the firmware map
 ## Address space
 
 The kernel occupies the top gigabyte of every address space; the bottom three
-belong to user processes - and, since the kernel moved to the higher half,
-each process has a page directory of its own with the kernel's half copied
-in. See [PROCESSES.md](PROCESSES.md) for what that buys.
+belong to user processes. Under PAE a gigabyte is exactly one entry of the
+top-level table, so "the kernel's half" is not copied into each process - it
+is the *same page directory*, pointed at from every address space. See
+[PROCESSES.md](PROCESSES.md) for what that buys.
 
 ```
 -- user space ----------------------------------------------------------
@@ -42,9 +43,17 @@ in. See [PROCESSES.md](PROCESSES.md) for what that buys.
 0xE0000000 - 0xE0400000   kernel task stacks, each behind a guard page
 0xE8000000 - 0xE8100000   per-processor stacks, each behind a guard page
 ...
-0xFFC00000 - 0xFFFFEFFF   recursive window: every page table
-0xFFFFF000 - 0xFFFFFFFF   recursive window: the page directory itself
+0xFFE00000 - 0xFFFFEFFF   self-map window: every page table in this gigabyte
+0xFFFFF000 - 0xFFFFFFFF   self-map window: the page directory itself
 ```
+
+Each of the three user gigabytes has a window of its own in the same place
+relative to its base - `0x3FE00000`, `0x7FE00000`, `0xBFE00000` - because
+there is one page directory per gigabyte and each self-maps. Those three are
+mapped supervisor-only, so a user process cannot read its own page tables; it
+simply cannot use those addresses either. That is the rent PAE charges for
+the window, and it is 2 MiB per gigabyte rather than the 4 MiB at the very
+top that two-level paging charged.
 
 The kernel is **loaded** at 1 MiB physical but **linked** at `0xC0100000`.
 `linker/kernel.ld` expresses that with `AT()`: a section's VMA is where its
@@ -65,28 +74,57 @@ immediately after paging is on.
 
 ```asm
 ; .boot has VMA == LMA, so these symbols are already physical addresses.
-mov     edi, boot_page_table
+; Seven pages: a PDPT, four page directories, two page tables.
+SELF_MAP boot_pd0                   ; entry 511 -> the directory itself, x4
 ...
-mov     [edi], eax                         ; PDE 0    identity, temporary
-mov     [edi + KERNEL_PDE_INDEX * 4], eax  ; PDE 768  the kernel's window
-mov     [edi + RECURSIVE_SLOT * 4], eax    ; PDE 1023 the directory itself
+mov     [boot_pd0], eax             ; gigabyte 0, 0-2 MiB: identity, temporary
+mov     [boot_page_directory], eax  ; gigabyte 3, 0xC0000000: the kernel
+...
+mov     [edi + KERNEL_PDPT_SLOT * ENTRY_SIZE], eax   ; the PDPT
+
+mov     eax, cr4                    ; PAE first, and necessarily so: the bit
+or      eax, CR4_PAE                ; cannot be written while CR0.PG is set
+mov     cr4, eax
+
+mov     eax, boot_pdpt
 mov     cr3, eax
 mov     eax, cr0
 or      eax, CR0_PG | CR0_WP
 mov     cr0, eax
 lea     eax, [higher_half]
-jmp     eax                                ; absolute: a relative jump would
-                                           ; stay down here
+jmp     eax                         ; absolute: a relative jump would stay
+                                    ; down here
 ```
 
-One page table serves both windows, deliberately: the identity map covers
+Two page tables serve both windows, deliberately: the identity map covers
 `0x00000000-0x003FFFFF` and the kernel window maps `0xC0000000-0xC03FFFFF` to
 the same physical range, so the same 1024 entries do both jobs.
 
-`vmm_init()` then widens the linear map to 16 MiB and **drops PDE 0**. That
-removal is what frees the bottom of the address space for user processes, and
-it is why `e_entry` in the kernel ELF is a low address - both loaders jump to
-it with paging off.
+All four directories exist from the start, even the two empty ones, so that
+"every PDPT entry is present" holds in the kernel's own address space as well
+as in the ones the VMM creates — and so that the PDPT is written exactly
+once, here. The processor caches its four entries internally and does not
+re-read them until `CR3` is reloaded, which is a trap worth not having at
+all.
+
+Nothing here sets bit 63, although every table is in the format that has one.
+Until `EFER.NXE` is written, bit 63 is *reserved*, and a reserved bit in a
+live entry faults every walk through it; `vmm_init()` goes back and sets it
+on the self-map entries once the MSR is in.
+
+Before any of it, a CPUID check. The kernel is PAE-only, so a processor
+without PAE gets a sentence written straight to the VGA text buffer — there
+is no console, no paging and no C yet — and a halt. Adding that check is also
+what broke the loader handover once: `CPUID` writes `EBX`, which is the
+Multiboot information pointer, and the kernel panicked with "no usable boot
+information" on both loaders at once. `EBX` is now parked in `EBP` across the
+one instruction.
+
+`vmm_init()` then widens the linear map to 16 MiB and **drops gigabyte 0's
+two directory entries**. That removal is what frees the bottom of the address
+space for user processes, and it is why `e_entry` in the kernel ELF is a low
+address - both loaders jump to it with paging off. Gigabyte 0's directory
+stays, with its self-map: it is now an ordinary empty user directory.
 
 `check-kernel.py` verifies the whole arrangement at build time:
 
@@ -207,55 +245,151 @@ That panic has already paid for itself — it caught a frame being reused after
 
 ## Virtual memory manager (`mm/vmm.c`)
 
-Standard two-level x86 paging: a 1024-entry page directory, each entry
-covering 4 MiB through a 1024-entry page table.
+PAE paging, three levels. `CR3` holds a **page-directory-pointer table** of
+four 64-bit entries, one per gigabyte. Each names a **page directory** of 512
+entries, each of those a **page table** of 512 entries, each of those a 4 KiB
+page. The virtual address splits 2/9/9/12.
 
-### The recursive mapping
+### The entry format, and why PAE
+
+It would have been simpler to stay on two-level paging. A 32-bit entry
+addressed everything a 32-bit kernel can reach, and the self-mapping window
+below was shorter. The reason not to is one bit:
+
+| Bits | 32-bit entry | PAE entry |
+| --- | --- | --- |
+| 0-11 | flags | the same flags, bit for bit |
+| 12-31 | frame address | frame address |
+| 32-51 | — | more frame address (frames above 4 GiB) |
+| 52-62 | — | available to software |
+| 63 | — | **no-execute** |
+
+There is nowhere in a 32-bit entry to say "this page is data". So on
+two-level paging a kernel that maps its stack writable has also mapped it
+executable, and `W^X` is a statement about what the kernel meant rather than
+something the hardware will enforce. Bit 63 is the only way to get the other
+half, and the only way to get bit 63 on 32-bit x86 is PAE. That is the whole
+reason for the extra level.
+
+Two things fell out of it that were not the point:
+
+- **The kernel's gigabyte is one PDPT entry.** So the whole kernel half hangs
+  off a single page directory, and every address space can share it *by
+  pointer* instead of copying 256 directory entries when it is created. A
+  kernel mapping made after a process forked is visible in that process
+  immediately. Before, it was not: a kernel page table created later existed
+  only in whichever address space happened to be current, the mapping worked
+  for one process and faulted for every other, and the bug waited for the
+  wrong process to be scheduled. Growing the heap past a 4 MiB boundary was
+  the live example. The defence was to pre-allocate all 255 kernel page
+  tables at boot — 1 MiB of tables — and panic if one was ever created later.
+  PAE deleted the problem, and that code with it.
+- **Frames may live above 4 GiB.** Nothing here uses it, because `paddr_t` is
+  32 bits, but the format no longer forbids it.
+
+The bit has to be *earned* before it can be used. On a processor where
+`EFER.NXE` is clear, bit 63 is **reserved**, and a reserved bit set anywhere
+on the walk makes every access through that entry fault — forever. So
+`vmm_enable_nx()` checks `CPUID.80000001H:EDX.NX`, sets the MSR, and reads it
+back rather than trusting the write; nothing sets bit 63 unless that
+succeeded. Every application processor does the same thing for itself, in the
+trampoline, *before* loading a page table that already has the bit set: a
+core that got this wrong would look exactly like a core that never came out
+of reset.
+
+### W^X, expressed as a positive permission
+
+`vmm_map()` takes a flag called `PTE_EXEC`, not one called `PTE_NX`:
+
+```c
+static pte_t leaf_flags(u32 flags)
+{
+    pte_t e = (pte_t)(flags & 0xFFF) | PTE_PRESENT;
+
+    if (nx_ok && !(flags & PTE_EXEC))
+        e |= PTE_NX;
+
+    return e;
+}
+```
+
+The polarity is the design. A caller who says nothing gets a non-executable
+page, so the kernel is `W^X` by default and `grep PTE_EXEC` is the complete
+list of exceptions — currently the kernel's own `.text` and the pages of a
+user program's `PF_X` segments. The opposite convention, an opt-in `PTE_NX`,
+makes every mapping anyone forgets to annotate into an executable one.
+
+`vmm_protect()` replaces permissions rather than merging them, so a page made
+writable again loses `PTE_EXEC` unless it is asked for again; and the
+copy-on-write handler carries bit 63 across from the old entry, so breaking a
+shared page cannot quietly turn data into code.
+
+A directory entry never carries NX. The bit is OR-ed down the walk, so
+setting it one level up would make all 512 pages beneath it non-executable;
+executability is decided per page, at the leaf. The one exception is each
+directory's self-map entry, which is discussed next.
+
+### The self-mapping window
 
 This is the most interesting mechanism in the kernel.
 
 Once `CR0.PG` is set, a page table can only be written through a virtual
 address. But page tables come from the physical allocator, which can return a
-frame anywhere in RAM — possibly far outside the identity-mapped window.
+frame anywhere in RAM — possibly far outside the linear map.
 Identity-mapping all of physical memory to work around that does not scale,
 and on a 4 GiB machine is impossible in a 32-bit address space.
 
-The solution is to point the last page directory entry at the directory
-itself:
+The two-level trick was to point the last page directory entry at the
+directory itself, making `CR3` serve as both levels. That does not transpose:
+`CR3` now names a PDPT, and a PDPT entry cannot be walked as a page table —
+it has no `USER` or `WRITE` bit and the hardware treats it as a different
+kind of thing.
+
+What does work is one self-map per **directory**: entry 511 of each page
+directory points at that directory.
 
 ```c
-pd_entries()[1023] = pd_phys | PTE_PRESENT | PTE_WRITE;
+entries[PD_SELF_SLOT] = (pte_t)dir_phys | PTE_PRESENT | PTE_WRITE |
+                        (nx_ok ? PTE_NX : 0);
 ```
 
-The hardware walk then does something useful by accident. For an address in
-the top 4 MiB, the CPU reads entry 1023 of the directory to find the "page
-table", which *is* the directory, and then indexes it as a table. So:
+For an address whose directory index is 511, the walk uses the directory as
+both of the last two levels. So within gigabyte *k*:
 
 ```
-0xFFFFF000             → the page directory
-0xFFC00000 + i * 4096  → the page table for directory entry i
+(k << 30) + 0x3FFFF000            → the page directory
+(k << 30) + 0x3FE00000 + i * 4096 → the page table for its entry i
 ```
 
 Every page table in the system becomes addressable at a computable virtual
-address. The cost is one 4 MiB slot at the very top of the address space, and
-`vmm_map()` refuses to map over it:
+address. The cost is the top 2 MiB of each gigabyte, and `vmm_map()` refuses
+to map over it:
 
 ```c
-if (pdi == RECURSIVE_SLOT)
-    panic("vmm_map(%p): refusing to map over the recursive page-table "
-          "window", (void *)va);
+if (pdi == PD_SELF_SLOT)
+    panic("vmm_map(%p): refusing to map over gigabyte %u's page-table "
+          "window - every page table in it would become unreachable",
+          (void *)va, pdpti);
 ```
 
-Before paging is enabled, physical equals virtual and the tables are addressed
-directly; afterwards, everything goes through the window. One pair of
-accessors hides the difference:
+Note the `PTE_NX` on the self-map entry, and that it is the one directory
+entry that carries it. The entry covers only the 2 MiB window it creates, so
+the bit makes that window non-executable without affecting anything mapped
+under the directory's other 511 slots. The window is writable and reaches
+every page table in the gigabyte; a writable, executable 2 MiB hole would be
+a strange thing to leave in a kernel that adopted PAE for `W^X`. `_start`
+cannot set it, because `EFER.NXE` has not been written yet and a reserved bit
+in a live entry faults every walk through it, so `vmm_init()` goes back and
+sets it once the MSR is in.
 
-```c
-static u32 *pd_entries(void)
-{
-    return paging_on ? (u32 *)PD_VADDR : (u32 *)pd_phys;
-}
-```
+One page table genuinely cannot be created on demand: the two temporary
+frame-mapping slots at `0xCF000000`. `temp_map()` writes a page table entry
+*directly*, precisely so that it depends on nothing that might itself need a
+temporary mapping — and a missing table there would be a page fault inside
+the mechanism the fault handler would need in order to resolve it. So
+`vmm_init()` claims that one slot explicitly, before the first temporary
+mapping is made. It is all that is left of the function that used to
+pre-allocate 255 of them.
 
 ### Frame ownership
 
@@ -366,7 +500,7 @@ ordinary memory and want caching.
 
 ### Temporary mapping slots
 
-The recursive window reaches the *current* address space's tables only, and
+The self-mapping window reaches the *current* address space's tables only, and
 `fork` has to build the child's while the parent's is loaded. So two kernel
 pages at `VMM_TEMP_BASE` (`0xCF000000`) exist to make an arbitrary frame
 writable for a moment:
@@ -529,7 +663,7 @@ elsewhere has every string literal pointing where ring 3 cannot read. See
 ## Current limitations
 
 - **Empty page tables are never reclaimed.** Unmapping the last page in a
-  4 MiB region leaves its table allocated — one frame per touched region.
+  2 MiB region leaves its table allocated — one frame per touched region.
 - **No demand paging.** Every fault is a bug, or a copy-on-write fault.
 - **No swap, no page replacement, no memory pressure handling.** `kmalloc`
   returns `NULL` when the heap cannot grow, and callers are expected to check.
@@ -539,13 +673,27 @@ elsewhere has every string literal pointing where ring 3 cannot read. See
   compiler cannot see. It reordered them, and the result was a page fault on a
   mapping the kernel had just made. See
   [SMP.md](SMP.md#the-compiler-unmapped-a-page-the-kernel-was-still-using).
-- **The kernel half costs 1 MiB of page tables** at boot, because all 255
-  directory slots are backed up front. Reserving only the regions in use
-  would cost 84 KiB and leave a list to keep in step with the layout.
+- **An address space costs four frames**, not one: a PDPT and a page
+  directory for each of the three user gigabytes. The directories are
+  allocated eagerly even when a gigabyte is empty, which buys the invariant
+  that every PDPT entry in every address space is present — the page-table
+  window is used without checking, and the PDPT is written exactly once, when
+  the address space is created. That last part matters: the processor caches
+  the four PDPT entries internally and does not re-read them until `CR3` is
+  reloaded, so never changing one removes the trap entirely.
+- **The top 2 MiB of each user gigabyte is unusable** by a user process:
+  `0x3FE00000`, `0x7FE00000` and `0xBFE00000` are that gigabyte's page-table
+  window, mapped supervisor-only. Nothing this kernel runs comes close to
+  them, and the alternative — a single window, reached some other way — is
+  not available at three levels.
+- **No 2 MiB pages.** A PAE directory entry can map one directly
+  (`PTE_PSE`), which would cut the linear map's page tables from eight to
+  zero and its TLB footprint with them. The constant is defined and nothing
+  uses it.
 - **The heap is a single arena**, so a long-lived small allocation can keep a
   large region from coalescing. Slab caches are the usual answer.
 - **64 MiB heap ceiling** (`KHEAP_MAX_SIZE`), chosen to keep the window well
-  clear of the recursive mapping.
+  clear of the self-mapping window.
 - **A program's segments are mapped eagerly**, so copy-on-write is the only
   laziness in the memory manager.
 - **Address spaces are freed only in whole.** `vmm_destroy_address_space()`

@@ -270,8 +270,10 @@ line never does.
 
 - **No demand paging.** A program's whole image is mapped eagerly.
   Copy-on-write is the only laziness in the memory manager.
-- **No NX.** Without PAE, x86 cannot mark a page non-executable, so
-  "read-only" is enforced but "non-executable" is not.
+- **A program's writable pages are no-execute**, and its `PF_X` segments are
+  not writable — but a page shared between two segments gets the union of
+  their flags and is logged if that makes it both. Nothing this kernel builds
+  does that, because the linker page-aligns the segments.
 - **No `argv` or environment.** `exec` takes a program name and nothing else.
 - **No signals**, so there is no way to interrupt a process that is blocked
   in a system call. That is why every blocking call here has a bounded

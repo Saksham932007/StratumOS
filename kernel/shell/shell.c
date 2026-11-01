@@ -260,7 +260,7 @@ static void ps_row(const struct task *t, void *ctx)
 
     if (!t->page_dir)
         strlcpy(space, "-", sizeof(space));
-    else if (t->page_dir == vmm_kernel_pd_phys())
+    else if (t->page_dir == vmm_kernel_root_phys())
         strlcpy(space, "kernel", sizeof(space));
     else
         ksnprintf(space, sizeof(space), "%08x", (unsigned)t->page_dir);
@@ -338,11 +338,11 @@ static int cmd_pagemap(int argc, char **argv)
         return 1;
     }
 
-    u32 pte = vmm_pte(addr);
+    pte_t pte = vmm_pte(addr);
 
     kprintf("virtual   : %p\n", (void *)addr);
-    kprintf("dir index : %u    table index: %u\n", PDE_INDEX(addr),
-            PTE_INDEX(addr));
+    kprintf("pdpt index: %u    dir index: %u    table index: %u\n",
+            PDPT_INDEX(addr), PDE_INDEX(addr), PTE_INDEX(addr));
 
     if (!(pte & PTE_PRESENT)) {
         kprintf("mapping   : not present\n");
@@ -353,12 +353,15 @@ static int cmd_pagemap(int argc, char **argv)
     vmm_translate(addr, &phys);
 
     kprintf("physical  : %p\n", (void *)phys);
-    kprintf("pte       : %08x\n", pte);
-    kprintf("flags     :%s%s%s%s%s%s\n", (pte & PTE_PRESENT) ? " present" : "",
+    kprintf("pte       : %08x%08x\n", (u32)(pte >> 32), (u32)pte);
+    kprintf("flags     :%s%s%s%s%s%s%s%s\n",
+            (pte & PTE_PRESENT) ? " present" : "",
             (pte & PTE_WRITE) ? " write" : " read-only",
+            (pte & PTE_NX) ? " no-execute" : " executable",
             (pte & PTE_USER) ? " user" : " supervisor",
             (pte & PTE_ACCESSED) ? " accessed" : "",
             (pte & PTE_DIRTY) ? " dirty" : "",
+            (pte & PTE_COW) ? " copy-on-write" : "",
             (pte & PTE_OWNED) ? " kernel-owned" : "");
     return 0;
 }
@@ -2041,6 +2044,7 @@ static volatile u32 fault_unmapped_addr = 0xC9000000u;
 static volatile u32 fault_readonly_addr;
 static volatile u32 fault_text_addr;
 static volatile u32 fault_guard_addr;
+static volatile u32 fault_nx_addr;
 
 /* Both operands live in volatile storage. With a literal numerator GCC proves
  * the division is undefined and emits `ud2` instead of `idiv`, so the #DE this
@@ -2102,15 +2106,26 @@ static int cmd_harden(int argc, char **argv)
             vmm_translate(guard, NULL) ? "MAPPED - the guard is gone!"
                                        : "unmapped, as it should be");
 
+    kprintf("W^X\n");
+    kprintf("  paging          : PAE, three levels, 64-bit entries\n");
+    kprintf("  no-execute      : %s\n",
+            vmm_nx_enabled()
+                ? "EFER.NXE set; data pages are mapped bit-63 no-execute"
+                : "NOT AVAILABLE on this processor - data pages are "
+                  "executable");
+    kprintf("  read-only       : .text and .rodata, enforced on ring 0 by "
+            "CR0.WP\n");
+    kprintf("  try it          : `fault nx` jumps into a data page, "
+            "`fault text`\n");
+    kprintf("                    writes to .text; both must fault\n");
+
     kprintf("Address spaces\n");
-    kprintf("  kernel half     : all %u directory slots pre-backed, so "
-            "every\n",
-            1023u - KERNEL_PDE_FIRST);
+    kprintf("  kernel half     : one page directory, shared by pointer, so "
+            "every\n");
     kprintf("                    address space sees identical kernel "
             "mappings\n");
 
-    kprintf("\nNot yet implemented: NX (needs PAE), KASLR. See "
-            "docs/SECURITY.md.\n");
+    kprintf("\nNot yet implemented: KASLR. See docs/SECURITY.md.\n");
     return 0;
 }
 
@@ -2154,6 +2169,35 @@ static int cmd_fault(int argc, char **argv)
         fault_text_addr = (u32)__text_start;
         volatile u32 *p = (volatile u32 *)fault_text_addr;
         *p = 0x90909090;
+    } else if (strcmp(what, "nx") == 0) {
+        /* The negative half of the NX check, and the one that could not be
+         * written before PAE: call into a page that holds data.
+         *
+         * The page is allocated writable and *not* PTE_EXEC, which is the
+         * default, so it is mapped no-execute - and 0xC3 is `ret`, a byte the
+         * processor would happily have executed before bit 63 existed. What
+         * must happen instead is a page fault whose error code has the
+         * instruction-fetch bit set on a page that is present, which is a
+         * message no other fault in this kernel produces. */
+        kprintf("calling into a no-execute data page...\n");
+
+        if (!vmm_nx_enabled()) {
+            kprintf("this processor has no NX bit, so there is nothing to "
+                    "demonstrate: the page would simply execute\n");
+            return 1;
+        }
+
+        if (!vmm_alloc_at(0xC9200000u, PTE_PRESENT | PTE_WRITE)) {
+            kprintf("could not map a test page\n");
+            return 1;
+        }
+
+        fault_nx_addr = 0xC9200000u;
+        *(volatile u8 *)fault_nx_addr = 0xC3; /* ret */
+
+        void (*data_as_code)(void) = (void (*)(void))fault_nx_addr;
+
+        data_as_code();
     } else if (strcmp(what, "stackguard") == 0) {
         /* The negative half of the guard-page check. Writing below this
          * task's own stack must land on the unmapped guard page. Done by
@@ -2167,7 +2211,8 @@ static int cmd_fault(int argc, char **argv)
         panic("deliberate panic requested from the shell");
     } else {
         kprintf("usage: fault "
-                "<null|unmapped|readonly|text|stackguard|div0|ud|panic>\n");
+                "<null|unmapped|readonly|text|nx|stackguard|div0|ud|"
+                "panic>\n");
         kprintf("each of these deliberately crashes the kernel so the\n");
         kprintf("exception handlers and backtrace can be inspected.\n");
         return 1;

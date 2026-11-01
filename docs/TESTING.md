@@ -171,7 +171,7 @@ than it sounds.
 | `boot` | the memory map was normalised, the linker symbols are sane and ordered |
 | `cpu` | CPUID works, `CR0.PE`/`CR0.PG` are set, `CS` says ring 0 |
 | `pmm` | allocation is page-aligned and never from the reserved first MiB; frees restore the count exactly; contiguous runs really are contiguous |
-| `vmm` | the null page is unmapped and page 1 is not; mappings work when written through; offsets survive translation; `PTE_OWNED` governs whether unmap frees; `vmm_protect` keeps the frame |
+| `vmm` | the null page is unmapped and page 1 is not; mappings work when written through; offsets survive translation; `PTE_OWNED` governs whether unmap frees; `vmm_protect` keeps the frame; a mapping nobody asked to be executable comes back no-execute, `PTE_EXEC` clears the bit, asking again for writable puts it back, and no directory entry ever carries it |
 | `heap` | payloads are 8-byte aligned; neighbours are not disturbed; coalescing returns merged space; realloc preserves contents; `kmalloc(0)`, `kfree(NULL)` and `krealloc(p, 0)` behave; 32 interleaved allocations freed in a different order leave the arena consistent |
 | `irq` | the timer is advancing, no spurious interrupts accumulated, `int3` survives a full round trip through the stub and `iret`, `irq_save`/`irq_restore` nests |
 | `sched` | a created task actually runs, switch counts rise, and a 60 ms sleep takes at least 50 ms |
@@ -179,10 +179,10 @@ than it sounds.
 | `elf` | a deliberately corrupted image is refused for each of eight reasons, each with a stated cause |
 | `vmspace` | a fresh address space has the kernel's half and an empty user half; a clone marks the page read-only and COW in *both* copies; the reference count rises to 2; the first write allocates exactly one new frame and the second does not fault; destroying the clone drops the shared frame to zero references; and the frame count returns to where it started |
 | `proc` | a kernel thread shares the kernel's page directory; `task_fork(NULL)` is refused rather than reading address zero; `wait()` returns a real pid and status for each child and -1 once there are none; `exec`'s program table contains `init` and terminates |
-| `harden` | `CR0.WP` is set; no page of `.text` or `.rodata` is writable or user-accessible and `.data` still is; every kernel directory entry is present and none has the `USER` bit; this task's stack is in the guarded region with its guard page unmapped above and below; CR4 agrees with CPUID about SMEP and SMAP; a declared user access opens a window and an undeclared one is what SMAP exists to refuse |
+| `harden` | `CR0.WP` is set; no page of `.text` or `.rodata` is writable or user-accessible and `.data` still is; no entry in the kernel's page directory has the `USER` bit and its self-map is present, writable and no-execute; across the whole linear map at most one of writable and executable is true, and the executable count equals the size of `.text`; this task's kernel stack is no-execute; this task's stack is in the guarded region with its guard page unmapped above and below; CR4 agrees with CPUID about SMEP and SMAP; a declared user access opens a window and an undeclared one is what SMAP exists to refuse |
 | `storage` | IDENTIFY reports a model and a capacity; a two-sector read equals two one-sector reads *and* the two sectors differ, which is the per-sector DRQ handshake; five malformed reads are each refused *and* logged; zero sectors is a no-op that logs nothing; a read of a partition's block 0 equals a read of the disk at the partition's first LBA; a read past the partition's end is refused even though those sectors exist |
 | `smp` | the MADT's local APIC address is page aligned and every processor it describes has a distinct APIC id; a table that is not there comes back NULL; the task priority register is zero; **LINT0 is ExtINT and unmasked, and the timer is advancing**; `smp_cpu_index()` agrees with the APIC id; every application processor's stack has an unmapped guard page below it and reached its idle loop; a lock taken with interrupts enabled gives them back; every other processor answers a ping and acknowledges a shootdown |
-| `bootpd` | the AP bootstrap directory identity-maps the first 4 MiB, its recursive entry points at itself rather than the kernel's, its kernel half matches entry for entry, its user half is empty, and destroying it returns exactly the two frames it allocated — which is also the regression test for a compiler-reordering bug, see docs/SMP.md |
+| `bootpd` | the AP bootstrap address space has all four PDPT entries present with no reserved bits set, its kernel slot *is* the kernel's own page directory rather than a copy of it, each user directory self-maps to itself rather than to the kernel's, gigabyte 0 identity-maps the first 4 MiB and nothing else, those pages are executable, and destroying it returns exactly the six frames it allocated — which is also the regression test for a compiler-reordering bug, see docs/SMP.md |
 | `fs` | the BPB's four offsets are ordered and inside the device; the cluster count is in FAT16's range; lookup is case-insensitive and tolerates redundant slashes; a missing name, a relative path, an over-long component, a file used as a directory and a directory read as a file are all refused; a chunked read agrees with a whole-file read byte for byte across a cluster boundary; a read at the end is short and past the end is zero; a size bound the file exceeds refuses rather than truncates; the volume label is not reported as a file; and the sector cache's hit rate |
 | `ksyms` | the table is sorted; every symbol resolves to itself; an exact address gives offset 0 and an address inside a function gives the right offset; addresses outside every executable section resolve to nothing |
 | `profile` | synthetic frames are attributed correctly — ring 0 inside a known function counts, ring 3 counts separately, an address outside `.text` counts as unattributed, and a stopped profiler ignores ticks |
@@ -222,16 +222,16 @@ table.
 
 ## Layer 4: boot scenarios
 
-`tools/run-tests.py` boots the kernel twelve ways and asserts on what it
-says. Ten of them must come up clean; two of them must *panic*.
+`tools/run-tests.py` boots the kernel fifteen ways and asserts on what it
+says. Twelve of them must come up clean; three of them must *panic*.
 
-One of the twelve does not assert on what the kernel says at all: the
+One of the fifteen does not assert on what the kernel says at all: the
 `network` scenario asserts on the bytes it put on the wire. See below.
 
-Nine run under `qemu-system-i386`, which is the machine this kernel targets.
-One - `long-mode` - runs under `qemu-system-x86_64`, because the i386 target
-masks `CPUID.80000001H:EDX.LM` even with `-cpu max`, so long mode is
-undetectable there. `Scenario.qemu` carries the choice, and a scenario whose
+Fourteen run under `qemu-system-i386`, which is the machine this kernel
+targets. One - `long-mode` - runs under `qemu-system-x86_64`, because the
+i386 target masks `CPUID.80000001H:EDX.LM` even with `-cpu max`, so long mode
+is undetectable there. `Scenario.qemu` carries the choice, and a scenario whose
 emulator is not installed is skipped with the binary's name printed, so a
 skip cannot read as a pass.
 
@@ -259,7 +259,13 @@ build/x86/stratum-test.img    # cmdline "autotest", via stage 2's patchable head
 build/x86/stratum-test.iso    # cmdline "autotest", via grub-test.cfg
 ```
 
-Each scenario then checks 47 expected lines, 9 forbidden patterns, the
+Every scenario runs with `-cpu max` unless it says otherwise, and two say
+otherwise: `legacy-cpu` asks for a Pentium II, which has PAE but no
+no-execute bit. The default matters - QEMU's default i386 model has no NX, so
+without it the kernel's `W^X` would be switched off in every scenario and
+nothing would have said so.
+
+Each scenario then checks 54 expected lines, 10 forbidden patterns, the
 in-kernel summary, and the exit status. The forbidden list is the important
 half:
 
@@ -317,7 +323,7 @@ requires both features to come up:
 ```python
 ("SMEP and SMAP both enabled", r"harden: SMEP enabled, SMAP enabled"),
 ("the boot step says so",
- r"hardening\s+\[ok\] W\^X, guard pages, SMEP \+ SMAP"),
+ r"hardening\s+\[ok\] W\^X \(NX\), guard pages, SMEP \+ SMAP"),
 ```
 
 With SMAP on, every place the kernel touches user memory must have declared
@@ -325,6 +331,38 @@ the access with `stac`/`clac`, and a missing declaration is a page fault. So
 this scenario is a test of that discipline rather than of a log line — and it
 earned its keep on its first run, by faulting the `vmspace` suite, which had
 never declared the user-page write it uses to prove copy-on-write works.
+
+### The same image, on a CPU with no NX bit
+
+The other direction, and the same argument. The kernel's `W^X` depends on bit
+63 of a page table entry, which only exists once `EFER.NXE` is set - and on a
+processor where it is clear, that bit is *reserved*, so writing it would make
+every walk through the entry fault forever. The fallback is therefore not a
+performance question: it is the difference between booting and not.
+
+`legacy-cpu` boots the same image on `-cpu pentium2`, which has PAE - PAE is
+where PAE came from - and no NX:
+
+```python
+cpu="pentium2",
+extra_expected=[
+    ("the absent bit was reported, not assumed",
+     r"no NX bit on this processor: the kernel's data pages are "
+     r"writable \*and\* executable"),
+    ("every suite still passes", r"ktest: ALL TESTS PASSED"),
+],
+forbidden=[
+    ("NX claimed on a CPU without it",
+     r"W\^X: \d+ pages of the kernel's linear map"),
+],
+```
+
+Three assertions in three directions: the kernel reports the absence, it does
+not claim the feature anyway, and all 24 suites still pass without it. The
+`harden` suite's own NX block has two branches for the same reason - where the
+bit exists it asserts that writable and executable are mutually exclusive
+across the whole linear map, and where it does not it asserts the bit is set
+*nowhere*.
 
 ### The interactive scenario
 
@@ -487,12 +525,26 @@ stratum> fault panic       call panic() directly
 
 ```
 stratum> fault text        ring-0 write to the kernel's .text  → #PF, W^X
+stratum> fault nx          call into a no-execute data page    → #PF, NX
 stratum> fault stackguard  write below a task's stack          → #PF, guard page
 ```
 
 The first six are not part of CI — they are how the quality of the
-diagnostics gets judged. The last two *are*, because a mitigation has two
+diagnostics gets judged. The last three *are*, because a mitigation has two
 halves and only one of them can be checked by a test that passes.
+
+`fault nx` is the one that could not be written at all before the kernel went
+to PAE. It allocates an ordinary writable page, puts a single `0xC3` in it —
+`ret`, one byte — and calls it. On two-level paging the processor would
+execute that byte and the command would return normally, which is precisely
+what "W^X was a claim" meant. It also declines to run at all on a processor
+without the bit, rather than demonstrating nothing:
+
+```
+stratum> fault nx
+this processor has no NX bit, so there is nothing to demonstrate: the page
+would simply execute
+```
 
 One detail worth recording. The fault addresses and the division operands all
 live in file-scope `volatile` variables:
@@ -550,9 +602,9 @@ table entry, and that the page below every task stack is unmapped. It cannot
 prove the CPU acts on either, because the correct outcome of trying is a dead
 kernel.
 
-`fault-text` and `fault-stackguard` each boot a kernel, type one command, and
-require the panic to name the right address, the right reason and the right
-region:
+`fault-text`, `fault-nx` and `fault-stackguard` each boot a kernel, type one
+command, and require the panic to name the right address, the right reason
+and the right region:
 
 ```python
 (
@@ -569,7 +621,24 @@ region:
 ),
 ```
 
-and on QEMU exiting **35**, the panic code. A clean exit there would mean the
+`fault-nx`'s patterns are the same shape, and the interesting one is the
+reason: an instruction fetch on a page that is **present**, which no other
+fault in this kernel produces.
+
+```python
+r"access\s+: instruction fetch from ring 0",
+r"reason\s+: the page is mapped no-execute, so it cannot be executed",
+r"EIP c9200000",      # EIP *is* the data page: control did transfer there
+r"shell_run_line\+0x",  # and the backtrace still walks out of it
+```
+
+`EIP` being the data page is the strongest single piece of evidence
+available — the processor took the jump and then refused to fetch the
+instruction — and the backtrace assertion is there because the faulting frame
+has no symbol at all, which is a case the unwinder is otherwise never asked
+to handle.
+
+All three turn on QEMU exiting **35**, the panic code. A clean exit there would mean the
 write succeeded, which is exactly the regression these exist to catch. The
 session keeps draining the serial port for five seconds after the panic
 banner, because the register dump, the resolved symbol and the call trace all

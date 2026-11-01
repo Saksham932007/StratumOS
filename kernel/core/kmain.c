@@ -350,11 +350,20 @@ void kmain(u32 magic, u32 info_addr)
     harden_init();
     {
         const struct harden_state *h = harden_get_state();
-        log_boot_step("hardening", h->kernel_text_ro,
-                      h->smap_enabled ? "W^X, guard pages, SMEP + SMAP"
-                      : h->smep_enabled
-                          ? "W^X, guard pages, SMEP (no SMAP on this CPU)"
-                          : "W^X, guard pages (no SMEP/SMAP on this CPU)");
+
+        /* "W^X" only where the hardware will enforce it. Before PAE this
+         * line said W^X on every machine, which was true of the read-only
+         * half and not of the executable half - the distinction is now
+         * visible at boot rather than buried in docs/SECURITY.md. */
+        const char *wx =
+            vmm_nx_enabled() ? "W^X (NX)" : "W^X (read-only only, no NX)";
+        const char *cpu = h->smap_enabled   ? ", SMEP + SMAP"
+                          : h->smep_enabled ? ", SMEP (no SMAP on this CPU)"
+                                            : " (no SMEP/SMAP on this CPU)";
+        char detail[80];
+
+        ksnprintf(detail, sizeof(detail), "%s, guard pages%s", wx, cpu);
+        log_boot_step("hardening", h->kernel_text_ro, detail);
     }
 
     /* 10. Non-essential hardware. A failure here is worth reporting but not

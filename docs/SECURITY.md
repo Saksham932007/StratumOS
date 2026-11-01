@@ -19,11 +19,17 @@ Stacks
   guard pages     : one unmapped page below every stack
   canaries        : checked on every context switch (0 failures)
   this task's guard page at 0xe000a000 is unmapped, as it should be
+W^X
+  paging          : PAE, three levels, 64-bit entries
+  no-execute      : EFER.NXE set; data pages are mapped bit-63 no-execute
+  read-only       : .text and .rodata, enforced on ring 0 by CR0.WP
+  try it          : `fault nx` jumps into a data page, `fault text`
+                    writes to .text; both must fault
 Address spaces
-  kernel half     : all 255 directory slots pre-backed, so every
+  kernel half     : one page directory, shared by pointer, so every
                     address space sees identical kernel mappings
 
-Not yet implemented: NX (needs PAE), KASLR. See docs/SECURITY.md.
+Not yet implemented: KASLR. See docs/SECURITY.md.
 ```
 
 Every one of those lines has an assertion in the `harden` suite, and the two
@@ -78,22 +84,117 @@ is decorative.
 `.data` and `.bss` stay writable, and the suite checks that too — evidence
 that the right ranges were narrowed rather than everything.
 
-`.boot` is left alone. It holds the page directory `_start` built, which the
-VMM edits; it does so through the recursive window rather than through this
-mapping, but there is no reason to narrow a mapping the kernel has a use for.
+`.boot` is left alone. It holds the paging structures `_start` built, which
+the VMM edits; it does so through the self-mapping window rather than through
+this mapping, but there is no reason to narrow a mapping the kernel has a use
+for. It is marked no-execute like the rest of the data, though — it holds
+`_start`'s code too, and that code has run for the last time.
 
 Both ends of each range are rounded outward to a page boundary. That is safe
 because the linker aligns the following section to 4 KiB, so the rounding can
 only ever cover padding.
 
-### What this is not
+### And the other half: NX
 
-It is not NX. Without PAE, a 32-bit page table entry has no
-execute-disable bit, so a page that is writable is also executable. The
-kernel's text is read-only and executable; the kernel's data is writable and —
-as far as the hardware is concerned — executable too. Marking data
-non-executable needs PAE, which means 64-bit page table entries and a
-three-level walk. See [what is missing](#what-is-missing).
+Read-only `.text` says the kernel's code cannot be rewritten. It says nothing
+about whether the kernel's *data* can be executed, and on classic 32-bit
+paging there was no way to say anything about it: a 32-bit page table entry
+has no execute-disable bit, so every writable page was also executable as far
+as the hardware was concerned. `W^X` was half a mitigation and the boot line
+said so.
+
+Bit 63 of a PAE entry is the other half, and getting at it is why this kernel
+uses PAE. The rule is one function, and the polarity is the point:
+
+```c
+static pte_t leaf_flags(u32 flags)
+{
+    pte_t e = (pte_t)(flags & 0xFFF) | PTE_PRESENT;
+
+    if (nx_ok && !(flags & PTE_EXEC))
+        e |= PTE_NX;
+
+    return e;
+}
+```
+
+A caller that says nothing gets a non-executable page. So the kernel is W^X
+by default rather than by inspection, and `grep PTE_EXEC` is the complete
+list of what is allowed to be code:
+
+| What | Where | Why |
+| --- | --- | --- |
+| the kernel's `.text` | `vmm_protect_kernel_text()` | it is the kernel |
+| a user segment with `PF_X` | `elf_load_user()` | the program said so |
+
+Everything else — `.rodata`, `.data`, `.bss`, `.boot`, the heap, every kernel
+and per-processor stack, the MMIO window, the temporary mapping slots, the
+page-table windows, user data, every user stack — is mapped with bit 63 set.
+`vmm_protect_kernel_text()` makes three passes over the kernel's linear map
+and reports the count:
+
+```
+vmm: kernel .text and .rodata mapped read-only (93 pages); CR0.WP makes that binding on ring 0 too
+vmm: W^X: 4039 pages of the kernel's linear map marked no-execute, so only .text is executable
+```
+
+The `harden` suite asserts it as an exclusive-or rather than as two separate
+facts: across every page of the linear map, at most one of *writable* and
+*executable* may be true, and the number of executable pages must equal the
+size of `.text`. It also checks the current task's own kernel stack, which is
+outside the linear map and is the single most useful page in the address
+space to someone who can overflow one.
+
+`vmm_protect()` **replaces** permissions instead of merging them, so a page
+made writable again loses `PTE_EXEC` unless it is asked for again. The
+copy-on-write handler copies bit 63 across from the old entry, so breaking a
+shared page cannot quietly turn data into code — a fork-heavy program would
+otherwise do exactly that, one page at a time.
+
+### Earning the bit
+
+On a processor where `EFER.NXE` is clear, bit 63 is **reserved**, and a
+reserved bit set anywhere on the walk makes every access through that entry
+fault forever. So nothing writes it on faith:
+
+```c
+cpuid_raw(0x80000001u, 0, &a, &b, &c, &d);
+if (!(d & CPUID_EXT_NX))
+    return false;
+
+u64 efer = rdmsr(MSR_EFER);
+
+if (!(efer & EFER_NXE))
+    wrmsr(MSR_EFER, efer | EFER_NXE);
+
+/* Read it back rather than trusting the write. */
+return (rdmsr(MSR_EFER) & EFER_NXE) != 0;
+```
+
+The read-back is not pedantry: a hypervisor may decline to set a bit it does
+not implement, and the consequence of believing it did is a fault on the next
+mapping the kernel makes.
+
+`EFER` is per-processor, so every application processor sets `NXE` for itself
+in the trampoline — *before* `mov cr3`, because by then the tables it is
+about to load already have the bit in them. A core that got this ordering
+wrong would triple-fault on its first instruction fetch and look exactly like
+a core that never came out of reset, which is the hardest kind of bring-up
+bug to find. It is five instructions and a comment explaining why.
+
+And where the feature is absent the kernel says so rather than pretending:
+
+```
+vmm: no NX bit on this processor: the kernel's data pages are writable *and*
+     executable, and W^X is only a claim
+boot: hardening          [ok] W^X (read-only only, no NX), guard pages
+```
+
+The `legacy-cpu` CI scenario boots the same image on a Pentium II — PAE, no
+NX — and asserts both that the fallback is taken and that the full test suite
+still passes on it. Same arrangement as `hardened-cpu` for SMEP/SMAP, for the
+same reason: a feature test that silently skips is a feature test that stops
+being read.
 
 ---
 
@@ -238,44 +339,59 @@ one compare per context switch.
 
 ## Every address space sees the same kernel
 
-An address space copies the kernel's page directory entries once, when it is
-created. A kernel page table created *afterwards* therefore exists only in
-whichever address space happened to be current.
+For most of this kernel's life, an address space **copied** the kernel's page
+directory entries once, when it was created. A kernel page table created
+afterwards therefore existed only in whichever address space happened to be
+current.
 
-This was a live bug, found by adding the assertion that catches it. The heap
-window spans directory slots 832 to 847; `heap_init()` maps 1 MiB, so only
-slot 832 existed at boot. Growing the heap past 4 MiB creates slot 833 — and
+That was a live bug, found by adding the assertion that catches it. The heap
+window spanned directory slots 832 to 847; `heap_init()` mapped 1 MiB, so only
+slot 832 existed at boot. Growing the heap past 4 MiB created slot 833 — and
 a process forked before that growth would never see it. The symptom would
 have been a kernel page fault on a perfectly valid heap pointer, in one
 process and not another, long after the allocation that caused it.
 
-The fix is to claim a page table for **every** slot in the kernel half during
-`vmm_init()`, while there is exactly one address space to put them in:
+The fix at the time was to claim a page table for **every** slot in the
+kernel half during `vmm_init()`, while there was exactly one address space to
+put them in — 1 MiB of page tables — and to panic if anything ever created a
+kernel table later.
 
-```
-vmm: kernel half fully backed: 255 page tables (1020 KiB), so every address
-     space sees identical kernel mappings
-```
-
-`ensure_table()` then panics if anything tries to create a kernel page table
-later, which can now only mean a bug in that reservation:
+PAE removed the problem instead. The kernel's gigabyte is exactly one entry
+of the four-entry top-level table, so every address space holds the *same*
+kernel page directory rather than a copy of its entries:
 
 ```c
-if (initialised && pdi >= KERNEL_PDE_FIRST)
-    panic("a kernel page table for directory slot %u (covering %p) is being "
-          "created after vmm_init(); it would be missing from every existing "
-          "address space - add the region to vmm_reserve_kernel_tables()", ...);
+/* The kernel's gigabyte, by pointer. Not a copy: a kernel mapping made
+ * after this address space exists has to be visible in it, and the only
+ * way to guarantee that without tracking every address space is for there
+ * to be one kernel page directory. */
+top[KERNEL_PDPT_INDEX] = PDPTE(kernel_pd_phys);
 ```
 
-Reserving only the regions the kernel currently uses would work and would
-cost 84 KiB instead of 1020 KiB, but it leaves a list to keep in step with the
-layout — and the failure mode for forgetting an entry is the bug above.
-1 MiB on a 127 MiB machine buys the removal of a category.
+A table created at runtime is in every address space the instant the entry is
+written. The 1 MiB of pre-allocated tables and the panic both went away, and
+what is left is a single reservation for the one region that genuinely cannot
+be created on demand — the two temporary frame-mapping slots, whose whole
+point is to write a page table entry directly without depending on anything
+that might itself need a temporary mapping.
 
-The `harden` suite also checks that no kernel directory entry has the `USER`
+The `bootpd` suite asserts the identity directly, which is a one-line test
+where it used to be a loop comparing 255 entries:
+
+```c
+KT_EQ(r, gigabytes[KERNEL_PDPT_INDEX], vmm_kernel_pd_phys());
+```
+
+The `harden` suite still checks that no kernel directory entry has the `USER`
 bit. That matters because `ensure_table()` widens a directory entry to `USER`
 when any page inside it becomes user-accessible, and a directory entry gates
-its whole 4 MiB: one wrong bit would expose 4 MiB of kernel space to ring 3.
+its whole 2 MiB: one wrong bit would expose 2 MiB of kernel space to ring 3.
+
+It also checks the PDPT entries for reserved bits. Bits 1, 2 and 5-8 of a
+PDPT entry are reserved — there is no `WRITE` or `USER` bit at that level —
+and a non-zero one faults every walk through it. Writing one out of habit is
+the obvious mistake to make when four levels of table look alike, so it is
+asserted rather than remembered.
 
 ---
 
@@ -311,11 +427,11 @@ Listed because they belong in this document, not because they are new:
 
 Scope honesty, in rough order of how much each would cost.
 
-- **NX, and therefore real W^X.** A 32-bit page table entry has no
-  execute-disable bit. Getting one means PAE: 64-bit entries, a three-level
-  walk, and every function in `mm/vmm.c` rewritten around a different entry
-  format. It is the single largest piece of hardening still outstanding, and
-  it is a project rather than a patch.
+- **The user ELF loader allows a writable, executable page** when a program's
+  own segments overlap within one page. It is logged by address when it
+  happens and it does not happen for anything this kernel builds, because the
+  linker page-aligns the segments; refusing would reject a valid ELF. A real
+  loader would either refuse or split the page.
 - **KASLR.** On a higher-half kernel this means relocating at load time. The
   loader already parses ELF program headers, so the mechanics exist; the work
   is emitting and applying relocations, and keeping the embedded symbol table

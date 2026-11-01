@@ -67,7 +67,7 @@ static bool range_ok(vaddr_t base, size_t len, bool need_write)
     vaddr_t last = PAGE_TRUNC(base + len - 1);
 
     for (vaddr_t page = first; page <= last; page += PAGE_SIZE) {
-        u32 pte = vmm_pte(page);
+        pte_t pte = vmm_pte(page);
 
         if (!(pte & PTE_PRESENT) || !(pte & PTE_USER))
             return false;

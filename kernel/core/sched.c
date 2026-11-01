@@ -87,7 +87,7 @@ void sched_init(void)
     idle->parent_pid = 0;
     /* Kernel threads all run in the kernel's address space. Only a forked
      * process gets its own. */
-    idle->page_dir = vmm_kernel_pd_phys();
+    idle->page_dir = vmm_kernel_root_phys();
     idle->next = idle;
 
     current = idle;
@@ -250,7 +250,7 @@ struct task *task_create(const char *name, task_entry_t entry, void *arg)
     fd_table_init(&t->files);
     /* A kernel thread shares the kernel's address space; there is nothing
      * private for it to see. */
-    t->page_dir = vmm_kernel_pd_phys();
+    t->page_dir = vmm_kernel_root_phys();
 
     /* Build the stack so that context_switch()'s epilogue - pop ebp/edi/esi/
      * ebx, popfd, ret - delivers control to thread_trampoline with `entry`
@@ -338,7 +338,7 @@ static void release_task_resources(struct task *t)
 
     /* A forked process owns its address space; a kernel thread shares the
      * kernel's and must not free it. */
-    if (pd && pd != vmm_kernel_pd_phys())
+    if (pd && pd != vmm_kernel_root_phys())
         vmm_destroy_address_space(pd);
 
     pr_debug("released pid %u's stack and address space", pid);

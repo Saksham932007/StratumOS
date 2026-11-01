@@ -28,7 +28,7 @@ machine, with the 32-bit kernel still running afterwards.
 the feature does. StratumOS's own code is 32-bit and stays 32-bit:
 `vaddr_t` is a `u32`, the IDT holds 8-byte gates, the syscall path is
 `int 0x80`, the scheduler saves 32-bit register frames, and the VMM's
-recursive-mapping trick is specific to two levels.
+self-mapping window is specific to the number of levels.
 
 A port means all of:
 
@@ -37,7 +37,7 @@ A port means all of:
 | a 64-bit IDT | gate descriptors are 16 bytes, not 8, and there is an interrupt stack table to set up |
 | a new calling convention | every assembly stub: arguments in registers, a red zone, 16-byte stack alignment |
 | `SYSCALL`/`SYSRET` | with `STAR`, `LSTAR` and `SFMASK`, instead of a software interrupt |
-| a four-level VMM | including a replacement for the recursive PD mapping, which does not generalise |
+| a four-level VMM | including a replacement for the self-mapping window, which is specific to the number of levels |
 | an audit of every `u32` | that is really an address |
 
 Each is tractable. Together they are a port, not a phase — they are scheduled

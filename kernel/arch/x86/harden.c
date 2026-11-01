@@ -16,9 +16,6 @@
 #define CPUID7_SMEP (1u << 7)
 #define CPUID7_SMAP (1u << 20)
 
-/* CR0 */
-#define CR0_WP      (1u << 16)
-
 static struct harden_state state;
 
 const struct harden_state *harden_get_state(void)
