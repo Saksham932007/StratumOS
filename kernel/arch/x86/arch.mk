@@ -355,18 +355,23 @@ $(TEST_IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(FS_IMG) $(TOOLS)/mkimag
 		--cmdline "autotest"
 	@$(PYTHON) $(TOOLS)/check-image.py $@
 
+# One recipe line, not six, because each line of a recipe is its own shell:
+# the `exit 0` that used to implement "skip when GRUB is absent" ended only
+# the line it was on, and make cheerfully ran grub-mkrescue on the next one.
+# The symptom was a build that printed SKIP and then failed anyway.
 $(ISO): $(KERNEL_ELF) $(TOOLS)/grub.cfg
-	@if ! command -v grub-mkrescue >/dev/null 2>&1; then \
+	@set -e; \
+	if ! command -v grub-mkrescue >/dev/null 2>&1; then \
 		echo "  SKIP    $@ (grub-mkrescue not installed)"; \
-		exit 0; \
+	else \
+		echo "  ISO     $@"; \
+		rm -rf $(OUT)/isoroot; \
+		mkdir -p $(OUT)/isoroot/boot/grub; \
+		cp $(KERNEL_ELF) $(OUT)/isoroot/boot/stratum.elf; \
+		cp $(TOOLS)/grub.cfg $(OUT)/isoroot/boot/grub/grub.cfg; \
+		grub-mkrescue -o $@ $(OUT)/isoroot >/dev/null 2>&1 || \
+			{ echo "  ERROR   grub-mkrescue failed"; exit 1; }; \
 	fi
-	@echo "  ISO     $@"
-	@rm -rf $(OUT)/isoroot
-	@mkdir -p $(OUT)/isoroot/boot/grub
-	@cp $(KERNEL_ELF) $(OUT)/isoroot/boot/stratum.elf
-	@cp $(TOOLS)/grub.cfg $(OUT)/isoroot/boot/grub/grub.cfg
-	@grub-mkrescue -o $@ $(OUT)/isoroot >/dev/null 2>&1 || \
-		(echo "  ERROR   grub-mkrescue failed"; exit 1)
 
 $(SHELL_IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(FS_IMG) $(TOOLS)/mkimage.py
 	@echo "  IMAGE   $@ (interactive)"
@@ -385,17 +390,18 @@ $(BENCH_IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(FS_IMG) $(TOOLS)/mkima
 	@$(PYTHON) $(TOOLS)/check-image.py $@
 
 $(TEST_ISO): $(KERNEL_ELF) $(TOOLS)/grub-test.cfg
-	@if ! command -v grub-mkrescue >/dev/null 2>&1; then \
+	@set -e; \
+	if ! command -v grub-mkrescue >/dev/null 2>&1; then \
 		echo "  SKIP    $@ (grub-mkrescue not installed)"; \
-		exit 0; \
+	else \
+		echo "  ISO     $@ (self-test)"; \
+		rm -rf $(OUT)/isoroot-test; \
+		mkdir -p $(OUT)/isoroot-test/boot/grub; \
+		cp $(KERNEL_ELF) $(OUT)/isoroot-test/boot/stratum.elf; \
+		cp $(TOOLS)/grub-test.cfg $(OUT)/isoroot-test/boot/grub/grub.cfg; \
+		grub-mkrescue -o $@ $(OUT)/isoroot-test >/dev/null 2>&1 || \
+			{ echo "  ERROR   grub-mkrescue failed"; exit 1; }; \
 	fi
-	@echo "  ISO     $@ (self-test)"
-	@rm -rf $(OUT)/isoroot-test
-	@mkdir -p $(OUT)/isoroot-test/boot/grub
-	@cp $(KERNEL_ELF) $(OUT)/isoroot-test/boot/stratum.elf
-	@cp $(TOOLS)/grub-test.cfg $(OUT)/isoroot-test/boot/grub/grub.cfg
-	@grub-mkrescue -o $@ $(OUT)/isoroot-test >/dev/null 2>&1 || \
-		(echo "  ERROR   grub-mkrescue failed"; exit 1)
 
 # ---- running ----------------------------------------------------------------
 

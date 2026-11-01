@@ -152,11 +152,21 @@ test-host: $(BUILD)/test_printf
 	@echo "  RUN     host unit tests"
 	@./$<
 
+# HOST_CFLAGS_EXTRA exists so a machine without a packaged 32-bit libc can
+# point these at an extracted one, e.g.
+#
+#   make test-host HOST_CFLAGS_EXTRA="--sysroot=$$HOME/.local/i386-sysroot"
+#
+# It is empty on CI, which installs gcc-multilib properly. The hook is here
+# rather than in a developer's shell profile because "it built on my machine"
+# is not a build system - this way the deviation is visible in the command.
+HOST_CFLAGS_EXTRA ?=
+
 $(BUILD)/test_printf: $(HOST_TEST_SRC)
 	@mkdir -p $(dir $@)
 	@echo "  CC      $@ (host, 32-bit)"
 	@gcc -m32 -std=gnu11 -Wall -Wextra -Werror -g \
-		-I$(INCLUDE) $(HOST_TEST_SRC) -o $@
+		-I$(INCLUDE) $(HOST_CFLAGS_EXTRA) $(HOST_TEST_SRC) -o $@
 
 # ---- fuzzing -----------------------------------------------------------------
 #
