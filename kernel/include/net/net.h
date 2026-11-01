@@ -251,7 +251,7 @@ struct net_stats {
     u32 icmp_echo_replies_received, icmp_bad_checksum;
     u32 udp_rx, udp_tx, udp_no_port, udp_bad_checksum;
     u32 tcp_rx, tcp_tx, tcp_bad_checksum, tcp_no_port, tcp_resets_sent;
-    u32 tcp_connections_accepted, tcp_bytes_echoed;
+    u32 tcp_connections_accepted, tcp_connections_initiated, tcp_bytes_echoed;
 };
 
 struct net_stats *net_stats(void);
@@ -381,15 +381,30 @@ const struct udp_last *udp_last_datagram(void);
 
 void tcp_input(ipv4_addr src, const u8 *packet, size_t len);
 
-/* Listen on one port, accept one connection at a time, echo what arrives,
- * and close when the peer does. The honest limits are in docs/NETWORK.md and
- * restated in tcp.c. Port 0 disables it. */
+/* How many connections exist at once. Small and fixed, like every other
+ * table in this kernel: a connection holds send and receive buffers, so the
+ * ceiling is what stops a peer opening connections until the heap is gone.
+ *
+ * It used to be one. One was enough for an echo server and is not enough for
+ * anything that *initiates* a connection, because a socket layer needs the
+ * listener and the accepted connection to exist at the same time - and an
+ * HTTP client needs a connection while the echo port is still listening. */
+#define TCP_MAX_CONNS 6
+
+/* The echo service, kept because the network CI scenario asserts on it.
+ * Port 0 disables it. A connection accepted on the echo port echoes; one
+ * handed to a socket does not, which is a flag on the connection rather than
+ * a property of the stack. */
 void tcp_listen(u16 port);
 u16 tcp_listen_port(void);
 
 enum tcp_state {
     TCP_CLOSED = 0,
     TCP_LISTEN,
+    /* An active open, waiting for the peer's SYN-ACK. New with connect():
+     * the stack could only ever be the passive side before, which is why
+     * this state had nothing to do. */
+    TCP_SYN_SENT,
     TCP_SYN_RECEIVED,
     TCP_ESTABLISHED,
     TCP_CLOSE_WAIT,
@@ -410,9 +425,80 @@ struct tcp_status {
     u32 segments_in, segments_out;
     u32 retransmits;
     u32 out_of_order_dropped;
+    /* Congestion control, exposed so that `net` can show it and the test
+     * suite can assert on it. A congestion window that is never reported is
+     * a congestion window nobody can tell is working. */
+    u32 cwnd;      /* the congestion window, in bytes       */
+    u32 ssthresh;  /* where slow start gives way            */
+    u32 srtt_ms;   /* smoothed round-trip time              */
+    u32 rttvar_ms; /* its variation                         */
+    u32 rto_ms;    /* the current retransmission timeout    */
+    u32 dup_acks;
+    u32 fast_retransmits;
+    u32 timeouts;
+    bool in_recovery;
 };
 
+/* The status of the first connection that is not closed, or of connection 0
+ * when they all are. Kept for `net`, which reports one connection. */
 void tcp_get_status(struct tcp_status *out);
+bool tcp_get_status_at(int handle, struct tcp_status *out);
+
+/* ---- connections, by handle --------------------------------------------
+ *
+ * A handle is an index into the connection table with a generation counter
+ * folded in, so that a handle to a connection that has since closed and been
+ * reused is rejected rather than silently referring to a different peer.
+ * That is the same problem a file descriptor has, and it is solved here
+ * rather than in the socket layer because the stack is what reuses the slot.
+ */
+
+/* Start an active open. Returns a handle, or a negative SYS_E* value.
+ * Non-blocking: the connection is in TCP_SYN_SENT when this returns, and the
+ * caller polls tcp_handle_state() or waits on it. */
+int tcp_connect(ipv4_addr dst, u16 port, u16 local_port);
+
+/* Claim a connection that arrived on `port` and has completed its handshake.
+ * Returns a handle or a negative SYS_E* value. The connection stops being a
+ * candidate for a second accept once claimed. */
+int tcp_accept(u16 port);
+
+/* Register and unregister a passive open on a port, for the socket layer.
+ * Separate from tcp_listen(), which is the echo service. */
+bool tcp_bind_listener(u16 port);
+void tcp_unbind_listener(u16 port);
+
+enum tcp_state tcp_handle_state(int handle);
+/* Queue data. Returns bytes accepted, which may be short when the send
+ * buffer is full - that is how back pressure is expressed. */
+i32 tcp_send(int handle, const void *buf, u32 len);
+/* Take data out of the receive buffer. 0 means none available; a closed peer
+ * with an empty buffer is reported through tcp_recv_eof(). */
+i32 tcp_recv(int handle, void *buf, u32 len);
+u32 tcp_recv_available(int handle);
+bool tcp_recv_eof(int handle);
+u32 tcp_send_room(int handle);
+/* Begin an orderly shutdown: the FIN goes out after whatever is queued, and
+ * the connection can still be read from until the peer closes too. */
+void tcp_shutdown(int handle);
+
+/* Give the connection back to the stack. The handle is invalid afterwards.
+ *
+ * This is separate from tcp_shutdown() because a close has to outlive its
+ * owner. The FIN exchange takes at least a round trip, and TIME_WAIT a good
+ * deal longer; a process that exits does not wait for either. So close()
+ * relinquishes the connection and the stack carries it the rest of the way,
+ * reclaiming the slot when the exchange finishes - which is exactly why a
+ * handle carries a generation counter, because the slot outlives the handle
+ * by design rather than by accident. */
+void tcp_close(int handle);
+
+/* Abort immediately with a reset, and release the slot. For an owner that
+ * has no use for an orderly close - and for the test suite, which needs a
+ * connection gone now rather than in two seconds. */
+void tcp_abort(int handle);
+/* An unused ephemeral port, for an active open that did not name one. */
+u16 tcp_ephemeral_port(void);
 
 /* Called from the network poll loop. Retransmits an unacknowledged segment
  * once its timer expires and times a half-open connection out. */

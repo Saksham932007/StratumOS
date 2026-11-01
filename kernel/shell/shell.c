@@ -633,6 +633,17 @@ static int cmd_net(int argc, char **argv)
             "%u retransmit(s), %u out of order\n",
             s->tcp_connections_accepted, s->tcp_bytes_echoed, ts.retransmits,
             ts.out_of_order_dropped);
+    /* The congestion state, reported because a congestion window nobody can
+     * see is a congestion window nobody can tell is working. The first two
+     * numbers are what the sender believes about the path; the last three
+     * are how it came to believe it. */
+    kprintf("  congestion: cwnd %u, ssthresh %u%s\n", ts.cwnd, ts.ssthresh,
+            ts.in_recovery ? " (in fast recovery)" : "");
+    kprintf("  round trip: srtt %u ms, var %u ms, rto %u ms\n", ts.srtt_ms,
+            ts.rttvar_ms, ts.rto_ms);
+    kprintf("  loss      : %u fast retransmit(s), %u timeout(s), "
+            "%u duplicate ack(s)\n",
+            ts.fast_retransmits, ts.timeouts, ts.dup_acks);
 
     const struct udp_last *ul = udp_last_datagram();
 

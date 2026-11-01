@@ -2198,6 +2198,113 @@ static void test_net(struct ktest_result *r)
     KT_ASSERT(r, strcmp(tcp_state_name(TCP_LISTEN), "LISTEN") == 0);
     KT_ASSERT(r, strcmp(tcp_state_name(TCP_ESTABLISHED), "ESTABLISHED") == 0);
     KT_ASSERT(r, strcmp(tcp_state_name(TCP_TIME_WAIT), "TIME_WAIT") == 0);
+    /* SYN_SENT exists now, because the stack can be the side that starts a
+     * connection. It had no name before because it had no use. */
+    KT_ASSERT(r, strcmp(tcp_state_name(TCP_SYN_SENT), "SYN_SENT") == 0);
+    KT_ASSERT(r, strcmp(tcp_state_name(TCP_CLOSE_WAIT), "CLOSE_WAIT") == 0);
+    KT_ASSERT(r, strcmp(tcp_state_name(TCP_FIN_WAIT_2), "FIN_WAIT_2") == 0);
+
+    /* --- the congestion state, at rest ----------------------------------
+     *
+     * Asserted as invariants rather than as literals. "cwnd starts at two
+     * segments" is a tuning choice that may well change; "slow start has
+     * somewhere to grow into, and the retransmission timeout is inside its
+     * bounds" is what has to hold whatever the numbers are, and a test that
+     * breaks when a constant is retuned is a test people learn to edit
+     * without reading. */
+    {
+        struct tcp_status ts;
+
+        tcp_get_status(&ts);
+
+        /* A congestion window below one segment could never send anything. */
+        KT_ASSERT(r, ts.cwnd >= 1460);
+        /* Above ssthresh and the connection would open in congestion
+         * avoidance, never having done slow start at all. */
+        KT_ASSERT(r, ts.ssthresh > ts.cwnd);
+        KT_ASSERT(r, ts.rto_ms >= 200 && ts.rto_ms <= 8000);
+        KT_ASSERT(r, !ts.in_recovery);
+        KT_ASSERT(r, ts.fast_retransmits == 0);
+        /* Nothing is connected, so this is the listener's own state. */
+        KT_ASSERT(r, ts.state == TCP_LISTEN || ts.state == TCP_CLOSED);
+    }
+
+    /* --- handles -------------------------------------------------------
+     *
+     * A handle is an index plus a generation counter, and 0 is deliberately
+     * not a valid one, so that a zeroed field fails closed. Every call that
+     * takes a handle has to reject a bad one the same way; a single missing
+     * check is a read of someone else's connection. */
+    KT_ASSERT(r, tcp_handle_state(0) == TCP_CLOSED);
+    KT_ASSERT(r, tcp_handle_state(-1) == TCP_CLOSED);
+    KT_ASSERT(r, tcp_handle_state(0x7FFFFFFF) == TCP_CLOSED);
+    {
+        char junk[4] = {0};
+
+        KT_EQ(r, tcp_send(0, junk, sizeof(junk)), SYS_EBADF);
+        KT_EQ(r, tcp_recv(0, junk, sizeof(junk)), SYS_EBADF);
+    }
+    KT_EQ(r, tcp_recv_available(0), 0u);
+    /* A handle that names nothing has nothing left to read, which is the
+     * same answer as a connection the peer has closed - and is the answer a
+     * caller can act on without a special case. */
+    KT_ASSERT(r, tcp_recv_eof(0));
+    KT_EQ(r, tcp_send_room(0), 0u);
+    /* None of these may fault on a handle that names nothing. */
+    tcp_shutdown(0);
+    tcp_close(0);
+    tcp_abort(0);
+    KT_ASSERT(r, tcp_handle_state(0) == TCP_CLOSED);
+
+    /* --- passive opens for the socket layer ------------------------------ */
+    {
+        /* The echo port is in use, and a second listener on it would make
+         * the destination port ambiguous. */
+        KT_ASSERT(r, !tcp_bind_listener(tcp_listen_port()));
+        KT_ASSERT(r, !tcp_bind_listener(0));
+        KT_ASSERT(r, tcp_bind_listener(8080));
+        KT_ASSERT(r, !tcp_bind_listener(8080)); /* already bound */
+        /* Nothing has connected, so there is nothing to accept - and that is
+         * EAGAIN, not an error, because the caller is expected to wait. */
+        KT_EQ(r, tcp_accept(8080), SYS_EAGAIN);
+        tcp_unbind_listener(8080);
+        /* Unbinding has to actually free the port, or a program that opened
+         * and closed a listening socket could never open it again. */
+        KT_ASSERT(r, tcp_bind_listener(8080));
+        tcp_unbind_listener(8080);
+        /* A port nobody bound has nothing to accept either. */
+        KT_EQ(r, tcp_accept(8081), SYS_EAGAIN);
+    }
+
+    /* --- ephemeral ports ------------------------------------------------- */
+    {
+        u16 a = tcp_ephemeral_port();
+        u16 b = tcp_ephemeral_port();
+
+        KT_ASSERT(r, a >= 49152);
+        KT_ASSERT(r, b >= 49152);
+        /* Two in a row must differ, or every outgoing connection from this
+         * kernel would share a four-tuple with the last one. */
+        KT_ASSERT(r, a != b);
+        /* And neither may collide with a port already listening. */
+        KT_ASSERT(r, a != tcp_listen_port() && b != tcp_listen_port());
+    }
+
+    /* --- connect's argument checks --------------------------------------
+     *
+     * Port 0 is not a port. Checked here rather than left to the handshake,
+     * because a SYN to port 0 is a segment nothing will ever answer and the
+     * connection would sit in SYN_SENT for the full timeout. */
+    KT_EQ(r, tcp_connect(IPV4(10, 0, 2, 2), 0, 0), SYS_EINVAL);
+
+    /* A status read on a handle that names nothing must say so rather than
+     * filling the caller's struct with a previous connection's numbers. */
+    {
+        struct tcp_status ts;
+
+        KT_ASSERT(r, !tcp_get_status_at(0, &ts));
+        KT_ASSERT(r, !tcp_get_status_at(0x7FFFFFFF, &ts));
+    }
 
     /* --- the hardware, if there is any ---------------------------------- */
 

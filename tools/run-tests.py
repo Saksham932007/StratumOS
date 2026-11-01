@@ -411,7 +411,12 @@ SHELL_SCRIPT: list[tuple[str, list[str]]] = [
     ("net", [r"Controller", r"MAC       : [0-9a-f:]{17}",
              r"link      : up", r"receive   : 32 descriptors",
              r"address   : 10\.0\.2\.15", r"tcp echo  : port 7",
-             r"udp echo  : port 7"]),
+             r"udp echo  : port 7",
+             # The congestion window, reported at rest: slow start has to
+             # have somewhere to grow into, which is ssthresh above cwnd.
+             r"congestion: cwnd \d+, ssthresh \d+",
+             r"round trip: srtt \d+ ms, var \d+ ms, rto \d+ ms",
+             r"loss      : \d+ fast retransmit\(s\)"]),
     # Either outcome is correct, and which one happens depends on whether
     # `selftest net` ran first and already resolved it. Asserting only the
     # cache-miss form made this test depend on the order of the script.
@@ -790,7 +795,7 @@ NETWORK_EXPECTED = [
     ("the suite reached the hardware",
      r"ktest net: controller present, link up"),
     ("the net suite passed its wider path",
-     r"ktest: net \.\.\. PASS \(9\d checks\)"),
+     r"ktest: net \.\.\. PASS \(1[0-9]\d checks\)"),
 ]
 
 
@@ -1187,7 +1192,7 @@ def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
                 ("the net suite took its narrower path",
                  r"ktest net: controller absent, link down"),
                 ("and still tested everything that does not need hardware",
-                 r"ktest: net \.\.\. PASS \(6\d checks\)"),
+                 r"ktest: net \.\.\. PASS \(9\d checks\)"),
             ],
         ),
         Scenario(
