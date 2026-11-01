@@ -51,6 +51,7 @@
 #include <fs/blockdev.h>
 #include <fs/fat16.h>
 #include <fs/vfs.h>
+#include <net/inet.h>
 #include <net/net.h>
 
 void ktest_check(struct ktest_result *r, bool ok, const char *what)
@@ -3372,6 +3373,268 @@ static void test_vfs(struct ktest_result *r)
     KT_EQ(r, vfs_open_count(), open_before);
 }
 
+/* ---------------------------------------------------------------------------
+ * The three protocols that reach the internet: their parsers, not their
+ * wires.
+ *
+ * The wire is tested by the `internet` CI scenario, which boots this kernel
+ * against QEMU's own DHCP server and a real HTTP server on the host. What is
+ * tested here is everything that can be got wrong without a network, and the
+ * most important of it is the DNS name parser - because that one has a
+ * remote attacker for an input and a denial of service for a bug.
+ * ------------------------------------------------------------------------- */
+
+static void test_inet(struct ktest_result *r)
+{
+    /* --- URLs ------------------------------------------------------------ */
+    {
+        char host[HTTP_HOST_MAX], path[HTTP_URL_MAX];
+        u16 port;
+        bool tls;
+
+        KT_ASSERT(r, http_parse_url("http://example.com/", host, sizeof(host),
+                                    &port, path, sizeof(path), &tls));
+        KT_ASSERT(r, strcmp(host, "example.com") == 0);
+        KT_EQ(r, (u32)port, 80u);
+        KT_ASSERT(r, strcmp(path, "/") == 0);
+        KT_ASSERT(r, !tls);
+
+        /* No scheme, which is what a person types. */
+        KT_ASSERT(r, http_parse_url("example.com", host, sizeof(host), &port,
+                                    path, sizeof(path), &tls));
+        KT_ASSERT(r, strcmp(host, "example.com") == 0);
+        /* An absent path is "/", not the empty string: a request line with
+         * an empty target is malformed and a server answers it with a 400. */
+        KT_ASSERT(r, strcmp(path, "/") == 0);
+
+        /* An explicit port. */
+        KT_ASSERT(r, http_parse_url("http://10.0.2.2:8080/a/b?c=d", host,
+                                    sizeof(host), &port, path, sizeof(path),
+                                    &tls));
+        KT_ASSERT(r, strcmp(host, "10.0.2.2") == 0);
+        KT_EQ(r, (u32)port, 8080u);
+        KT_ASSERT(r, strcmp(path, "/a/b?c=d") == 0);
+
+        /* A query with no path. */
+        KT_ASSERT(r, http_parse_url("host?q=1", host, sizeof(host), &port, path,
+                                    sizeof(path), &tls));
+        KT_ASSERT(r, strcmp(path, "?q=1") == 0);
+
+        /* https is understood and refused, and the two are different: the
+         * caller has to be able to say "there is no TLS here" rather than
+         * "that is not a URL". */
+        KT_ASSERT(r, !http_parse_url("https://example.com/", host, sizeof(host),
+                                     &port, path, sizeof(path), &tls));
+        KT_ASSERT(r, tls);
+
+        /* Rejections. */
+        KT_ASSERT(r, !http_parse_url("", host, sizeof(host), &port, path,
+                                     sizeof(path), &tls));
+        KT_ASSERT(r, !http_parse_url("http://", host, sizeof(host), &port, path,
+                                     sizeof(path), &tls));
+        /* Port 0 is not a port, and a port above 65535 does not wrap. */
+        KT_ASSERT(r, !http_parse_url("http://h:0/", host, sizeof(host), &port,
+                                     path, sizeof(path), &tls));
+        KT_ASSERT(r, !http_parse_url("http://h:99999/", host, sizeof(host),
+                                     &port, path, sizeof(path), &tls));
+        KT_ASSERT(r, !http_parse_url("http://h:80x/", host, sizeof(host), &port,
+                                     path, sizeof(path), &tls));
+        KT_ASSERT(r, !http_parse_url("http://h:/", host, sizeof(host), &port,
+                                     path, sizeof(path), &tls));
+        /* A host longer than the buffer is refused rather than truncated: a
+         * truncated host name is a request to the wrong server. */
+        {
+            char longurl[HTTP_HOST_MAX + 32];
+
+            memset(longurl, 'a', sizeof(longurl) - 1);
+            longurl[sizeof(longurl) - 1] = '\0';
+            memcpy(longurl, "http://", 7);
+            KT_ASSERT(r, !http_parse_url(longurl, host, sizeof(host), &port,
+                                         path, sizeof(path), &tls));
+        }
+    }
+
+    /* --- DNS name compression -------------------------------------------
+     *
+     * The parser whose input is a stranger's datagram. Every one of these is
+     * a message a malicious server could send, and the assertion is that
+     * none of them makes the parser read out of bounds or loop.
+     */
+    {
+        /* "www.example.com" then the root label: a plain name. */
+        static const u8 plain[] = {3,   'w', 'w', 'w', 7,   'e', 'x', 'a', 'm',
+                                   'p', 'l', 'e', 3,   'c', 'o', 'm', 0};
+
+        KT_EQ(r, dns_skip_name(plain, sizeof(plain), 0), 17);
+
+        /* A name that ends in a pointer back to offset 0. Legal, and the
+         * offset returned is just past the *pointer*, not past the name it
+         * leads to - which is the subtlety: the two are different and using
+         * the wrong one desynchronises the whole message. */
+        static const u8 compressed[] = {
+            3, 'w', 'w', 'w',  0,    /* "www." at offset 0, 5 bytes  */
+            2, 'u', 's', 0xC0, 0x00, /* "us" then a pointer to 0      */
+        };
+
+        /* Offset 5 is the 2-byte label "us" (5..7), then the pointer at
+         * 8..9, so the name ends at 10 - two bytes before the end of the
+         * message, not at it. */
+        KT_EQ(r, dns_skip_name(compressed, sizeof(compressed), 5), 10);
+
+        /* A pointer to itself. The classic infinite loop, and the reason the
+         * parser requires a pointer to go strictly backwards. */
+        static const u8 self[] = {0xC0, 0x00};
+
+        KT_ASSERT(r, dns_skip_name(self, sizeof(self), 0) < 0);
+
+        /* A pointer forwards. Also a loop, built from two pointers that
+         * reference each other, and rejected by the same rule. */
+        static const u8 forward[] = {0xC0, 0x02, 0x00, 0xC0, 0x00};
+
+        KT_ASSERT(r, dns_skip_name(forward, sizeof(forward), 0) < 0);
+
+        /* A label whose length runs off the end of the message. */
+        static const u8 overrun[] = {40, 'a', 'b', 'c'};
+
+        KT_ASSERT(r, dns_skip_name(overrun, sizeof(overrun), 0) < 0);
+
+        /* A pointer whose second byte is not in the message at all. */
+        static const u8 short_ptr[] = {0xC0};
+
+        KT_ASSERT(r, dns_skip_name(short_ptr, sizeof(short_ptr), 0) < 0);
+
+        /* An offset past the end. */
+        KT_ASSERT(r, dns_skip_name(plain, sizeof(plain), 99) < 0);
+
+        /* The reserved label types, 0x40 and 0x80. Neither is defined, and a
+         * parser that treats them as lengths reads whatever follows as a
+         * label. */
+        static const u8 reserved[] = {0x40, 0, 0, 0};
+
+        KT_ASSERT(r, dns_skip_name(reserved, sizeof(reserved), 0) < 0);
+
+        static const u8 reserved2[] = {0x80, 0, 0, 0};
+
+        KT_ASSERT(r, dns_skip_name(reserved2, sizeof(reserved2), 0) < 0);
+
+        /* A chain of backward pointers longer than the jump cap. Each step
+         * is individually legal - every pointer goes backwards and stays in
+         * bounds - so this is the case the first two defences do not catch,
+         * and the reason the cap exists at all. */
+        {
+            static u8 chain[64];
+
+            chain[0] = 0; /* the root label, so the chain terminates */
+            chain[1] = 0;
+            for (u32 i = 1; i < 32; i++) {
+                chain[i * 2] = 0xC0;
+                chain[i * 2 + 1] = (u8)((i - 1) * 2);
+            }
+
+            KT_ASSERT(r, dns_skip_name(chain, sizeof(chain), 62) < 0);
+        }
+    }
+
+    /* --- the resolver's own behaviour ----------------------------------- */
+    {
+        ipv4_addr a = 0;
+
+        /* A dotted quad is its own answer, with no query and no resolver.
+         * This is what makes `fetch 10.0.2.2` work on a machine that has no
+         * DNS server configured at all. */
+        KT_EQ(r, dns_resolve("10.0.2.2", &a, 0), 0);
+        KT_ASSERT(r, a == IPV4(10, 0, 2, 2));
+
+        KT_ASSERT(r, dns_resolve("", &a, 0) == SYS_EINVAL);
+        KT_ASSERT(r, dns_resolve(NULL, &a, 0) == SYS_EINVAL);
+
+        /* The cache. A dotted quad does not enter it, because it never
+         * needed a lookup. */
+        dns_cache_clear();
+        KT_EQ(r, dns_cache_count(), 0u);
+        KT_EQ(r, dns_resolve("10.0.2.2", &a, 0), 0);
+        KT_EQ(r, dns_cache_count(), 0u);
+
+        KT_ASSERT(r, strcmp(dns_status_name(DNS_NOT_FOUND), "not found") == 0);
+        KT_ASSERT(r, strcmp(dns_status_name(DNS_TIMEOUT), "timed out") == 0);
+    }
+
+    /* --- DHCP ------------------------------------------------------------ */
+    {
+        /* The point being asserted is the one from the top of dhcp.c: the
+         * kernel's configuration is untouched until an ACK arrives, so a
+         * lease that is not valid must not have been written anywhere. */
+        const struct dhcp_lease *l = dhcp_get_lease();
+        const struct net_config *cfg = net_get_config();
+
+        if (dhcp_state() == DHCP_IDLE) {
+            KT_ASSERT(r, !l->valid);
+            KT_EQ(r, l->acks_received, 0u);
+            /* And the static address is still the one net_init() set - on a
+             * machine that has a controller at all. With no controller
+             * net_init() never runs, so the address is zero and that is
+             * correct rather than a missing configuration. */
+            KT_ASSERT(r, !net_device() || cfg->addr != 0);
+        } else {
+            /* Something already ran it - the `internet` scenario does - in
+             * which case the lease and the configuration must agree, which
+             * is the same assertion from the other side. */
+            KT_ASSERT(r, !l->valid || cfg->addr == l->addr);
+            KT_ASSERT(r, l->valid || !net_device() || cfg->addr != 0);
+        }
+
+        KT_ASSERT(r, strcmp(dhcp_state_name(DHCP_BOUND), "bound") == 0);
+        KT_ASSERT(r, strcmp(dhcp_state_name(DHCP_FAILED), "failed") == 0);
+    }
+
+    /* --- UDP's bound ports ----------------------------------------------
+     *
+     * The queue DNS and DHCP both sit on. Tested here rather than in the
+     * `net` suite because it arrived with them.
+     */
+    {
+        KT_ASSERT(r, !udp_bind(0));
+        /* The echo service answers from inside udp_input() and keeps
+         * nothing, so a binding on top of it would see datagrams that had
+         * already been replied to. One owner per port. */
+        KT_ASSERT(r, !udp_bind(udp_echo_port()));
+
+        KT_ASSERT(r, udp_bind(5353));
+        KT_ASSERT(r, udp_port_bound(5353));
+        KT_ASSERT(r, !udp_bind(5353));
+        KT_EQ(r, udp_queued(5353), 0u);
+
+        struct udp_dgram d;
+
+        /* An empty queue is 0, which is not an error - and a port nobody
+         * bound is an error, which is a different answer. */
+        KT_EQ(r, udp_recv(5353, &d), 0);
+        KT_EQ(r, udp_recv(5354, &d), SYS_EINVAL);
+
+        udp_unbind(5353);
+        KT_ASSERT(r, !udp_port_bound(5353));
+        KT_EQ(r, udp_recv(5353, &d), SYS_EINVAL);
+
+        u16 e1 = udp_bind_ephemeral();
+        u16 e2 = udp_bind_ephemeral();
+
+        KT_ASSERT(r, e1 >= 49152 && e2 >= 49152);
+        KT_ASSERT(r, e1 != e2);
+        udp_unbind(e1);
+        udp_unbind(e2);
+    }
+
+    /* --- the HTTP client's counters ------------------------------------- */
+    {
+        const struct http_stats *hs = http_get_stats();
+
+        /* Not asserted as zero: the `internet` scenario fetches a URL before
+         * this suite runs. What has to hold either way is that every request
+         * was either answered or counted as a failure. */
+        KT_ASSERT(r, hs->responses + hs->failures <= hs->requests);
+    }
+}
+
 static const struct ktest tests[] = {
     {"string", "string and formatting primitives", test_string},
     {"boot", "boot protocol normalisation", test_boot},
@@ -3394,6 +3657,8 @@ static const struct ktest tests[] = {
     {"bootpd", "the AP bootstrap page directory", test_bootstrap_pd},
     {"longmode", "the 32 -> 64 -> 32 mode transition", test_longmode},
     {"net", "checksums, addresses, ARP, and the wire", test_net},
+    {"inet", "URL parsing, DNS name compression, DHCP and HTTP state",
+     test_inet},
     {"ksyms", "embedded symbol table lookup", test_ksyms},
     {"profile", "sampling profiler attribution", test_profile},
 };

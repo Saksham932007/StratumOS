@@ -52,6 +52,7 @@
 #include <fs/blockdev.h>
 #include <fs/fat16.h>
 #include <fs/vfs.h>
+#include <net/inet.h>
 #include <net/net.h>
 
 #define PROMPT "stratum> "
@@ -583,8 +584,9 @@ static int cmd_net(int argc, char **argv)
     kprintf("  device    : %u rx, %u tx, %u CRC error(s), %u no-buffer\n",
             ei.dev_rx_packets, ei.dev_tx_packets, ei.dev_crc_errors,
             ei.dev_rx_no_buffers);
-    kprintf("  driver    : %u interrupt(s), %u tx-ring-full, %u overrun(s)\n",
-            ei.interrupts, ei.tx_ring_full, ei.rx_overruns);
+    kprintf("  driver    : %u interrupt(s), %u tx-ring-full, %u overrun(s), "
+            "%u reentry(s)\n",
+            ei.interrupts, ei.tx_ring_full, ei.rx_overruns, ei.rx_reentries);
 
     kprintf("Addressing\n");
     kprintf("  address   : %s\n", ipv4_str(cfg->addr, b2, sizeof(b2)));
@@ -722,6 +724,202 @@ static int cmd_arp(int argc, char **argv)
                 mac_str(&e->mac, mb, sizeof(mb)), timer_ms() - e->learned_ms);
     }
 
+    return 0;
+}
+
+static int cmd_dhcp(int argc, char **argv)
+{
+    UNUSED(argc);
+    UNUSED(argv);
+
+    if (!net_up()) {
+        kprintf("no network, or the link is down\n");
+        return 1;
+    }
+
+    const struct dhcp_lease *l = dhcp_get_lease();
+
+    if (!dhcp_start()) {
+        kprintf("could not start the exchange\n");
+        return 1;
+    }
+
+    kprintf("DISCOVER sent; waiting for an offer\n");
+
+    /* Polled here rather than left to the network thread, for the same
+     * reason `arp` and `ping` are: a command that depends on another thread
+     * being scheduled is a command that fails differently under load. */
+    for (u32 i = 0;
+         i < 3000 && dhcp_state() != DHCP_BOUND && dhcp_state() != DHCP_FAILED;
+         i++) {
+        net_poll(8);
+        task_sleep_ms(5);
+    }
+
+    char ab[IPV4_STR_LEN], mb[IPV4_STR_LEN], gb[IPV4_STR_LEN], db[IPV4_STR_LEN],
+        sb[IPV4_STR_LEN];
+
+    kprintf("state     : %s\n", dhcp_state_name(dhcp_state()));
+    kprintf("messages  : %u discover, %u offer, %u request, %u ack, %u nak, "
+            "%u timeout\n",
+            l->discovers_sent, l->offers_received, l->requests_sent,
+            l->acks_received, l->naks_received, l->timeouts);
+
+    if (dhcp_state() != DHCP_BOUND) {
+        kprintf("the configuration was left as it was\n");
+        return 1;
+    }
+
+    kprintf("address   : %s\n", ipv4_str(l->addr, ab, sizeof(ab)));
+    kprintf("netmask   : %s\n", ipv4_str(l->netmask, mb, sizeof(mb)));
+    kprintf("gateway   : %s\n", ipv4_str(l->gateway, gb, sizeof(gb)));
+    kprintf("dns       : %s\n", ipv4_str(l->dns, db, sizeof(db)));
+    kprintf("server    : %s\n", ipv4_str(l->server, sb, sizeof(sb)));
+    /* Reported and not acted on: there is no renewal timer. Said here so
+     * that a number which looks like a promise is visibly not one. */
+    kprintf("lease     : %u second(s) (not renewed; see net/inet.h)\n",
+            l->lease_seconds);
+    return 0;
+}
+
+static int cmd_dns(int argc, char **argv)
+{
+    /* A bare `dns` shows the resolver and the cache; `dns <name>` asks. */
+    if (argc < 2) {
+        char sb[IPV4_STR_LEN];
+        const struct dns_stats *st = dns_get_stats();
+
+        kprintf("resolver  : %s\n", ipv4_str(dns_server(), sb, sizeof(sb)));
+        kprintf("queries   : %u sent, %u reply(s), %u answer(s), "
+                "%u not found\n",
+                st->queries_sent, st->replies_received, st->answers,
+                st->not_found);
+        kprintf("failures  : %u timeout(s), %u error(s), %u retry(s)\n",
+                st->timeouts, st->errors, st->retries);
+        kprintf("cache     : %u entry(s), %u hit(s)\n", dns_cache_count(),
+                st->cache_hits);
+
+        for (u32 i = 0; i < dns_cache_count(); i++) {
+            char nm[DNS_NAME_MAX], ab[IPV4_STR_LEN];
+            ipv4_addr a;
+
+            if (!dns_cache_entry(i, nm, sizeof(nm), &a))
+                break;
+
+            kprintf("  %-32s %s\n", nm, ipv4_str(a, ab, sizeof(ab)));
+        }
+
+        return 0;
+    }
+
+    /* `dns server <address>` sets it, for a machine with no DHCP. */
+    if (argc >= 3 && strcmp(argv[1], "server") == 0) {
+        ipv4_addr s;
+
+        if (!ipv4_parse(argv[2], &s)) {
+            kprintf("'%s' is not an IPv4 address\n", argv[2]);
+            return 1;
+        }
+
+        dns_set_server(s);
+        return 0;
+    }
+
+    if (!net_up()) {
+        kprintf("no network, or the link is down\n");
+        return 1;
+    }
+
+    ipv4_addr addr;
+    i32 rc = dns_resolve(argv[1], &addr, 5000);
+
+    if (rc < 0) {
+        kprintf("%s: %s\n", argv[1], sys_strerror(rc));
+        return 1;
+    }
+
+    char ab[IPV4_STR_LEN];
+
+    kprintf("%s is %s\n", argv[1], ipv4_str(addr, ab, sizeof(ab)));
+    return 0;
+}
+
+/* The buffer `fetch` reads a response body into. Static rather than on the
+ * stack because a shell command runs on a kernel thread's stack and 16 KiB
+ * of it would not fit - the same reason `cat` has a bound. */
+static u8 fetch_buf[16 * KIB];
+
+static int cmd_fetch(int argc, char **argv)
+{
+    if (argc < 2) {
+        kprintf("usage: fetch <url> [-h]\n");
+        kprintf("  http:// only; there is no TLS. See net/inet.h.\n");
+        return 1;
+    }
+
+    if (!net_up()) {
+        kprintf("no network, or the link is down\n");
+        return 1;
+    }
+
+    /* `-h` prints only what came back about the response, for a URL whose
+     * body is not worth putting on a serial console. */
+    bool headers_only = (argc >= 3 && strcmp(argv[2], "-h") == 0);
+
+    char host[HTTP_HOST_MAX], path[HTTP_URL_MAX];
+    u16 port;
+    bool tls;
+
+    if (!http_parse_url(argv[1], host, sizeof(host), &port, path, sizeof(path),
+                        &tls)) {
+        if (tls)
+            kprintf("https is not supported: there is no TLS in this kernel, "
+                    "and a half-checked\ncertificate validator would be worse "
+                    "than saying so. See net/inet.h.\n");
+        else
+            kprintf("'%s' is not a URL this client can use\n", argv[1]);
+        return 1;
+    }
+
+    kprintf("GET %s from %s port %u\n", path, host, port);
+
+    struct http_response r;
+    i32 n = http_get(argv[1], fetch_buf, sizeof(fetch_buf), &r, 10000);
+
+    if (n < 0) {
+        kprintf("fetch failed: %s\n", sys_strerror(n));
+        return 1;
+    }
+
+    kprintf("status    : %d %s\n", r.status, r.reason);
+    if (r.content_type[0])
+        kprintf("type      : %s\n", r.content_type);
+    kprintf("headers   : %u byte(s)\n", r.header_bytes);
+    kprintf("body      : %u byte(s)%s%s\n", r.body_bytes,
+            r.chunked ? ", chunked" : "",
+            r.truncated ? " (truncated to the buffer)" : "");
+
+    if (headers_only || !r.body_bytes)
+        return 0;
+
+    kprintf("----\n");
+
+    /* Printed with non-printable bytes shown as dots: a response body is a
+     * stranger's bytes, and sending them to a terminal unfiltered lets a
+     * remote server move the cursor around. */
+    for (u32 i = 0; i < r.body_bytes; i++) {
+        u8 c = fetch_buf[i];
+
+        if (c == '\n' || c == '\t' || (c >= 0x20 && c < 0x7F))
+            kprintf("%c", (char)c);
+        else if (c != '\r')
+            kprintf(".");
+    }
+
+    if (r.body_bytes && fetch_buf[r.body_bytes - 1] != '\n')
+        kprintf("\n");
+
+    kprintf("----\n");
     return 0;
 }
 
@@ -2172,6 +2370,12 @@ static const struct shell_command commands[] = {
      cmd_ping},
     {"udpsend", "udpsend <address> <port> <text...>", "send one UDP datagram",
      cmd_udpsend},
+    {"dhcp", "dhcp", "ask a DHCP server for an address", cmd_dhcp},
+    {"dns", "dns [name|server <address>]",
+     "resolve a name, or show the "
+     "resolver and its cache",
+     cmd_dns},
+    {"fetch", "fetch <url> [-h]", "fetch an http:// URL over TCP", cmd_fetch},
     {"longmode", "longmode", "enter 64-bit long mode, prove it, and return",
      cmd_longmode},
     {"ipi", "ipi", "ping every other processor and time a TLB shootdown",

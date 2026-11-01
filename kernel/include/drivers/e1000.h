@@ -46,6 +46,12 @@ struct e1000_info {
      * it says whether frames were lost before or after the driver. */
     u32 dev_rx_packets, dev_tx_packets, dev_crc_errors, dev_rx_no_buffers;
     u32 interrupts, tx_ring_full, rx_overruns;
+    /* How many times the receive ring was already being walked when
+     * something tried to walk it again - which is to say, how many times the
+     * guard in e1000_poll() earned its keep. Nonzero is normal and healthy;
+     * the number existing at all is what makes a silent reentrancy bug
+     * visible. See the long note on e1000_poll(). */
+    u32 rx_reentries;
 };
 
 void e1000_get_info(struct e1000_info *out);

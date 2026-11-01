@@ -11,6 +11,7 @@
 #include <kernel/sched.h>
 #include <kernel/string.h>
 
+#include <net/inet.h>
 #include <net/net.h>
 
 const struct mac_addr mac_broadcast = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
@@ -212,6 +213,13 @@ u32 net_poll(u32 max_frames)
      * the situation a retransmission exists for. */
     tcp_tick();
 
+    /* The application protocols' timers, for the same reason: a DHCP
+     * message is a datagram with no retransmission of its own, and a DNS
+     * query that gets no answer has to time out even when nothing is
+     * arriving. */
+    dhcp_tick();
+    dns_tick();
+
     return handled;
 }
 
@@ -255,6 +263,12 @@ void net_init(void)
      * the path works in both directions without a sockets API existing. */
     udp_set_echo_port(7); /* the traditional echo port */
     tcp_listen(7);
+
+    /* 10.0.2.3 is the resolver QEMU's user-mode networking emulates, which
+     * forwards to the host's. Set here so that a name can be resolved before
+     * anything has run DHCP - and overwritten by DHCP when it succeeds,
+     * which is the normal case on a real network. */
+    dns_set_server(IPV4(10, 0, 2, 3));
 }
 
 void net_start(void)

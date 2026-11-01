@@ -103,6 +103,37 @@ bool ipv4_output_frame(struct net_frame *f, ipv4_addr dst, u8 proto)
     return true;
 }
 
+bool ipv4_output_broadcast_frame(struct net_frame *f, ipv4_addr src, u8 proto)
+{
+    struct ipv4_hdr *h;
+    u32 payload_len = net_frame_len(f);
+
+    if (payload_len + IPV4_HDR_LEN > ETH_MTU)
+        return false;
+
+    h = (struct ipv4_hdr *)net_frame_prepend(f, IPV4_HDR_LEN);
+    if (!h)
+        return false;
+
+    h->version_ihl = 0x45;
+    h->dscp_ecn = 0;
+    h->total_length = htons((u16)(IPV4_HDR_LEN + payload_len));
+    h->id = htons(next_id++);
+    h->flags_fragment = htons(IPV4_FLAG_DF);
+    h->ttl = IPV4_DEFAULT_TTL;
+    h->protocol = proto;
+    h->checksum = 0;
+    h->src = src;
+    h->dst = 0xFFFFFFFFu;
+    h->checksum = checksum(h, IPV4_HDR_LEN);
+
+    if (!eth_output_frame(f, &mac_broadcast, ETHERTYPE_IPV4))
+        return false;
+
+    net_stats()->ip_tx++;
+    return true;
+}
+
 bool ipv4_output(ipv4_addr dst, u8 proto, const void *payload, size_t len)
 {
     struct net_frame f;
@@ -195,7 +226,7 @@ void ipv4_input(const struct mac_addr *from, const u8 *packet, size_t len)
         icmp_input(h->src, payload, payload_len);
         break;
     case IPPROTO_UDP:
-        udp_input(h->src, payload, payload_len);
+        udp_input(h->src, h->dst, payload, payload_len);
         break;
     case IPPROTO_TCP:
         tcp_input(h->src, payload, payload_len);

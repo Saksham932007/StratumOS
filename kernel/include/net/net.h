@@ -327,6 +327,22 @@ void ipv4_input(const struct mac_addr *from, const u8 *packet, size_t len);
  * refused rather than silently truncated. */
 bool ipv4_output_frame(struct net_frame *f, ipv4_addr dst, u8 proto);
 
+/* Send a frame to 255.255.255.255 and the Ethernet broadcast address, with
+ * an explicit source address.
+ *
+ * Separate from ipv4_output_frame() for two reasons, both of which are about
+ * DHCP being the only user. There is no ARP for a broadcast address - the
+ * destination hardware address is known without asking - so the ordinary
+ * path would try to resolve 255.255.255.255 and drop the frame forever. And
+ * the source has to be allowed to be 0.0.0.0, because a client asking for an
+ * address does not have one yet, where the ordinary path refuses to send at
+ * all until the stack is configured.
+ *
+ * Those are exactly the two assumptions the normal output path is entitled
+ * to make, which is why this is a second function rather than a flag on the
+ * first one. */
+bool ipv4_output_broadcast_frame(struct net_frame *f, ipv4_addr src, u8 proto);
+
 /* The copying form, for a caller that already has a contiguous payload. */
 bool ipv4_output(ipv4_addr dst, u8 proto, const void *payload, size_t len);
 
@@ -358,7 +374,13 @@ void icmp_clear_last_reply(void);
 
 #define UDP_HDR_LEN 8
 
-void udp_input(ipv4_addr src, const u8 *packet, size_t len);
+/* `dst` is the datagram's destination address, which this needs and ICMP and
+ * TCP do not. UDP's checksum covers a pseudo-header containing it, so a
+ * broadcast datagram - which is what a DHCP reply may be - checksums against
+ * 255.255.255.255 and not against this machine's address. Verifying against
+ * the local address instead made every DHCP reply fail its checksum, which
+ * presented as a silent timeout. */
+void udp_input(ipv4_addr src, ipv4_addr dst, const u8 *packet, size_t len);
 bool udp_send(ipv4_addr dst, u16 src_port, u16 dst_port, const void *payload,
               size_t len);
 
@@ -376,6 +398,60 @@ struct udp_last {
 };
 
 const struct udp_last *udp_last_datagram(void);
+
+/* ---- bound ports, and a receive queue ----------------------------------
+ *
+ * The echo port above is not a receive API: it answers from inside
+ * udp_input() and keeps nothing. Everything that actually *uses* UDP needs
+ * the opposite - a datagram sitting somewhere until the code that asked for
+ * it gets round to looking - and three things need it at once: DHCP, DNS,
+ * and a datagram socket.
+ *
+ * So a port can be bound, and a bound port has a short queue. The queue is
+ * short on purpose: a datagram protocol has no flow control, so the only
+ * question is how many datagrams to keep before dropping the oldest, and a
+ * deep queue on a kernel with no way to apply back pressure just delays the
+ * drop while using more memory. Two is enough for a request/reply protocol,
+ * which is what all three of these are.
+ *
+ * Dropping the *oldest* rather than the newest is the choice worth naming:
+ * for a request/reply protocol the newest datagram is the one most likely to
+ * be the reply being waited for, and a full queue of stale datagrams that
+ * shuts out the answer is the failure mode to avoid.
+ */
+#define UDP_BINDINGS_MAX 8
+#define UDP_QUEUE_DEPTH  2
+/* A DNS reply without EDNS cannot exceed 512 bytes and a DHCP message is
+ * smaller still, so this is generous for what the kernel actually speaks. A
+ * larger datagram is truncated, and `truncated` says so rather than the
+ * caller having to infer it from a length that looks plausible. */
+#define UDP_DGRAM_MAX    1024
+
+struct udp_dgram {
+    ipv4_addr src;
+    u16 src_port;
+    u16 dst_port;
+    u16 len;      /* bytes in `data`                              */
+    u16 real_len; /* what arrived, before truncation          */
+    bool truncated;
+    u8 data[UDP_DGRAM_MAX];
+};
+
+/* Claim a port. False if it is already bound, is the echo port, or there is
+ * no free binding. */
+bool udp_bind(u16 port);
+void udp_unbind(u16 port);
+/* Claim an unused port in the ephemeral range, or 0. */
+u16 udp_bind_ephemeral(void);
+bool udp_port_bound(u16 port);
+
+/* Take the oldest queued datagram for a bound port. Returns its payload
+ * length, 0 when the queue is empty, or a negative SYS_E* value when the
+ * port is not bound. */
+i32 udp_recv(u16 port, struct udp_dgram *out);
+u32 udp_queued(u16 port);
+/* Datagrams dropped because a bound port's queue was full, for the shell. */
+u32 udp_dropped(void);
 
 /* ---- TCP ---------------------------------------------------------------- */
 

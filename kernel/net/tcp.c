@@ -1355,6 +1355,11 @@ int tcp_connect(ipv4_addr dst, u16 port, u16 local_port)
     if (!port)
         return SYS_EINVAL;
 
+    /* No link means no amount of retransmission will help, and an immediate
+     * answer is worth more than ten seconds in SYN_SENT. */
+    if (!net_up())
+        return SYS_EHOSTUNREACH;
+
     if (!local_port) {
         local_port = tcp_ephemeral_port();
         if (!local_port)
@@ -1377,14 +1382,27 @@ int tcp_connect(ipv4_addr dst, u16 port, u16 local_port)
      * value arrives on the SYN-ACK. */
     t->snd_window = TCP_MSS;
 
-    if (!send_segment(t, t->snd_nxt, TCP_SYN, NULL, 0, true)) {
-        tcb_free(t);
-        /* Almost always a missing ARP entry, which ipv4_output_frame()
-         * resolves by queuing a request and dropping this frame. The
-         * retransmission in tick_one() is what makes that work, so this is
-         * reported as a failure only when the frame could not be built. */
-        return SYS_EIO;
-    }
+    /* The SYN is sent on a best-effort basis and the connection enters
+     * SYN_SENT either way.
+     *
+     * This is not sloppiness, it is the only thing that works. The first SYN
+     * to a host whose hardware address is not yet known cannot be sent at
+     * all: ipv4_output_frame() queues an ARP request and drops the frame,
+     * which is correct, and means the very first connection to any host
+     * always fails to transmit its first segment. Reporting that as a failed
+     * connect made `fetch` fail on every cold ARP cache and work on the
+     * second try, which is the shape of a bug that looks like a flaky
+     * network.
+     *
+     * The retransmission timer is what sends it, one RTO later, by which
+     * time the ARP reply has arrived. A stack with a retransmission timer
+     * does not need its first transmission to succeed, and designing as if
+     * it does is how the timer comes to have an untested path. */
+    bool sent = send_segment(t, t->snd_nxt, TCP_SYN, NULL, 0, true);
+
+    if (!sent)
+        pr_debug("the first SYN could not be sent (no ARP entry yet); the "
+                 "retransmission will carry it");
 
     t->snd_nxt++;
     t->rtt_pending = true;

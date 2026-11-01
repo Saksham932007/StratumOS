@@ -193,6 +193,9 @@ static struct {
 
     u32 dev_rx_packets, dev_tx_packets, dev_crc_errors, dev_rx_no_buffers;
     u32 interrupts, tx_ring_full, rx_overruns;
+    /* Someone is already walking the receive ring. See e1000_poll(). */
+    volatile bool rx_busy;
+    u32 rx_reentries;
 } nic;
 
 static inline u32 reg_read(u32 off)
@@ -452,12 +455,58 @@ static bool e1000_transmit(const void *frame, size_t len)
     return true;
 }
 
+/* Drain the receive ring.
+ *
+ * NOT REENTRANT, AND THAT IS THE WHOLE DIFFICULTY
+ *
+ * This is called from two places: the interrupt handler, and the network
+ * poll loop - which includes a shell command that is waiting on the network
+ * with interrupts enabled. So the handler can fire in the middle of the loop
+ * below, on the same processor, and run this function again.
+ *
+ * That is not a theoretical race and it is not benign. The loop derives the
+ * next descriptor from RDT, processes it, and then publishes by writing RDT
+ * forward. If an interrupt lands between the read and the write, the
+ * handler's copy of this function processes the same descriptor, advances
+ * RDT, and returns - and then the interrupted copy writes RDT back to its
+ * own stale `slot`. The tail moves *backwards*, the window of descriptors
+ * the device may fill shrinks, and after a few of these the ring wedges with
+ * the head far ahead of the tail and receive stops dead.
+ *
+ * It presented as a TCP connection whose SYN was retransmitted five times
+ * and never answered, on the third HTTP fetch of a run and not the first
+ * two: the stall needed enough traffic for an interrupt to land inside the
+ * loop. Transmit kept working throughout, because it has its own ring and
+ * its own index, which is exactly what makes this kind of fault hard to see
+ * from the outside.
+ *
+ * The guard is a flag rather than a lock, for two reasons. A spinlock would
+ * deadlock against itself here, because the second entry is on the same
+ * processor as the first and it cannot proceed until the first finishes.
+ * And nothing is lost by the second entry giving up: the descriptor it would
+ * have handled still has its DD bit set, the loop below re-reads RDT every
+ * iteration, so the copy that holds the flag picks it up. A dropped
+ * *interrupt* here costs nothing, where a corrupted tail costs the link.
+ */
 static u32 e1000_poll(u32 max)
 {
     u32 handled = 0;
 
     if (!nic.present)
         return 0;
+
+    {
+        bool irq = irq_save();
+
+        if (nic.rx_busy) {
+            nic.rx_reentries++;
+            irq_restore(irq);
+            return 0;
+        }
+
+        nic.rx_busy = true;
+        irq_restore(irq);
+    }
 
     /* Where the driver resumes is derived from tail rather than kept
      * separately: tail is the last descriptor the device may fill, so the
@@ -504,6 +553,7 @@ static u32 e1000_poll(u32 max)
         handled++;
     }
 
+    nic.rx_busy = false;
     return handled;
 }
 
@@ -726,4 +776,5 @@ void e1000_get_info(struct e1000_info *out)
     out->interrupts = nic.interrupts;
     out->tx_ring_full = nic.tx_ring_full;
     out->rx_overruns = nic.rx_overruns;
+    out->rx_reentries = nic.rx_reentries;
 }

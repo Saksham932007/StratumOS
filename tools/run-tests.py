@@ -31,6 +31,7 @@ The kernel writes a code to port 0xF4; QEMU exits with (code << 1) | 1.
 from __future__ import annotations
 
 import argparse
+import http.server
 import os
 import re
 import select
@@ -39,6 +40,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -874,6 +876,226 @@ def run_network(build_dir: Path, keep_logs: Path | None) -> Outcome:
     return Outcome(sc, not failures, qemu_exit, log, failures, suites), frames
 
 
+# ---------------------------------------------------------------------------
+# The internet scenario: DHCP from QEMU's own server, and HTTP against a real
+# HTTP server running on the host.
+#
+# This is the counterpart to the `network` scenario and the opposite kind of
+# test. That one asserts on the frames the kernel transmits, parsed here,
+# with no peer involved. This one asserts that a real peer - QEMU's DHCP
+# server, and Python's HTTP server - understood what the kernel said and that
+# the kernel understood the answer. A stack can put perfectly-formed frames
+# on a wire and still fail to talk to anything; both halves are needed.
+#
+# The peer is on the host rather than emulated, which matters for one reason:
+# the host's HTTP server counts the requests it served, so the assertion that
+# the kernel fetched three documents is made by the server and not by the
+# kernel's own report of its own behaviour.
+#
+# Nothing here needs the host to have internet access. QEMU's user-mode
+# networking provides the DHCP server, and 10.0.2.2 is the host itself, so
+# the whole exchange is local. A real name lookup *would* need the internet
+# and is therefore not asserted on - see the comment on the `dns` command
+# below.
+# ---------------------------------------------------------------------------
+
+PLAIN_BODY = b"StratumOS fetched this with a Content-Length.\n"
+CHUNKED_BODY = (b"This body arrived in chunks, which is how a server that "
+                b"does not know its own\nlength ends a response without "
+                b"closing the connection.\n")
+CLOSE_BODY = (b"This body has no length and no chunks. It ends when the "
+              b"server closes the\nconnection, which is the third and "
+              b"most-forgotten way an HTTP response ends.\n")
+
+
+class InetHandler(http.server.BaseHTTPRequestHandler):
+    """Three documents, one per way an HTTP/1.1 response can be framed."""
+
+    protocol_version = "HTTP/1.1"
+    served: dict[str, int] = {}
+
+    def log_message(self, fmt, *args):  # noqa: A003 - quiet
+        pass
+
+    def do_GET(self):  # noqa: N802 - the base class names it
+        InetHandler.served[self.path] = InetHandler.served.get(self.path, 0) + 1
+
+        if self.path == "/plain":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(PLAIN_BODY)))
+            self.end_headers()
+            self.wfile.write(PLAIN_BODY)
+            return
+
+        if self.path == "/chunked":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            # Deliberately several small chunks, so that the decoder's state
+            # machine crosses a chunk boundary more than once - a decoder
+            # that only ever sees one chunk is a decoder whose SIZE state is
+            # untested.
+            for i in range(0, len(CHUNKED_BODY), 17):
+                part = CHUNKED_BODY[i:i + 17]
+                self.wfile.write(b"%x\r\n" % len(part) + part + b"\r\n")
+            self.wfile.write(b"0\r\n\r\n")
+            return
+
+        if self.path == "/close":
+            # No Content-Length and no chunking: the response ends at the
+            # FIN. HTTP/1.0 in the status line, because a 1.1 response
+            # without either framing header is ill-formed.
+            self.protocol_version = "HTTP/1.0"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(CLOSE_BODY)
+            self.close_connection = True
+            return
+
+        self.send_error(404, "no such document")
+
+
+def run_internet(build_dir: Path, keep_logs: Path | None) -> Outcome:
+    image = build_dir / "stratum-shell.img"
+    sc = Scenario(
+        name="internet",
+        description="DHCP from QEMU, and HTTP against a real server on the "
+                    "host",
+        image=image,
+        qemu_args=[],
+    )
+
+    failures: list[str] = []
+    InetHandler.served = {}
+
+    # Port 0 lets the operating system choose, so two runs of this suite in
+    # parallel do not collide on a hardcoded number.
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), InetHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    # 10.0.2.2 is the host as QEMU's user-mode networking presents it, so a
+    # guest connection to that address and this port reaches the server
+    # above. No port forwarding is needed, because the traffic is outbound
+    # from the guest's point of view.
+    base = f"http://10.0.2.2:{port}"
+
+    script: list[tuple[str, list[str]]] = [
+        # DHCP against QEMU's built-in server. The address it hands out is
+        # the same 10.0.2.15 the kernel configures statically, which is
+        # convenient and is also why the message counts are asserted: a
+        # client that did nothing at all would leave the address looking
+        # right.
+        ("dhcp", [r"state     : bound",
+                  r"messages  : \d+ discover, [1-9]\d* offer, \d+ request, "
+                  r"[1-9]\d* ack",
+                  r"address   : 10\.0\.2\.15",
+                  r"netmask   : 255\.255\.255\.0",
+                  r"gateway   : 10\.0\.2\.2",
+                  r"dns       : 10\.0\.2\.3",
+                  r"lease     : \d+ second\(s\)"]),
+        # A dotted quad resolves without a query, which is what makes the
+        # fetches below work on a machine with no resolver.
+        ("dns 10.0.2.2", [r"10\.0\.2\.2 is 10\.0\.2\.2"]),
+        # Framing by Content-Length.
+        (f"fetch {base}/plain",
+         [r"status    : 200 OK",
+          r"type      : text/plain",
+          # The exact length, derived from the constant rather than
+          # written out, because a hardcoded number that disagrees with
+          # the document is a test that fails for the wrong reason.
+          rf"body      : {len(PLAIN_BODY)} byte\(s\)",
+          r"StratumOS fetched this with a Content-Length\."]),
+        # Framing by chunked transfer encoding, in 17-byte chunks.
+        (f"fetch {base}/chunked",
+         [r"status    : 200 OK",
+          rf"body      : {len(CHUNKED_BODY)} byte\(s\), chunked",
+          r"This body arrived in chunks",
+          r"closing the connection\."]),
+        # Framing by the server closing the connection, which is the case a
+        # client that trusts Content-Length gets wrong.
+        (f"fetch {base}/close",
+         [r"status    : 200 OK",
+          rf"body      : {len(CLOSE_BODY)} byte\(s\)",
+          r"most-forgotten way an HTTP response ends\."]),
+        (f"fetch {base}/missing", [r"status    : 404"]),
+        # https is refused with a reason, not attempted. Asserted because a
+        # kernel that quietly tried port 443 would produce an unreadable
+        # error instead of an explanation.
+        ("fetch https://example.com/",
+         [r"https is not supported", r"there is no TLS in this kernel"]),
+        # The connection counters, after four fetches: four outgoing
+        # connections and some bytes in both directions. This is the kernel's
+        # own account; the server's is checked below.
+        ("net", [r"tcp       : [1-9]\d* in, [1-9]\d* out",
+                 r"congestion: cwnd \d+, ssthresh \d+",
+                 r"round trip: srtt \d+ ms, var \d+ ms, rto \d+ ms"]),
+        ("selftest inet", [r"ktest: inet \.\.\. PASS"]),
+        # And the resolver, which by now holds nothing but has a server.
+        ("dns", [r"resolver  : 10\.0\.2\.3"]),
+    ]
+
+    cmd = [
+        QEMU, "-m", "128M", "-no-reboot", "-display", "none",
+        "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        "-serial", "stdio",
+        "-netdev", "user,id=inet0",
+        "-device", "e1000,netdev=inet0",
+        "-drive", f"format=raw,file={image},index=0,media=disk",
+    ]
+
+    session = SerialSession(cmd, timeout=60.0)
+    exit_code: int | None = None
+
+    try:
+        if not session.read_until(PROMPT, timeout=60.0):
+            failures.append("the shell prompt never appeared")
+        else:
+            for command, patterns in script:
+                output = session.run_command(command, settle=30.0)
+                for pattern in patterns:
+                    if not re.search(pattern, output):
+                        failures.append(
+                            f"'{command}': no match for /{pattern}/ in its "
+                            f"output")
+
+            session.send_line("halt")
+            session.read_until("halting", timeout=10.0)
+    finally:
+        exit_code = session.close()
+        server.shutdown()
+        server.server_close()
+
+    # The independent half: what the server says it served. The kernel's own
+    # output could be right while nothing ever reached the host, and this is
+    # the assertion that cannot be satisfied by the kernel alone.
+    for path in ("/plain", "/chunked", "/close", "/missing"):
+        if not InetHandler.served.get(path):
+            failures.append(
+                f"the host's HTTP server never received a request for {path}")
+
+    log = session.transcript
+    if keep_logs:
+        keep_logs.mkdir(parents=True, exist_ok=True)
+        (keep_logs / "internet.log").write_text(log, errors="replace")
+
+    for label, pattern in FORBIDDEN:
+        match = re.search(pattern, log)
+        if match:
+            failures.append(f"forbidden: {label} -> {match.group(0)}")
+
+    if exit_code is None:
+        failures.append("QEMU did not exit after 'halt'")
+    elif exit_code != EXIT_PASS:
+        failures.append(f"unexpected QEMU exit status {exit_code} after halt")
+
+    return Outcome(sc, not failures, exit_code, log, failures, None)
+
+
 def run_interactive(build_dir: Path, keep_logs: Path | None) -> Outcome:
     image = build_dir / "stratum-shell.img"
     sc = Scenario(
@@ -1316,8 +1538,8 @@ def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
         ),
     ]
 
-    if only in ("interactive-shell", "benchmarks", "syscall-fuzz",
-                "network") or (only or "").startswith("fault-"):
+    if only in ("interactive-shell", "benchmarks", "syscall-fuzz", "network",
+                "internet") or (only or "").startswith("fault-"):
         return []
 
     if only:
@@ -1425,6 +1647,30 @@ def main() -> int:
                 print("    --- end ---\n")
         else:
             print(f"  [network] SKIP ({test_image} not built)\n")
+
+    if args.only in (None, "internet"):
+        shell_image = args.build_dir / "stratum-shell.img"
+        if shell_image.is_file():
+            print("  [internet] DHCP from QEMU, and HTTP against a real "
+                  "server on the host")
+            outcome = run_internet(args.build_dir, args.keep_logs)
+            outcomes.append(outcome)
+            print(f"    documents served : "
+                  f"{sum(InetHandler.served.values())}")
+            print(f"    qemu exit        : {outcome.qemu_exit}")
+            if outcome.passed:
+                print("    result           : PASS\n")
+            else:
+                print("    result           : FAIL")
+                for f in outcome.failures:
+                    print(f"      - {f}")
+                print()
+                print("    --- transcript ---")
+                for line in outcome.log.splitlines():
+                    print(f"    | {line}")
+                print("    --- end ---\n")
+        else:
+            print(f"  [internet] SKIP ({shell_image} not built)\n")
 
     if args.only in (None, "syscall-fuzz"):
         shell_image = args.build_dir / "stratum-shell.img"
