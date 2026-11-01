@@ -284,19 +284,33 @@ portability:
 
 # ---- housekeeping -----------------------------------------------------------
 
+# The -name tests are parenthesised and the find is shared between the two
+# targets below. Neither is a bug fix: an unparenthesised `-name '*.c' -o
+# -name '*.h'` with no action is already correct, because the implicit -print
+# is applied to the whole expression rather than to the last branch. It is
+# written out because that is true only while there is no action - adding one
+# later would silently narrow it to the second branch - and because two
+# targets that must scan the same files should not each spell out which.
+SOURCES_TO_FORMAT := $(KSRC) $(USERSRC) tests
+FIND_SOURCES      := find $(SOURCES_TO_FORMAT) \( -name '*.c' -o -name '*.h' \)
+
 .PHONY: format
 format:
 	@command -v clang-format >/dev/null 2>&1 || \
 		{ echo "clang-format is not installed"; exit 1; }
-	@find $(KSRC) $(USERSRC) tests -name '*.c' -o -name '*.h' | xargs clang-format -i
-	@echo "  formatted $$(find $(KSRC) $(USERSRC) tests -name '*.c' -o -name '*.h' | wc -l) files"
+	@$(FIND_SOURCES) | xargs clang-format -i
+	@echo "  formatted $$($(FIND_SOURCES) | wc -l) files"
 
+# One shell command, not two: `exit 0` on its own line ended only that line,
+# so a machine without clang-format printed "skipping" and then ran it anyway
+# and failed. The same bug as the ISO rules in arch/x86/arch.mk.
 .PHONY: format-check
 format-check:
-	@command -v clang-format >/dev/null 2>&1 || \
-		{ echo "clang-format is not installed; skipping"; exit 0; }
-	@find $(KSRC) $(USERSRC) tests -name '*.c' -o -name '*.h' | \
-		xargs clang-format --dry-run --Werror
+	@if ! command -v clang-format >/dev/null 2>&1; then \
+		echo "  SKIP    clang-format is not installed"; \
+	else \
+		$(FIND_SOURCES) | xargs clang-format --dry-run --Werror; \
+	fi
 
 .PHONY: lines
 lines:

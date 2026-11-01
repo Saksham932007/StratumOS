@@ -21,7 +21,7 @@ void _start(void);
  * stale page table entry behind, a pointer that should fault would not. */
 static void probe_boundary_after_exec(void)
 {
-    if (sys_write((const char *)0xC0100000u, 16) != SYS_EFAULT) {
+    if (sys_write(STDOUT_FD, (const char *)0xC0100000u, 16) != SYS_EFAULT) {
         u_puts("  [exec] WARNING: kernel accepted a kernel pointer after "
                "exec!\n");
         return;
@@ -30,7 +30,8 @@ static void probe_boundary_after_exec(void)
     /* init's stack lived here before the exec and the new stack is mapped at
      * the same place, so this proves nothing on its own. The page *below* the
      * stack is the interesting one: exec must not have left it mapped. */
-    if (sys_write((const char *)(0xB0000000u - 5 * 4096), 8) != SYS_EFAULT) {
+    if (sys_write(STDOUT_FD, (const char *)(0xB0000000u - 5 * 4096), 8) !=
+        SYS_EFAULT) {
         u_puts("  [exec] WARNING: a page below the new stack is still "
                "mapped!\n");
         return;

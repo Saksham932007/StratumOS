@@ -51,6 +51,7 @@
 
 #include <fs/blockdev.h>
 #include <fs/fat16.h>
+#include <fs/vfs.h>
 #include <net/net.h>
 
 #define PROMPT "stratum> "
@@ -1079,52 +1080,191 @@ static int cmd_mount(int argc, char **argv)
     return 0;
 }
 
+/* The name the stat type goes by when printed. */
+static const char *type_name(unsigned type)
+{
+    switch (type) {
+    case S_TYPE_FILE:
+        return "file";
+    case S_TYPE_DIR:
+        return "dir";
+    case S_TYPE_CHAR:
+        return "char";
+    case S_TYPE_PIPE:
+        return "pipe";
+    case S_TYPE_SOCKET:
+        return "socket";
+    default:
+        return "?";
+    }
+}
+
+/* `ls` through the VFS rather than through the FAT driver.
+ *
+ * This is where the abstraction earns its keep visibly: `ls /dev` now works,
+ * and it works without this function knowing that /dev is not on a disk.
+ * Before, `ls` called fat16_readdir() directly, so the only listable thing in
+ * the system was the FAT partition - and on the GRUB ISO path, where nothing
+ * is mounted, there was nothing to list at all.
+ *
+ * It also costs something, and the cost is worth naming: the old version
+ * printed FAT's attribute bits (read-only, hidden, system), and
+ * `struct sys_dirent` has no room for them because they are not a property
+ * every filesystem has. The type and the size are what all three backends can
+ * answer, so that is what is printed. `mount` still reports FAT-specific
+ * detail, which is the right place for it.
+ */
 static int cmd_ls(int argc, char **argv)
 {
-    const char *path = (argc > 1) ? argv[1] : "/";
+    const char *path = (argc > 1) ? argv[1] : ".";
+    char abs[VFS_PATH_MAX];
 
-    if (!fat16_mounted()) {
-        kprintf("nothing is mounted\n");
+    if (!fd_resolve(path, abs, sizeof(abs))) {
+        kprintf("%s: path too long\n", path);
         return 1;
     }
 
-    struct fat_dirent entry;
+    i32 fd = fd_open(abs, O_RDONLY);
 
-    if (!fat16_stat(path, &entry)) {
-        kprintf("%s: no such file or directory\n", path);
+    if (fd < 0) {
+        kprintf("%s: %s\n", abs, sys_strerror(fd));
         return 1;
     }
 
-    if (!entry.is_dir) {
-        kprintf("  %-14s %8u\n", entry.name, entry.size);
+    struct sys_stat st;
+
+    if (fd_stat(fd, &st) < 0) {
+        kprintf("%s: cannot stat\n", abs);
+        fd_close(fd);
+        return 1;
+    }
+
+    if (st.type != S_TYPE_DIR) {
+        kprintf("  %-14s %8u  %s\n", abs, st.size, type_name(st.type));
+        fd_close(fd);
         return 0;
     }
 
-    kprintf("  %-14s %8s  %s\n", "NAME", "SIZE", "ATTR");
+    kprintf("  %-14s %8s  %s\n", "NAME", "SIZE", "TYPE");
 
-    u32 files = 0, dirs = 0, bytes = 0;
+    u32 files = 0, dirs = 0, others = 0, bytes = 0;
+    struct sys_dirent de;
 
-    for (u32 i = 0;; i++) {
-        if (!fat16_readdir(path, i, &entry))
+    for (u32 i = 0; i < 4096; i++) {
+        i32 got = fd_getdent(fd, i, &de);
+
+        if (got <= 0)
             break;
 
-        kprintf("  %-14s %8u  %s%s%s%s\n", entry.name,
-                entry.is_dir ? 0 : entry.size, entry.is_dir ? "d" : "-",
-                (entry.attr & FAT_ATTR_READ_ONLY) ? "r" : "-",
-                (entry.attr & FAT_ATTR_HIDDEN) ? "h" : "-",
-                (entry.attr & FAT_ATTR_SYSTEM) ? "s" : "-");
+        kprintf("  %-14s %8u  %s\n", de.name, de.size, type_name(de.type));
 
-        if (entry.is_dir) {
+        switch (de.type) {
+        case S_TYPE_DIR:
             dirs++;
-        } else {
+            break;
+        case S_TYPE_FILE:
             files++;
-            bytes += entry.size;
+            bytes += de.size;
+            break;
+        default:
+            others++;
+            break;
         }
     }
 
-    kprintf("  %u file(s), %u bytes; %u director(y|ies)\n", files, bytes, dirs);
+    fd_close(fd);
+
+    kprintf("  %u file(s), %u bytes; %u director(y|ies)", files, bytes, dirs);
+    if (others)
+        kprintf("; %u device(s)", others);
+    kprintf("\n");
+
     return 0;
 }
+
+static int cmd_pwd(int argc, char **argv)
+{
+    UNUSED(argc);
+    UNUSED(argv);
+
+    kprintf("%s\n", fd_cwd());
+    return 0;
+}
+
+static int cmd_cd(int argc, char **argv)
+{
+    const char *path = (argc > 1) ? argv[1] : "/";
+    i32 e = fd_chdir(path);
+
+    if (e < 0) {
+        kprintf("%s: %s\n", path, sys_strerror(e));
+        return 1;
+    }
+
+    return 0;
+}
+
+/* What the kernel's own descriptor table and the open-file pool look like.
+ * The pool is a fixed global array, so "how full is it" is a question with a
+ * real answer, and a leak shows up here as a number that only goes up. */
+static int cmd_fds(int argc, char **argv)
+{
+    UNUSED(argc);
+    UNUSED(argv);
+
+    kprintf("open files : %u of %u in use, peak %u\n", vfs_open_count(),
+            VFS_OPEN_MAX, vfs_open_peak());
+    kprintf("vfs calls  : %u\n", vfs_call_count());
+    kprintf("cwd        : %s\n", fd_cwd());
+
+    u32 reads = 0, in = 0, out = 0;
+
+    devfs_counters(&reads, &in, &out);
+    kprintf("console    : %u read(s), %u byte(s) in, %u byte(s) out\n", reads,
+            in, out);
+
+    u32 opens = 0, freads = 0, fbytes = 0;
+
+    fatfs_counters(&opens, &freads, &fbytes);
+    kprintf("fat16      : %u open(s), %u read(s), %u byte(s)\n", opens, freads,
+            fbytes);
+
+    kprintf("\n  %-4s %-10s %-6s %8s  %s\n", "FD", "BACKEND", "TYPE", "OFFSET",
+            "PATH");
+
+    u32 shown = 0;
+
+    for (i32 fd = 0; fd < (i32)SYS_FDS_MAX; fd++) {
+        struct vfs_file *f = fd_get(fd);
+
+        if (!f)
+            continue;
+
+        kprintf("  %-4d %-10s %-6s %8u  %s\n", fd,
+                f->ops && f->ops->name ? f->ops->name : "?", type_name(f->type),
+                f->offset, f->path);
+        shown++;
+    }
+
+    if (!shown)
+        kprintf("  (this task holds none - the shell is a kernel thread and "
+                "uses kprintf)\n");
+
+    return 0;
+}
+
+/* `cat` through the VFS too, which means `cat /dev/zero` and `cat
+ * /etc/motd.txt` are the same code path. Reads in chunks rather than whole,
+ * so that a large file does not need a buffer the size of the file - and so
+ * the incremental read path, the one exec() does not use, is exercised by
+ * hand as well as by the test suite.
+ *
+ * A character device has no size and no end, so the byte budget is what stops
+ * `cat /dev/zero` from running until the machine is rebooted. A real `cat`
+ * would stream forever and rely on the user interrupting it; there is no
+ * interrupt key wired to a kernel thread here, so the limit is explicit.
+ */
+#define CAT_MAX_BYTES (64 * KIB)
 
 static int cmd_cat(int argc, char **argv)
 {
@@ -1133,35 +1273,53 @@ static int cmd_cat(int argc, char **argv)
         return 1;
     }
 
-    if (!fat16_mounted()) {
-        kprintf("nothing is mounted\n");
+    char abs[VFS_PATH_MAX];
+
+    if (!fd_resolve(argv[1], abs, sizeof(abs))) {
+        kprintf("%s: path too long\n", argv[1]);
         return 1;
     }
 
-    struct fat_dirent entry;
+    i32 fd = fd_open(abs, O_RDONLY);
 
-    if (!fat16_stat(argv[1], &entry)) {
-        kprintf("%s: no such file or directory\n", argv[1]);
+    if (fd < 0) {
+        kprintf("%s: %s\n", abs, sys_strerror(fd));
         return 1;
     }
 
-    if (entry.is_dir) {
-        kprintf("%s: is a directory\n", argv[1]);
+    struct sys_stat st;
+
+    if (fd_stat(fd, &st) == 0 && st.type == S_TYPE_DIR) {
+        kprintf("%s: %s\n", abs, sys_strerror(SYS_EISDIR));
+        fd_close(fd);
         return 1;
     }
 
-    /* Read in chunks rather than whole, so that `cat` on a large file does
-     * not need a buffer the size of the file - and so the chunked path
-     * through fat16_read(), which is the one exec does not use, gets
-     * exercised by hand as well as by the test suite. */
     char buf[256];
-    u32 offset = 0;
+    u32 total = 0;
     u32 printable = 0, binary = 0;
+    bool truncated = false;
 
     for (;;) {
-        i32 got = fat16_read(&entry, offset, buf, sizeof(buf));
+        u32 want = sizeof(buf);
 
-        if (got <= 0)
+        if (total + want > CAT_MAX_BYTES)
+            want = CAT_MAX_BYTES - total;
+
+        if (want == 0) {
+            truncated = true;
+            break;
+        }
+
+        i32 got = fd_read(fd, buf, want);
+
+        if (got < 0) {
+            kprintf("\n%s: %s\n", abs, sys_strerror(got));
+            fd_close(fd);
+            return 1;
+        }
+
+        if (got == 0)
             break;
 
         for (i32 i = 0; i < got; i++) {
@@ -1178,13 +1336,17 @@ static int cmd_cat(int argc, char **argv)
             }
         }
 
-        offset += (u32)got;
+        total += (u32)got;
     }
 
-    if (binary)
-        kprintf("\n[%u of %u bytes were not printable]\n", binary, entry.size);
+    fd_close(fd);
+
+    if (truncated)
+        kprintf("\n[stopped after %u bytes]\n", total);
+    else if (binary)
+        kprintf("\n[%u of %u bytes were not printable]\n", binary, total);
     else if (printable == 0)
-        kprintf("[%s is empty]\n", argv[1]);
+        kprintf("[%s is empty]\n", abs);
 
     return 0;
 }
@@ -1716,7 +1878,13 @@ static const struct shell_command commands[] = {
     {"mount", "mount", "the mounted filesystem's geometry and activity",
      cmd_mount},
     {"ls", "ls [path]", "list a directory", cmd_ls},
-    {"cat", "cat <path>", "print a file", cmd_cat},
+    {"cat", "cat <path>", "print a file or device", cmd_cat},
+    {"cd", "cd [path]", "change the working directory", cmd_cd},
+    {"pwd", "pwd", "print the working directory", cmd_pwd},
+    {"fds", "fds",
+     "open files, the descriptor pool and per-backend "
+     "counters",
+     cmd_fds},
     {"stress", "stress [workers] [rounds]",
      "hammer the heap from several tasks", cmd_stress},
     {"harden", "harden", "report the mitigations that are switched on",

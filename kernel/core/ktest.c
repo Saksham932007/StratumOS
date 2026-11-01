@@ -50,6 +50,7 @@
 
 #include <fs/blockdev.h>
 #include <fs/fat16.h>
+#include <fs/vfs.h>
 #include <net/net.h>
 
 void ktest_check(struct ktest_result *r, bool ok, const char *what)
@@ -2322,6 +2323,490 @@ static void test_net(struct ktest_result *r)
     KT_EQ(r, st->rx_dropped_short, 0u);
 }
 
+/* ------------------------------------------------------------------------- */
+/* The VFS and the descriptor table                                         */
+/* ------------------------------------------------------------------------- */
+
+/* Path resolution gets its own block, first, and gets the most assertions.
+ *
+ * It is the only part of this subsystem that is a security boundary: every
+ * path a ring-3 program passes goes through vfs_resolve() and nothing else
+ * re-checks the result. A ".." that escaped here would be a filesystem
+ * escape, and it would be one in every backend at once.
+ *
+ * Note what is asserted about escape attempts: not that they are *rejected*,
+ * but that they resolve to a path inside the root. There is no syntax for
+ * "above the root" in the output, so there is nothing for a backend to have
+ * to refuse - which is a stronger property than a rejection, because it
+ * cannot be forgotten.
+ */
+static void test_vfs_paths(struct ktest_result *r)
+{
+    char out[VFS_PATH_MAX];
+
+    /* Absolute paths, canonicalised and folded to upper case. */
+    KT_ASSERT(r, vfs_resolve("/", "/bin/init", out, sizeof(out)));
+    KT_ASSERT(r, strcmp(out, "/BIN/INIT") == 0);
+
+    KT_ASSERT(r, vfs_resolve("/", "/BIN///INIT", out, sizeof(out)));
+    KT_ASSERT(r, strcmp(out, "/BIN/INIT") == 0);
+
+    KT_ASSERT(r, vfs_resolve("/", "/bin/./init", out, sizeof(out)));
+    KT_ASSERT(r, strcmp(out, "/BIN/INIT") == 0);
+
+    KT_ASSERT(r, vfs_resolve("/", "/", out, sizeof(out)));
+    KT_ASSERT(r, strcmp(out, "/") == 0);
+
+    /* A trailing slash names the same thing as no trailing slash. */
+    KT_ASSERT(r, vfs_resolve("/", "/bin/", out, sizeof(out)));
+    KT_ASSERT(r, strcmp(out, "/BIN") == 0);
+
+    /* Relative, against a working directory. */
+    KT_ASSERT(r, vfs_resolve("/BIN", "init", out, sizeof(out)));
+    KT_ASSERT(r, strcmp(out, "/BIN/INIT") == 0);
+
+    KT_ASSERT(r, vfs_resolve("/BIN", ".", out, sizeof(out)));
+    KT_ASSERT(r, strcmp(out, "/BIN") == 0);
+
+    KT_ASSERT(r, vfs_resolve("/BIN", "..", out, sizeof(out)));
+    KT_ASSERT(r, strcmp(out, "/") == 0);
+
+    KT_ASSERT(r, vfs_resolve("/BIN", "../etc/motd.txt", out, sizeof(out)));
+    KT_ASSERT(r, strcmp(out, "/ETC/MOTD.TXT") == 0);
+
+    /* --- escapes. Every one of these must land at or under the root. --- */
+    KT_ASSERT(r, vfs_resolve("/", "..", out, sizeof(out)));
+    KT_ASSERT(r, strcmp(out, "/") == 0);
+
+    KT_ASSERT(r, vfs_resolve("/", "../../../..", out, sizeof(out)));
+    KT_ASSERT(r, strcmp(out, "/") == 0);
+
+    KT_ASSERT(r, vfs_resolve("/", "/../../etc/passwd", out, sizeof(out)));
+    KT_ASSERT(r, strcmp(out, "/ETC/PASSWD") == 0);
+
+    KT_ASSERT(
+        r, vfs_resolve("/BIN", "../../../../../../BIN/INIT", out, sizeof(out)));
+    KT_ASSERT(r, strcmp(out, "/BIN/INIT") == 0);
+
+    /* "..." is a name, not two dots and a dot. A resolver that stripped dots
+     * by counting them rather than by comparing whole components would get
+     * this wrong, and would then treat "....//" as two levels up. */
+    KT_ASSERT(r, vfs_resolve("/", "/...", out, sizeof(out)));
+    KT_ASSERT(r, strcmp(out, "/...") == 0);
+
+    /* Every output begins with '/' - asserted directly, because it is the
+     * invariant every backend is entitled to assume. */
+    static const char *const nasty[] = {
+        "..", "../..", "./..", "/..", "a/../..", "../a/../..", "", ".",
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(nasty); i++) {
+        KT_ASSERT(r, vfs_resolve("/", nasty[i], out, sizeof(out)));
+        KT_ASSERT(r, out[0] == '/');
+        /* And no "/.." survives anywhere in the result. */
+        KT_ASSERT(r,
+                  strlen(out) < 3 || strcmp(out + strlen(out) - 3, "/..") != 0);
+    }
+
+    /* Bounds. An overlong path fails rather than being truncated: a
+     * truncated path names a different file, and silently opening the wrong
+     * file is worse than failing to open one. */
+    char longpath[VFS_PATH_MAX * 2];
+
+    longpath[0] = '/';
+    for (size_t i = 1; i < sizeof(longpath) - 1; i++)
+        longpath[i] = (i % 9 == 0) ? '/' : 'A';
+    longpath[sizeof(longpath) - 1] = '\0';
+
+    KT_ASSERT(r, !vfs_resolve("/", longpath, out, sizeof(out)));
+
+    /* A single component longer than any name a backend here can hold. */
+    KT_ASSERT(
+        r, !vfs_resolve("/", "/ABCDEFGHIJKLMNOPQRSTUVWXYZ", out, sizeof(out)));
+
+    /* A buffer too small to hold even "/" is refused rather than written to. */
+    char tiny[1];
+
+    KT_ASSERT(r, !vfs_resolve("/", "/bin", tiny, sizeof(tiny)));
+}
+
+static void test_vfs(struct ktest_result *r)
+{
+    test_vfs_paths(r);
+
+    u32 open_before = vfs_open_count();
+
+    /* --- /dev/zero and /dev/null: the character-device backend --------- */
+    i32 err = 0;
+    struct vfs_file *z = vfs_open("/DEV/ZERO", O_RDONLY, &err);
+
+    KT_ASSERT(r, z != NULL);
+    KT_EQ(r, err, 0);
+
+    if (z) {
+        u8 buf[16];
+
+        memset(buf, 0xAA, sizeof(buf));
+        KT_EQ(r, vfs_read(z, buf, sizeof(buf)), (i32)sizeof(buf));
+
+        bool all_zero = true;
+        for (size_t i = 0; i < sizeof(buf); i++)
+            if (buf[i] != 0)
+                all_zero = false;
+        KT_ASSERT(r, all_zero);
+
+        /* A character device has no size and no position. Asserting the
+         * refusal matters as much as asserting the read: a seek that
+         * silently succeeded would let a caller believe it had moved. */
+        struct sys_stat st;
+
+        KT_EQ(r, vfs_stat_file(z, &st), 0);
+        KT_EQ(r, st.type, (unsigned)S_TYPE_CHAR);
+        KT_EQ(r, st.size, 0u);
+        KT_EQ(r, vfs_seek(z, 0, SEEK_SET), SYS_EINVAL);
+
+        /* Opened read-only, so a write is refused by the access mode - in
+         * the dispatcher, not in the backend, which is the point of checking
+         * it in one place. */
+        KT_EQ(r, vfs_write(z, "x", 1), SYS_EINVAL);
+
+        vfs_put(z);
+    }
+
+    struct vfs_file *n = vfs_open("/DEV/NULL", O_WRONLY, &err);
+
+    KT_ASSERT(r, n != NULL);
+    if (n) {
+        KT_EQ(r, vfs_write(n, "discarded", 9), 9);
+        KT_EQ(r, vfs_read(n, (char[16]){0}, 16), SYS_EINVAL); /* write-only */
+        vfs_put(n);
+    }
+
+    /* Read-write, so both directions are permitted on one descriptor. */
+    struct vfs_file *rw = vfs_open("/DEV/NULL", O_RDWR, &err);
+
+    KT_ASSERT(r, rw != NULL);
+    if (rw) {
+        char tmp[4];
+
+        KT_EQ(r, vfs_write(rw, "ab", 2), 2);
+        KT_EQ(r, vfs_read(rw, tmp, sizeof(tmp)), 0); /* /dev/null is EOF */
+        vfs_put(rw);
+    }
+
+    /* --- a missing device, and a missing filesystem -------------------- */
+    log_expect_errors(true);
+    KT_ASSERT(r, vfs_open("/DEV/NOSUCHDEVICE", O_RDONLY, &err) == NULL);
+    KT_EQ(r, err, SYS_ENOENT);
+
+    /* A relative path never reaches a backend: vfs_open() takes absolute
+     * paths only, because resolution happens before it. */
+    KT_ASSERT(r, vfs_open("relative/path", O_RDONLY, &err) == NULL);
+    KT_EQ(r, err, SYS_EINVAL);
+    log_expect_errors(false);
+
+    /* --- /dev as a directory ------------------------------------------- */
+    struct vfs_file *d = vfs_open("/DEV", O_RDONLY, &err);
+
+    KT_ASSERT(r, d != NULL);
+    if (d) {
+        struct sys_dirent de;
+
+        KT_EQ(r, d->type, (u8)S_TYPE_DIR);
+        /* Reading bytes from a directory is refused on the type, by the
+         * dispatcher - so a backend cannot forget to refuse it. */
+        KT_EQ(r, vfs_read(d, (char[8]){0}, 8), SYS_EISDIR);
+
+        KT_EQ(r, vfs_getdent(d, 0, &de), 1);
+        KT_ASSERT(r, de.name[0] != '\0');
+
+        /* Walk to the end and confirm it stops rather than repeating. */
+        u32 count = 0;
+        while (vfs_getdent(d, count, &de) == 1 && count < 64)
+            count++;
+        KT_ASSERT(r, count >= 4); /* console, tty, kbd, null, zero */
+        KT_EQ(r, vfs_getdent(d, count, &de), 0);
+        KT_EQ(r, vfs_getdent(d, 10000, &de), 0);
+
+        vfs_put(d);
+    }
+
+    /* --- reference counting -------------------------------------------- */
+    struct vfs_file *shared = vfs_open("/DEV/ZERO", O_RDONLY, &err);
+
+    KT_ASSERT(r, shared != NULL);
+    if (shared) {
+        KT_EQ(r, shared->refcount, 1u);
+        vfs_ref(shared);
+        KT_EQ(r, shared->refcount, 2u);
+        vfs_put(shared);
+        KT_EQ(r, shared->refcount, 1u);
+        /* Still usable after the extra reference went away. */
+        KT_EQ(r, vfs_read(shared, (char[4]){0}, 4), 4);
+        vfs_put(shared);
+        /* And the slot is genuinely released, not merely marked. */
+        KT_EQ(r, shared->refcount, 0u);
+    }
+
+    /* Every open above is matched by a put, so the pool is where it was.
+     * This is the assertion that catches a leak, and it is the reason each
+     * block above closes what it opened even though the kernel would survive
+     * either way. */
+    KT_EQ(r, vfs_open_count(), open_before);
+
+    /* --- descriptors --------------------------------------------------- */
+    i32 fd = fd_open("/dev/zero", O_RDONLY);
+
+    KT_ASSERT(r, fd >= 0);
+
+    if (fd >= 0) {
+        char buf[8];
+
+        KT_ASSERT(r, fd_get(fd) != NULL);
+        KT_EQ(r, fd_read(fd, buf, sizeof(buf)), (i32)sizeof(buf));
+
+        /* dup gives a second descriptor onto the *same* open file. The
+         * refcount is the observable part; the shared offset is tested on a
+         * real file below, where a position exists to share. */
+        i32 dup = fd_dup(fd);
+
+        KT_ASSERT(r, dup >= 0);
+        KT_ASSERT(r, dup != fd);
+        KT_ASSERT(r, fd_get(dup) == fd_get(fd));
+        KT_EQ(r, fd_get(fd)->refcount, 2u);
+
+        /* Closing one leaves the other working - which is the whole reason
+         * descriptors and open files are separate objects. */
+        KT_EQ(r, fd_close(dup), 0);
+        KT_ASSERT(r, fd_get(dup) == NULL);
+        KT_EQ(r, fd_get(fd)->refcount, 1u);
+        KT_EQ(r, fd_read(fd, buf, sizeof(buf)), (i32)sizeof(buf));
+
+        /* dup2 onto a specific number, and the no-op case. A dup2(fd, fd)
+         * that closed before copying would free the last reference and then
+         * duplicate a released slot. */
+        KT_EQ(r, fd_dup2(fd, fd), fd);
+        KT_ASSERT(r, fd_get(fd) != NULL);
+        KT_EQ(r, fd_get(fd)->refcount, 1u);
+
+        i32 target = (i32)SYS_FDS_MAX - 1;
+
+        KT_EQ(r, fd_dup2(fd, target), target);
+        KT_ASSERT(r, fd_get(target) == fd_get(fd));
+        KT_EQ(r, fd_close(target), 0);
+
+        /* Out-of-range descriptors, on both sides. */
+        KT_EQ(r, fd_dup2(fd, (i32)SYS_FDS_MAX), SYS_EBADF);
+        KT_EQ(r, fd_dup2(fd, -1), SYS_EBADF);
+
+        KT_EQ(r, fd_close(fd), 0);
+        /* Closing twice is EBADF, not a double free: fd_close clears the
+         * table slot before dropping the reference. */
+        KT_EQ(r, fd_close(fd), SYS_EBADF);
+    }
+
+    /* --- the bounds a hostile caller would probe ----------------------- */
+    KT_ASSERT(r, fd_get(-1) == NULL);
+    KT_ASSERT(r, fd_get((i32)SYS_FDS_MAX) == NULL);
+    KT_ASSERT(r, fd_get(0x7FFFFFFF) == NULL);
+    KT_EQ(r, fd_read(-1, (char[4]){0}, 4), SYS_EBADF);
+    KT_EQ(r, fd_write((i32)SYS_FDS_MAX, "x", 1), SYS_EBADF);
+    KT_EQ(r, fd_seek(99, 0, SEEK_SET), SYS_EBADF);
+    KT_EQ(r, fd_close(99), SYS_EBADF);
+    KT_EQ(r, fd_dup(99), SYS_EBADF);
+
+    /* An unknown whence is refused even on a seekable descriptor. */
+    i32 zfd = fd_open("/dev/zero", O_RDONLY);
+
+    if (zfd >= 0) {
+        KT_EQ(r, fd_seek(zfd, 0, 99), SYS_EINVAL);
+        KT_EQ(r, fd_close(zfd), 0);
+    }
+
+    /* --- exhausting the descriptor table, and recovering -------------- */
+    log_expect_errors(true);
+    {
+        i32 held[SYS_FDS_MAX];
+        u32 got = 0;
+
+        for (u32 i = 0; i < SYS_FDS_MAX; i++) {
+            held[i] = fd_open("/dev/null", O_RDONLY);
+            if (held[i] < 0)
+                break;
+            got++;
+        }
+
+        /* The next one must fail cleanly rather than overrun the table. */
+        KT_EQ(r, fd_open("/dev/null", O_RDONLY), SYS_EMFILE);
+
+        for (u32 i = 0; i < got; i++)
+            KT_EQ(r, fd_close(held[i]), 0);
+
+        /* And the table is usable again - an EMFILE that leaked the open
+         * file behind it would have consumed pool slots permanently, which
+         * is precisely what a ring-3 loop would exploit. */
+        KT_EQ(r, vfs_open_count(), open_before);
+
+        i32 again = fd_open("/dev/null", O_RDONLY);
+
+        KT_ASSERT(r, again >= 0);
+        if (again >= 0)
+            KT_EQ(r, fd_close(again), 0);
+    }
+    log_expect_errors(false);
+
+    /* --- the filesystem, through the same interface -------------------- */
+    if (!fat16_mounted()) {
+        /* The GRUB ISO path. The backend is registered but has nothing
+         * mounted, and must say so rather than dereference it. */
+        log_expect_errors(true);
+        KT_EQ(r, fd_open("/bin/INIT", O_RDONLY), SYS_ENOENT);
+        log_expect_errors(false);
+
+        /* /dev still works, which is the reason the VFS comes up whether or
+         * not a disk mounted. */
+        i32 c = fd_open("/dev/console", O_WRONLY);
+
+        KT_ASSERT(r, c >= 0);
+        if (c >= 0)
+            KT_EQ(r, fd_close(c), 0);
+
+        KT_EQ(r, vfs_open_count(), open_before);
+        return;
+    }
+
+    i32 ffd = fd_open("/bin/init", O_RDONLY);
+
+    KT_ASSERT(r, ffd >= 0);
+
+    if (ffd >= 0) {
+        struct sys_stat st;
+        u8 hdr[4];
+
+        KT_EQ(r, fd_stat(ffd, &st), 0);
+        KT_EQ(r, st.type, (unsigned)S_TYPE_FILE);
+        KT_ASSERT(r, st.size > 0);
+        KT_ASSERT(r, st.blocks > 0);
+
+        /* It is an ELF, read through the VFS rather than through fat16_read
+         * directly - which is what proves the two layers are actually
+         * connected. */
+        KT_EQ(r, fd_read(ffd, hdr, 4), 4);
+        KT_EQ(r, hdr[0], 0x7Fu);
+        KT_EQ(r, hdr[1], (u8)'E');
+        KT_EQ(r, hdr[2], (u8)'L');
+        KT_EQ(r, hdr[3], (u8)'F');
+
+        /* The offset advanced, and seeking moves it. */
+        KT_EQ(r, fd_seek(ffd, 0, SEEK_CUR), 4);
+        KT_EQ(r, fd_seek(ffd, 0, SEEK_SET), 0);
+        KT_EQ(r, fd_seek(ffd, 0, SEEK_END), (i32)st.size);
+        KT_EQ(r, fd_read(ffd, hdr, 4), 0); /* at the end: EOF, not an error */
+
+        /* Seeks outside the file are refused, in both directions. */
+        KT_EQ(r, fd_seek(ffd, -1, SEEK_SET), SYS_EINVAL);
+        KT_EQ(r, fd_seek(ffd, (i32)st.size + 1, SEEK_SET), SYS_EINVAL);
+        KT_EQ(r, fd_seek(ffd, 1, SEEK_END), SYS_EINVAL);
+
+        /* A short read at the end of the file, which is the one place a
+         * short read is expected rather than an error. */
+        KT_EQ(r, fd_seek(ffd, (i32)st.size - 2, SEEK_SET), (i32)st.size - 2);
+        KT_EQ(r, fd_read(ffd, hdr, 4), 2);
+
+        /* The shared offset, demonstrated where there is one to share. */
+        i32 dfd = fd_dup(ffd);
+
+        KT_ASSERT(r, dfd >= 0);
+        if (dfd >= 0) {
+            KT_EQ(r, fd_seek(ffd, 8, SEEK_SET), 8);
+            /* Seen through the other descriptor, because both point at one
+             * open file. */
+            KT_EQ(r, fd_seek(dfd, 0, SEEK_CUR), 8);
+            KT_EQ(r, fd_close(dfd), 0);
+        }
+
+        /* Read-only, and specific about why. */
+        log_expect_errors(true);
+        KT_EQ(r, fd_write(ffd, "x", 1), SYS_EINVAL); /* opened O_RDONLY */
+        KT_EQ(r, fd_open("/bin/init", O_WRONLY), SYS_EROFS);
+        KT_EQ(r, fd_open("/newfile.txt", O_WRONLY | O_CREAT), SYS_EROFS);
+        KT_EQ(r, vfs_unlink("/BIN/INIT"), SYS_EROFS);
+        KT_EQ(r, vfs_mkdir("/NEWDIR"), SYS_EROFS);
+        log_expect_errors(false);
+
+        KT_EQ(r, fd_close(ffd), 0);
+    }
+
+    /* A directory on disk, listed through the same getdent as /dev. */
+    i32 dfd = fd_open("/bin", O_RDONLY | O_DIRECTORY);
+
+    KT_ASSERT(r, dfd >= 0);
+
+    if (dfd >= 0) {
+        struct sys_dirent de;
+        bool found_init = false;
+        u32 i = 0;
+
+        while (fd_getdent(dfd, i, &de) == 1 && i < 64) {
+            if (strcasecmp(de.name, "INIT") == 0)
+                found_init = true;
+            i++;
+        }
+
+        KT_ASSERT(r, i > 0);
+        KT_ASSERT(r, found_init);
+        KT_EQ(r, fd_read(dfd, (char[8]){0}, 8), SYS_EISDIR);
+        KT_EQ(r, fd_close(dfd), 0);
+    }
+
+    /* A file opened with O_DIRECTORY, and a directory read as a file: the
+     * two type confusions the flag exists to prevent. */
+    log_expect_errors(true);
+    KT_EQ(r, fd_open("/bin/init", O_RDONLY | O_DIRECTORY), SYS_ENOTDIR);
+    KT_EQ(r, fd_open("/nosuchfile", O_RDONLY), SYS_ENOENT);
+    KT_EQ(r, fd_open("/bin/nosuchfile", O_RDONLY), SYS_ENOENT);
+    log_expect_errors(false);
+
+    /* --- stat by path, and the working directory ----------------------- */
+    struct sys_stat st;
+
+    KT_EQ(r, vfs_stat("/BIN", &st), 0);
+    KT_EQ(r, st.type, (unsigned)S_TYPE_DIR);
+    KT_EQ(r, vfs_stat("/BIN/INIT", &st), 0);
+    KT_EQ(r, st.type, (unsigned)S_TYPE_FILE);
+    KT_EQ(r, vfs_stat("/DEV/NULL", &st), 0);
+    KT_EQ(r, st.type, (unsigned)S_TYPE_CHAR);
+
+    log_expect_errors(true);
+    KT_EQ(r, vfs_stat("/NOSUCH", &st), SYS_ENOENT);
+    log_expect_errors(false);
+
+    /* chdir changes what a relative path means, and refuses a non-directory
+     * rather than leaving the process somewhere that cannot be listed. */
+    KT_EQ(r, fd_chdir("/bin"), 0);
+    KT_ASSERT(r, strcmp(fd_cwd(), "/BIN") == 0);
+
+    i32 rel = fd_open("init", O_RDONLY);
+
+    KT_ASSERT(r, rel >= 0);
+    if (rel >= 0)
+        KT_EQ(r, fd_close(rel), 0);
+
+    KT_EQ(r, fd_chdir(".."), 0);
+    KT_ASSERT(r, strcmp(fd_cwd(), "/") == 0);
+
+    log_expect_errors(true);
+    KT_EQ(r, fd_chdir("/bin/init"), SYS_ENOTDIR);
+    KT_EQ(r, fd_chdir("/nosuchdir"), SYS_ENOENT);
+    log_expect_errors(false);
+
+    /* The failed chdirs left the working directory alone. */
+    KT_ASSERT(r, strcmp(fd_cwd(), "/") == 0);
+
+    /* Nothing leaked across the whole suite. */
+    KT_EQ(r, vfs_open_count(), open_before);
+}
+
 static const struct ktest tests[] = {
     {"string", "string and formatting primitives", test_string},
     {"boot", "boot protocol normalisation", test_boot},
@@ -2339,6 +2824,7 @@ static const struct ktest tests[] = {
      test_hardening},
     {"storage", "ATA PIO reads and the MBR partition table", test_storage},
     {"fs", "FAT16: geometry, paths, cluster chains", test_filesystem},
+    {"vfs", "path resolution, open files, descriptors", test_vfs},
     {"smp", "ACPI, the local APIC, per-CPU state, locks, IPIs", test_smp},
     {"bootpd", "the AP bootstrap page directory", test_bootstrap_pd},
     {"longmode", "the 32 -> 64 -> 32 mode transition", test_longmode},

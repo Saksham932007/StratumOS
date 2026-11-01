@@ -242,6 +242,12 @@ struct task *task_create(const char *name, task_entry_t entry, void *arg)
     t->user = false;
     t->resources_freed = false;
     t->parent_pid = current ? current->pid : 0;
+    /* An empty table and a working directory of "/". A kernel thread does not
+     * get descriptors 0-2 opened for it: it has kprintf, and giving it a
+     * console descriptor it never uses would hold an open-file slot for the
+     * life of the kernel. usermode_task() opens them for a process that is
+     * about to enter ring 3, where there is no kprintf. */
+    fd_table_init(&t->files);
     /* A kernel thread shares the kernel's address space; there is nothing
      * private for it to see. */
     t->page_dir = vmm_kernel_pd_phys();
@@ -527,6 +533,18 @@ NORETURN void task_exit(int code)
 
     pr_debug("pid %u \"%s\" exited with %d", current->pid, current->name, code);
 
+    /* Descriptors go first, and they go here rather than in the reaper.
+     * Closing one can run backend code - freeing a FAT handle, sending a FIN
+     * on a socket - and that code is entitled to assume it is running as the
+     * process that owns the descriptor. The reaper runs as the idle task, in
+     * a different address space, so a close from there would be doing that
+     * work on behalf of a process that no longer exists.
+     *
+     * Interrupts are still on at this point, deliberately: a close may need
+     * to take a lock or touch a device, and doing it inside the IRQ-off
+     * window below would extend that window by however long a flush takes. */
+    fd_table_close_all(&current->files);
+
     bool irqs = irq_save();
     current->exit_code = code;
     current->state = TASK_ZOMBIE;
@@ -607,6 +625,13 @@ int task_fork(const struct regs *parent_frame)
     child->exit_code = 0;
     child->user = parent->user;
     child->resources_freed = false;
+
+    /* The child's table points at the parent's open files, one new reference
+     * each. That sharing is the whole behaviour of fork over descriptors: the
+     * file *position* is shared, so a parent and child appending to the same
+     * descriptor advance one offset between them instead of overwriting each
+     * other. Copying the open files instead would be easier and wrong. */
+    fd_table_clone(&child->files, &parent->files);
 
     /* Build the child's kernel stack so that the first context switch into it
      * restores a copy of the parent's trap frame and returns to user space.

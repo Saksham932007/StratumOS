@@ -46,6 +46,7 @@
 #include <mm/vmm.h>
 
 #include <fs/fat16.h>
+#include <fs/vfs.h>
 
 /* Produced by objcopy from the per-program ELFs under build/user - see the
  * Makefile. */
@@ -247,6 +248,21 @@ static void usermode_task(void *arg)
     pr_info("user stack mapped %p-%p",
             (void *)(USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE),
             (void *)USER_STACK_TOP);
+
+    /* Descriptors 0, 1 and 2 on the console, before the entry point runs.
+     * This is what makes write(1, ...) from ring 3 work without the kernel
+     * knowing anything about the number 1 - the program is genuinely holding
+     * an open file, and the same write() that reaches it reaches a file on
+     * disk when the descriptor points at one.
+     *
+     * A failure here is a failure to start the process, not a warning. A
+     * program whose stdout is closed would write into an error return it has
+     * no way to report. */
+    if (!fd_table_open_std(&self->files)) {
+        pr_err("pid %u: cannot open stdin/stdout/stderr", self->pid);
+        elf_unload_user(&loaded);
+        task_exit(1);
+    }
 
     /* The CPU finds the ring-0 stack to switch to on a trap in the TSS, so it
      * must point at *this* task's kernel stack before we leave ring 0. Get

@@ -13,6 +13,12 @@
 
 #include <kernel/types.h>
 
+/* For `struct task_files`, which is embedded in every task by value. The
+ * dependency runs this way round - sched.h includes the VFS, not the other
+ * way - because the VFS owns what a descriptor table contains and the
+ * scheduler only owns its lifetime. */
+#include <fs/vfs.h>
+
 #define TASK_NAME_MAX   24
 #define TASK_MAX        32
 #define TASK_STACK_SIZE (16 * KIB)
@@ -51,6 +57,12 @@ struct task {
      * The slot itself stays ZOMBIE until a parent collects the exit code -
      * which is what a zombie process is. */
     bool resources_freed;
+    /* Open descriptors and the working directory. Duplicated by fork,
+     * preserved across exec, and closed in task_exit() rather than by the
+     * reaper - a descriptor has to be released from the context that owns it,
+     * because closing one can mean flushing a file or shutting down a
+     * connection, and neither is something to do from another task's stack. */
+    struct task_files files;
     struct task *next;
 };
 

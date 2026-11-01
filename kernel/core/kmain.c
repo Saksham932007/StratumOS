@@ -59,6 +59,7 @@
 
 #include <fs/blockdev.h>
 #include <fs/fat16.h>
+#include <fs/vfs.h>
 #include <net/net.h>
 
 /* QEMU `isa-debug-exit` turns a port write into a process exit status of
@@ -484,6 +485,17 @@ void kmain(u32 magic, u32 info_addr)
         log_boot_step("filesystem", true,
                       "none present; using the embedded programs");
     }
+
+    /* The VFS goes up whether or not a disk mounted, and that ordering is the
+     * point: /dev does not live on a disk, so a kernel booted from the GRUB
+     * ISO - which has no FAT partition at all - still has a console to open
+     * descriptors 0, 1 and 2 on. Registering the FAT backend when nothing is
+     * mounted is harmless; its open() answers ENOENT until something is. */
+    vfs_init();
+    devfs_init();
+    fatfs_init();
+    log_boot_step("vfs", true,
+                  fat16_mounted() ? "devfs + fat16" : "devfs only");
 
     /* 11. Tasks, then the syscall gate they will use. */
     sched_init();

@@ -89,7 +89,7 @@ static u32 nasty_length(void)
     case 1:
         return 1;
     case 2:
-        return 1024; /* exactly SYS_WRITE_MAX                            */
+        return 1024; /* exactly SYS_IO_MAX                               */
     case 3:
         return 1025; /* one past it                                      */
     case 4:
@@ -117,6 +117,115 @@ static u32 nasty_length(void)
  * them before it reads a byte, so they print nothing either way. */
 static const char legit[] = ".";
 
+/* ---- descriptors, and why the generator had to learn about them --------
+ *
+ * When write() took a buffer and a length, every argument this file produces
+ * could go straight into it. write() now takes a descriptor first, and a
+ * nasty_pointer() in that position is an enormous integer - which the kernel
+ * correctly refuses with EBADF before it looks at anything else.
+ *
+ * That is a passing test that proves nothing. The whole point of fuzzing
+ * write() is to reach the *copy*, with a bad pointer and a bad length, and a
+ * descriptor that is never valid means the copy is never reached. The first
+ * version of this file after the descriptor change still reported 40,000
+ * calls survived and had stopped testing the one thing it was written for.
+ *
+ * So the generator now knows which argument of which call is a descriptor,
+ * and supplies a real one most of the time. The refusal path did not get
+ * weaker: an invalid descriptor is still generated, just not every time.
+ */
+/* Descriptors this program opens for itself, so that read() has somewhere to
+ * read *from* that cannot block.
+ *
+ * STDIN is deliberately not in the pool, and the reason is worth recording.
+ * read(0, ...) on the console blocks until a key arrives - correctly, that is
+ * what a console read is - and this fuzzer runs with nobody at the keyboard.
+ * The first version of this file after the descriptor change included STDIN,
+ * and the run did not fail: it stopped, 300 calls in, inside a blocking read,
+ * and sat there until the harness timed out. A fuzzer wedged on correct
+ * behaviour is indistinguishable from a kernel that hung.
+ *
+ * So blocking console reads are outside what this fuzzer can cover, which is
+ * a real gap and is listed as one in docs/FUZZING.md. What it covers instead
+ * is read() against a character device that always has bytes (/dev/zero) and
+ * against a regular file on disk, which between them reach the same copy path
+ * with the same bad pointers and bad lengths.
+ */
+static int fd_zero = -1;
+static int fd_file = -1;
+static int fd_dir = -1;
+
+static void open_targets(void)
+{
+    fd_zero = sys_open("/dev/zero", O_RDONLY);
+    fd_file = sys_open("/bin/INIT", O_RDONLY);
+    fd_dir = sys_open("/bin", O_RDONLY | O_DIRECTORY);
+}
+
+/* The generator is allowed to close these - closing a descriptor that really
+ * is open is a case worth covering, and so is every call that then gets
+ * EBADF for it. But if they stayed closed the read() coverage above would
+ * quietly stop after the first few hundred iterations, so they are reopened
+ * at each progress report. The close is unconditional: on an already-closed
+ * descriptor it is an EBADF this program ignores, which costs one system
+ * call and avoids having to track which of them are still live. */
+static void refresh_targets(void)
+{
+    (void)sys_close(fd_zero);
+    (void)sys_close(fd_file);
+    (void)sys_close(fd_dir);
+
+    open_targets();
+}
+
+static int nasty_fd(void)
+{
+    switch (next() % 10) {
+    case 0:
+        return STDOUT_FD; /* valid, and the one that reaches the copy    */
+    case 1:
+        return STDERR_FD;
+    case 2:
+        return fd_zero; /* readable, never blocks                       */
+    case 3:
+        return fd_file; /* a real file: seekable, finite                 */
+    case 4:
+        return fd_dir; /* a directory: read() must refuse it            */
+    case 5:
+        return -1; /* negative, so an index would be below the table    */
+    case 6:
+        return 31; /* SYS_FDS_MAX - 1: in range, nothing open there     */
+    case 7:
+        return 32; /* exactly SYS_FDS_MAX, the off-by-one               */
+    case 8:
+        return (int)0x7FFFFFFF;
+    default:
+        return (int)(next() % 40);
+    }
+}
+
+/* Is this call's first argument a descriptor? Spelled out as a list rather
+ * than inferred from a range, because the numbering is not going to stay
+ * contiguous and a range check would quietly rot. */
+static int takes_fd_first(u32 nr)
+{
+    switch (nr) {
+    case SYS_WRITE:
+    case SYS_READ:
+    case SYS_CLOSE:
+    case SYS_LSEEK:
+    case SYS_FSTAT:
+    case SYS_GETDENT:
+    case SYS_DUP:
+    case SYS_DUP2:
+    case SYS_IOCTL:
+    case SYS_TRUNCATE:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 #define ITERATIONS     40000
 
 /* How often to report, in iterations. A power of two so the test is an AND. */
@@ -127,6 +236,22 @@ void _start(void)
     u_puts("  [fuzz] ring-3 syscall fuzzer: ");
     u_putu(ITERATIONS);
     u_puts(" calls, deterministic seed\n");
+
+    open_targets();
+
+    /* Reported rather than asserted. On the GRUB ISO path there is no FAT
+     * partition, so /bin/INIT genuinely is not there and fd_file is an
+     * error code - which nasty_fd() will then hand to the kernel as an
+     * invalid descriptor, which is a perfectly good thing to fuzz with. The
+     * line exists so that a transcript shows which targets the run actually
+     * had, instead of leaving "read() was covered" as an assumption. */
+    u_puts("  [fuzz] targets: /dev/zero=");
+    u_putu((u32)fd_zero);
+    u_puts(" /bin/INIT=");
+    u_putu((u32)fd_file);
+    u_puts(" /bin=");
+    u_putu((u32)fd_dir);
+    u_puts("\n");
 
     u32 refused = 0, accepted = 0;
 
@@ -151,9 +276,39 @@ void _start(void)
         u32 b = nasty_length();
         u32 c = next();
 
+        /* Put a descriptor where a descriptor goes. Without this every
+         * descriptor call is an immediate EBADF and the code behind it is
+         * never entered - see takes_fd_first() for what that cost. */
+        if (takes_fd_first(nr)) {
+            int fd = nasty_fd();
+
+            /* close() and dup2() are the two that can destroy this program's
+             * own stdout, and a fuzzer that silences itself "passes" by
+             * being invisible for the remaining 39,000 iterations. They are
+             * still aimed at every other descriptor, valid and invalid - the
+             * three standard ones are simply shifted out of range, which
+             * exercises the bounds check instead. The same reasoning as
+             * exit() and fork() above: a call that makes the rest of the run
+             * unreachable is not testing the kernel, it is ending the test.
+             *
+             * dup2's *second* argument is a descriptor too, and it is left
+             * entirely as generated: dup2(bad, 1) is refused on the first
+             * argument before the second is looked at, which is exactly the
+             * ordering worth confirming. */
+            if ((nr == SYS_CLOSE || nr == SYS_DUP2) && fd >= 0 && fd <= 2)
+                fd += 8;
+
+            a = (u32)fd;
+
+            /* The pointer moves to the second argument, where read(), write()
+             * and the stat calls actually expect it. */
+            b = nasty_pointer();
+            c = nasty_length();
+        }
+
         /* See `legit` above. Both the pointer and the length are replaced,
          * not just the length: sys_write() *clamps* an oversized length to
-         * SYS_WRITE_MAX rather than refusing it - which is a legitimate short
+         * SYS_IO_MAX rather than refusing it - which is a legitimate short
          * write, and which the first version of this guard got wrong by
          * assuming a length of 0xFFFFFFFF would be rejected. It is not; it
          * becomes 1024 and prints 1024 bytes.
@@ -161,9 +316,9 @@ void _start(void)
          * The rejection path is still covered, and by more of the generator
          * than before: every other pointer it produces is refused with the
          * length it was given. */
-        if (nr == SYS_WRITE && (a == 0x00400000u || a == 0xAFFFF000u)) {
-            a = (u32)(unsigned long)legit;
-            b = sizeof(legit) - 1;
+        if (nr == SYS_WRITE && (b == 0x00400000u || b == 0xAFFFF000u)) {
+            b = (u32)(unsigned long)legit;
+            c = sizeof(legit) - 1;
         }
 
         i32 ret = syscall3(nr, a, b, c);
@@ -191,6 +346,8 @@ void _start(void)
             u_puts(" calls, uptime ");
             u_putu((u32)sys_uptime());
             u_puts(" s\n");
+
+            refresh_targets();
         }
     }
 

@@ -28,7 +28,7 @@ static void probe_kernel_pointer(void)
            "behalf\n");
 
     /* 0xC0100000 is where the kernel is linked. A correct kernel rejects it. */
-    if (sys_write((const char *)0xC0100000u, 16) == SYS_EFAULT)
+    if (sys_write(STDOUT_FD, (const char *)0xC0100000u, 16) == SYS_EFAULT)
         u_puts("  [ring3] kernel refused it (EFAULT) - the pointer check "
                "works\n");
     else
@@ -41,7 +41,7 @@ static void probe_unmapped_pointer(void)
     /* An address in our own half that nothing has mapped. The kernel must
      * notice that it is not present, not merely that it is below the kernel
      * boundary. */
-    if (sys_write((const char *)0x7F000000u, 8) == SYS_EFAULT)
+    if (sys_write(STDOUT_FD, (const char *)0x7F000000u, 8) == SYS_EFAULT)
         u_puts("  [ring3] unmapped user pointer also refused\n");
     else
         u_puts("  [ring3] WARNING: kernel accepted an unmapped pointer!\n");

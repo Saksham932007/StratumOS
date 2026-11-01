@@ -439,6 +439,38 @@ SHELL_SCRIPT: list[tuple[str, list[str]]] = [
     ("cat /etc/MOTD.TXT", [r"init=/bin/INIT"]),
     ("cat /nosuchfile", [r"no such file or directory"]),
     ("cat /bin", [r"is a directory"]),
+    # --- the VFS and the descriptor table ----------------------------------
+    ("selftest vfs", [r"ktest: vfs \.\.\. PASS"]),
+    # The assertion that the VFS is real rather than a rename of the FAT
+    # driver: /dev is a different filesystem, it is listed by the same `ls`,
+    # and nothing on it is on a disk. If these two listings ever diverge in
+    # format, one of them is not going through the interface.
+    ("ls /dev", [r"NAME\s+SIZE\s+TYPE", r"CONSOLE\s+0\s+char",
+                 r"ZERO\s+0\s+char", r"NULL\s+0\s+char",
+                 r"device\(s\)"]),
+    ("pwd", [r"\r?\n/\r?\n"]),
+    # A relative path resolves against the working directory, and ".." gets
+    # back. Checked as a sequence because each step only means something
+    # given the previous one.
+    ("cd /etc", []),
+    ("pwd", [r"\r?\n/ETC\r?\n"]),
+    ("cat MOTD.TXT", [r"init=/bin/INIT"]),
+    ("cd ..", []),
+    ("pwd", [r"\r?\n/\r?\n"]),
+    ("cd /bin/INIT", [r"not a directory"]),
+    ("cd /nosuchdir", [r"no such file or directory"]),
+    # The working directory survived both failures.
+    ("pwd", [r"\r?\n/\r?\n"]),
+    # A character device read through the same read() a file uses, bounded by
+    # the shell rather than by an end of file - /dev/zero does not have one.
+    ("cat /dev/zero", [r"stopped after 65536 bytes"]),
+    # The pool is a fixed array, so "nothing leaked" is a number that can be
+    # asserted. Everything the script opened above has been closed, so the
+    # count has to be back to zero - and the peak has to be non-zero, or
+    # nothing was ever opened and the rest of this is meaningless.
+    ("fds", [r"open files : 0 of 96 in use, peak [1-9]",
+             r"vfs calls  : \d+", r"cwd        : /",
+             r"fat16      : \d+ open\(s\)"]),
     ("stress 2 40", [r"heap integrity: consistent"]),
     ("ring3", [r"\[ring3\] hello from user mode",
                r"\[ring3\] calling exit\(0\)"]),
@@ -467,6 +499,21 @@ SYSCALL_FUZZ_EXPECTED = [
     ("iteration count announced",
      r"\[fuzz\] ring-3 syscall fuzzer: \d+ calls, deterministic seed"),
     ("the run advanced", r"\[fuzz\] \d+ calls, uptime \d+ s"),
+    # The descriptors the fuzzer opened for itself. Asserted because read()
+    # coverage depends on them: with no valid descriptor every read is an
+    # immediate EBADF and the copy path behind it is never entered, which is
+    # a silent loss of exactly the coverage this scenario exists for. The
+    # numbers are not pinned - on the ISO path /bin/INIT is absent and its
+    # descriptor is an error code, which is itself worth fuzzing with.
+    ("the fuzzer opened its own read targets",
+     r"\[fuzz\] targets: /dev/zero=\d+ /bin/INIT=\d+ /bin=\d+"),
+    # A ring-3 pointer into the program's own read-only text, handed to a
+    # call that writes through it. This used to panic the kernel:
+    # user_range_ok() checked present+user and not writable, and CR0.WP makes
+    # the resulting ring-0 store a kernel fault. The refusal line is the
+    # regression test.
+    ("a read-only user buffer is refused rather than faulting",
+     r"passed an unwritable buffer 0x0040\d+\+\d+ to read"),
     # Both counts must be non-zero: all-refused would mean the generator never
     # produced a valid call, and all-accepted would mean the kernel never
     # refused one. Either way the run proved nothing.

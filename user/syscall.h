@@ -23,9 +23,112 @@ static inline i32 syscall3(u32 nr, u32 a, u32 b, u32 c)
     return ret;
 }
 
-static inline i32 sys_write(const char *s, u32 len)
+/* ---- descriptors --------------------------------------------------------
+ *
+ * write() takes a descriptor now. It did not before: there was one possible
+ * destination, the console, and the call took only a buffer and a length.
+ * Every program here was updated in the same commit, and that is the whole
+ * migration - there is no binary compatibility to keep, which is exactly
+ * what makes changing the shape of call number 1 a reasonable thing to do
+ * rather than a breaking change to apologise for.
+ */
+static inline i32 sys_write(int fd, const void *buf, u32 len)
 {
-    return syscall3(SYS_WRITE, (u32)s, len, 0);
+    return syscall3(SYS_WRITE, (u32)fd, (u32)buf, len);
+}
+
+static inline i32 sys_read(int fd, void *buf, u32 len)
+{
+    return syscall3(SYS_READ, (u32)fd, (u32)buf, len);
+}
+
+static inline i32 sys_open(const char *path, u32 flags)
+{
+    return syscall3(SYS_OPEN, (u32)path, flags, 0);
+}
+
+static inline i32 sys_close(int fd)
+{
+    return syscall3(SYS_CLOSE, (u32)fd, 0, 0);
+}
+
+static inline i32 sys_lseek(int fd, i32 offset, int whence)
+{
+    return syscall3(SYS_LSEEK, (u32)fd, (u32)offset, (u32)whence);
+}
+
+static inline i32 sys_stat(const char *path, struct sys_stat *st)
+{
+    return syscall3(SYS_STAT, (u32)path, (u32)st, 0);
+}
+
+static inline i32 sys_fstat(int fd, struct sys_stat *st)
+{
+    return syscall3(SYS_FSTAT, (u32)fd, (u32)st, 0);
+}
+
+/* Read one directory entry by index. Returns 1 when `out` was filled, 0 at
+ * the end of the directory, or a negative error. An index rather than an
+ * opaque cookie, because the underlying driver's own iteration is by index -
+ * see fs/fat16.h on why that is stable for a given filesystem. */
+static inline i32 sys_getdent(int fd, u32 index, struct sys_dirent *out)
+{
+    return syscall3(SYS_GETDENT, (u32)fd, index, (u32)out);
+}
+
+static inline i32 sys_dup(int fd)
+{
+    return syscall3(SYS_DUP, (u32)fd, 0, 0);
+}
+
+static inline i32 sys_dup2(int oldfd, int newfd)
+{
+    return syscall3(SYS_DUP2, (u32)oldfd, (u32)newfd, 0);
+}
+
+static inline i32 sys_ioctl(int fd, u32 request, u32 arg)
+{
+    return syscall3(SYS_IOCTL, (u32)fd, request, arg);
+}
+
+static inline i32 sys_chdir(const char *path)
+{
+    return syscall3(SYS_CHDIR, (u32)path, 0, 0);
+}
+
+static inline i32 sys_getcwd(char *buf, u32 len)
+{
+    return syscall3(SYS_GETCWD, (u32)buf, len, 0);
+}
+
+static inline i32 sys_unlink(const char *path)
+{
+    return syscall3(SYS_UNLINK, (u32)path, 0, 0);
+}
+
+static inline i32 sys_mkdir(const char *path)
+{
+    return syscall3(SYS_MKDIR, (u32)path, 0, 0);
+}
+
+static inline i32 sys_rmdir(const char *path)
+{
+    return syscall3(SYS_RMDIR, (u32)path, 0, 0);
+}
+
+static inline i32 sys_rename(const char *from, const char *to)
+{
+    return syscall3(SYS_RENAME, (u32)from, (u32)to, 0);
+}
+
+static inline i32 sys_truncate(int fd, u32 length)
+{
+    return syscall3(SYS_TRUNCATE, (u32)fd, length, 0);
+}
+
+static inline i32 sys_sync(void)
+{
+    return syscall3(SYS_SYNC, 0, 0, 0);
 }
 
 static inline i32 sys_getpid(void)
@@ -98,7 +201,32 @@ static inline u32 u_strlen(const char *s)
 
 static inline void u_puts(const char *s)
 {
-    (void)sys_write(s, u_strlen(s));
+    (void)sys_write(STDOUT_FD, s, u_strlen(s));
+}
+
+static inline void u_eputs(const char *s)
+{
+    (void)sys_write(STDERR_FD, s, u_strlen(s));
+}
+
+/* Write all of a buffer, looping over short writes. The kernel caps one
+ * transfer at a kilobyte, so anything larger comes back short - and a program
+ * that ignored that would silently truncate its own output. */
+static inline i32 u_write_all(int fd, const void *buf, u32 len)
+{
+    const char *p = buf;
+    u32 done = 0;
+
+    while (done < len) {
+        i32 n = sys_write(fd, p + done, len - done);
+
+        if (n <= 0)
+            return n < 0 ? n : (i32)done;
+
+        done += (u32)n;
+    }
+
+    return (i32)done;
 }
 
 static inline void u_putu(u32 v)
