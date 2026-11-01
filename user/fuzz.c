@@ -269,9 +269,34 @@ void _start(void)
         if (nr == SYS_EXIT || nr == SYS_FORK)
             nr = SYS_GETPID;
 
-        /* sleep() with a random argument would spend the whole run asleep -
-         * the kernel bounds it to 10 seconds, which is correct and is not
-         * something to do 40,000 times. */
+        /* The calls whose *correct* behaviour is to wait.
+         *
+         * sleep() with a random argument would spend the whole run asleep;
+         * the kernel bounds it to ten seconds, which is right and is not
+         * something to do 40,000 times. The same reasoning applies to three
+         * socket calls and to resolve(): connect() to an unreachable address
+         * waits for the handshake, accept() waits for a peer, recv() waits
+         * for data, and resolve() waits for a nameserver. Every one of those
+         * is bounded by the kernel and every one of them is seconds, so a
+         * generator that aimed at them would spend the run waiting rather
+         * than testing - the fuzz run that first included them produced
+         * about a thousand calls in three minutes and then looked like a
+         * hang.
+         *
+         * They are *not* exempt from the boundary checks that matter: the
+         * pointer validation on their arguments is reached through
+         * sendto/recvfrom/bind/getsockopt, which are in the generator and do
+         * not block. What is excluded is the waiting, not the checking.
+         *
+         * It is worth saying what the first run of this fuzzer against those
+         * calls was worth, because it was not nothing: it is what found that
+         * a ring-3 program could make one system call emit a DNS query and
+         * block for five seconds, which is now rate-limited and bounded at
+         * 1.5 seconds in sys_resolve(). */
+        if (nr == SYS_CONNECT || nr == SYS_ACCEPT || nr == SYS_RECV ||
+            nr == SYS_RESOLVE)
+            nr = SYS_GETSOCKOPT;
+
         u32 a = (nr == SYS_SLEEP) ? (next() % 2) : nasty_pointer();
         u32 b = nasty_length();
         u32 c = next();

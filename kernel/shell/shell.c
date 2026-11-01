@@ -54,6 +54,7 @@
 #include <fs/vfs.h>
 #include <net/inet.h>
 #include <net/net.h>
+#include <net/socket.h>
 
 #define PROMPT "stratum> "
 
@@ -1904,39 +1905,37 @@ static int cmd_programs(int argc, char **argv)
 /* Run the ring-3 syscall fuzzer. It is a program like any other, so this
  * just execs it into a child - which is also a demonstration that the fuzzer
  * needs no privilege the shell does not already have. */
-static int cmd_fuzz(int argc, char **argv)
+/* Run a named program in ring 3 and wait for that pid specifically. Factored
+ * out of cmd_fuzz when a second command needed the same thing: the shell may
+ * have other collectable children - `stress` and `ring3` both leave some - so
+ * a bare wait() could return one of those instead.
+ *
+ * The bound is on how many *other* children get collected first, not on time:
+ * task_wait() blocks, so each iteration makes progress. 64 is more children
+ * than any shell command creates, and reaching it would mean wait() is
+ * returning pids nobody asked for. */
+static int run_user_program(const char *name, const char *what)
 {
-    UNUSED(argc);
-    UNUSED(argv);
-
-    u32 pid = usermode_spawn_named("fuzz");
+    u32 pid = usermode_spawn_named(name);
 
     if (!pid) {
-        kprintf("could not start the syscall fuzzer\n");
+        kprintf("could not start %s\n", what);
         return 1;
     }
 
-    kprintf("syscall fuzzer started as pid %u; its output follows\n", pid);
+    kprintf("%s started as pid %u; its output follows\n", what, pid);
 
-    /* Wait for that process specifically. The shell may have other
-     * collectable children - `stress` and `ring3` both leave some - so a bare
-     * wait() could return one of those instead.
-     *
-     * The bound is on how many *other* children get collected first, not on
-     * time: task_wait() blocks, so each iteration makes progress. 64 is more
-     * children than any shell command creates, and reaching it would mean
-     * wait() is returning pids nobody asked for. */
     for (u32 others = 0; others < 64; others++) {
         int status = 0;
         int got = task_wait(&status);
 
         if (got < 0) {
-            kprintf("the fuzzer vanished without exiting\n");
+            kprintf("%s vanished without exiting\n", what);
             return 1;
         }
 
         if ((u32)got != pid)
-            continue; /* someone else's zombie; keep waiting */
+            continue;
 
         kprintf("pid %u exited with %d\n", pid, status);
         return status == 0 ? 0 : 1;
@@ -1945,6 +1944,72 @@ static int cmd_fuzz(int argc, char **argv)
     kprintf("gave up waiting for pid %u after collecting 64 other children\n",
             pid);
     return 1;
+}
+
+static int cmd_netcat(int argc, char **argv)
+{
+    UNUSED(argc);
+    UNUSED(argv);
+
+    if (!net_up()) {
+        kprintf("no network, or the link is down\n");
+        return 1;
+    }
+
+    /* The echo services are what it talks to, so a kernel with them turned
+     * off would see every step fail for a reason that has nothing to do with
+     * sockets. Said here rather than left to the program's own error
+     * numbers. */
+    if (!tcp_listen_port() || !udp_echo_port()) {
+        kprintf("the echo services are off; this program talks to them\n");
+        return 1;
+    }
+
+    return run_user_program("netcat", "the ring-3 socket program");
+}
+
+static int cmd_sockets(int argc, char **argv)
+{
+    UNUSED(argc);
+    UNUSED(argv);
+
+    const struct socket_stats *st = socket_get_stats();
+
+    kprintf("open      : %u of %u\n", socket_count(), (u32)SOCKET_MAX);
+    kprintf("lifetime  : %u created, %u closed; %u bind(s), %u listen "
+            "accept(s), %u connect(s)\n",
+            st->created, st->closed, st->binds, st->accepts, st->connects);
+    kprintf("bytes     : %u sent, %u received\n", st->bytes_sent,
+            st->bytes_received);
+    /* The number that says how much of this is polling rather than waiting.
+     * See net/socket.h: there is no wait queue, so a blocking call spins the
+     * network and sleeps, and this counts how often it had to. */
+    kprintf("waits     : %u blocking call(s) had to wait for the network\n",
+            st->blocking_waits);
+
+    if (!socket_count())
+        return 0;
+
+    kprintf("%-4s %-11s %-12s %s\n", "TYPE", "LOCAL", "STATE", "PEER");
+
+    for (u32 i = 0;; i++) {
+        char row[80];
+
+        if (!socket_describe(i, row, sizeof(row)))
+            break;
+
+        kprintf("%s\n", row);
+    }
+
+    return 0;
+}
+
+static int cmd_fuzz(int argc, char **argv)
+{
+    UNUSED(argc);
+    UNUSED(argv);
+
+    return run_user_program("fuzz", "syscall fuzzer");
 }
 
 static int cmd_ring3(int argc, char **argv)
@@ -2376,6 +2441,9 @@ static const struct shell_command commands[] = {
      "resolver and its cache",
      cmd_dns},
     {"fetch", "fetch <url> [-h]", "fetch an http:// URL over TCP", cmd_fetch},
+    {"sockets", "sockets", "open sockets, and what the socket layer has done",
+     cmd_sockets},
+    {"netcat", "netcat", "exercise sockets from ring 3", cmd_netcat},
     {"longmode", "longmode", "enter 64-bit long mode, prove it, and return",
      cmd_longmode},
     {"ipi", "ipi", "ping every other processor and time a TLB shootdown",

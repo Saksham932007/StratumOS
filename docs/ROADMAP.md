@@ -21,9 +21,8 @@ Two new in-kernel suites (`vmspace`, `proc`, 56 assertions between them)
 and fifteen new CI expectations. Documented in
 [PROCESSES.md](PROCESSES.md).
 
-What it still lacks: `argv`, file descriptors, signals, and loading the
-image from a file rather than the embedded table — the last of which the
-filesystem work below has since fixed.
+What it still lacks: `argv` and signals. File descriptors and loading the
+image from a file have both since landed - see below.
 
 ### Hardening
 
@@ -200,30 +199,124 @@ intended to exercise opposite paths both reported the same check count. Both
 suite paths are now asserted by count, and there is a `no-network` scenario
 with `-nic none`.
 
-**What it deliberately does not have**, in rough order of how much it matters:
-congestion control (no slow start, no congestion window - the biggest
-omission, and the reason this is not a general-purpose TCP); out-of-order
-reassembly; IP fragment reassembly; a sockets API for ring 3; DHCP; a routing
+**What it deliberately does not have**, in rough order of how much it
+matters - as of the work below, which closed the first, the fourth and the
+fifth: out-of-order reassembly (the largest remaining gap: fast retransmit
+makes the *sender* side of a single loss cheap, and the receiver still costs a
+round trip per segment after the hole); IP fragment reassembly; a routing
 table beyond one gateway; window scaling, SACK and timestamps; ICMP error
-generation. Each has its reasoning in [NETWORK.md](NETWORK.md).
+generation; TLS, and therefore `https`. Each has its reasoning in
+[NETWORK.md](NETWORK.md).
+
+### File descriptors, and a VFS with three backends
+
+Landed after v0.13.0, and it was the item at the top of this list for a
+reason: there was no `open`, so there was nothing a descriptor could be, so
+`read` and `write` had nothing to name. Adding sockets without it would have
+meant a second parallel set of calls that happened to return small integers -
+which is to say a descriptor table, built twice, badly.
+
+Two refcounted layers: a per-process table of small integers, and a global
+pool of open files they point at. `dup` shares a position, `fork` duplicates
+the table and not the open files, and the last close is what releases. Both
+tables are fixed-size, so a ring-3 `open` loop hits EMFILE rather than the
+allocator.
+
+Three backends from the day it landed, which matters more than it sounds: an
+interface with one implementation is a guess about what varies. A FAT file is
+seekable and has a size, the console is neither, and a socket is a stream with
+no position at all - and every NULL entry in `struct vfs_ops` is a place the
+abstraction would have been wrong if it had been designed against files alone.
+
+The ring-3 fuzzer found a real bug immediately: `user_range_ok()` did not
+check writability, so a pointer into a program's own read-only `.text` passed
+validation and then faulted in ring 0, where `CR0.WP` makes it a panic. It had
+been latent since `wait()`'s status pointer.
+
+### A writable filesystem, from the ATA command up
+
+`ata_write` with the per-sector DRQ handshake and a cache flush, because a
+drive acknowledges a write once it is in its write-back cache and not once it
+is on the platter - and the whole difficulty of writing a filesystem is
+reasoning about exactly that ordering.
+
+FAT16 writing is crash-*ordered* rather than crash-safe, and the distinction
+is the honest part. Three structures have to agree afterwards and no two can
+be updated atomically, so the question is which order leaves the least damage:
+the allocation table first (both copies), then the data, then the directory
+entry. *The name is published last and withdrawn first.* A crash leaks
+clusters, which is repairable by a scan; the reverse order double-allocates
+them, which is two files silently sharing bytes.
+
+Verified against mtools, an independent FAT implementation, and the write
+tests are idempotent because six CI scenarios boot the same mutable image in
+sequence - leftover files would pass once and fail thereafter.
+
+### TCP that is not a demo, and a machine that is on the internet
+
+Landed together, because each of three gaps was blocked on the same thing: one
+connection. A sockets API needs a listener and an accepted connection at once;
+an outgoing connection needs the echo port still listening; and a congestion
+window on a stack that holds one connection cannot be tested against anything,
+because there is no second flow to be fair to.
+
+So: a connection table demultiplexed on the four-tuple, with handles that
+carry a generation counter so a handle to a reused slot is rejected rather
+than silently addressing a different peer. Then congestion control by RFC
+5681 - slow start, congestion avoidance, fast retransmit on three duplicate
+acknowledgements, fast recovery - and a retransmission timeout that is
+measured by Jacobson's estimator with the variance term, instead of the
+constant 500 ms it was. Karn's rule is why a retransmitted segment produces
+no sample.
+
+Then DHCP, DNS and an HTTP client, which are the whole distance between "the
+stack works" and "the machine is on the internet". Each turned out to be the
+first user of something underneath it that had never run: DHCP needed a
+broadcast output path and found that UDP verified every checksum against this
+machine's address rather than the datagram's own destination, so every
+broadcast reply failed silently. DNS needed bound ports with a receive queue.
+HTTP needed an active open, and found that `tcp_connect` reported failure
+whenever the first SYN could not be transmitted - which is always, on a cold
+ARP cache. A stack with a retransmission timer does not need its first
+transmission to succeed, and designing as if it does is how the timer comes to
+have an untested path.
+
+And sockets, which is now a short file: `read` is a receive, `write` is a
+send, `poll_read` is what makes a blocking receive work, and the three calls
+with no file equivalent - bind, listen, accept - are the only ones that needed
+anything new. That is the argument for having built the descriptor table
+first.
+
+Two things found along the way. A loopback path, because a controller does not
+receive its own transmissions and QEMU's user-mode networking does not reflect
+a frame sent to the guest's own address either: without it `ping` on one's own
+address times out, and a program that connects to a server it is itself
+running cannot work. It is a queue and not a direct call, so that a send from
+inside a receive cannot nest.
+
+And a receive-ring race in the e1000 driver that predated all of this.
+`e1000_poll()` derives its next descriptor from RDT and publishes by writing
+RDT forward, and it is called from both the interrupt handler and the poll
+loop. An interrupt landing inside the loop made the interrupted copy write a
+stale tail *backwards*, and a few of those wedged the ring with the head far
+ahead of the tail: receive stopped while transmit carried on working. It
+presented as a SYN retransmitted five times and never answered, on the third
+HTTP fetch of a run and never the first two. The guard is a flag rather than a
+lock, because the second entry is on the same processor and a lock would
+deadlock against itself - and its counter reads 30 on a run that does four
+fetches, so the race was happening constantly.
+
+`dns example.com` resolves and `fetch http://example.com/` downloads, over a
+chunked body. There is no TLS, so there is no `https`, and the refusal says
+so rather than quietly trying port 443: TLS is a certificate store, a chain
+validator and four primitives where being approximately right is the same as
+being broken.
 
 ---
 
 ## Next
 
-### 1. A sockets API, and therefore file descriptors
-
-The network stack has no way for a ring-3 program to use it, and the reason
-is not in the network stack: this kernel has no file descriptors. There is no
-`open`, so there is nothing a socket could be.
-
-So this is a process-model change that happens to be motivated by networking:
-a per-process descriptor table, `read`/`write`/`close` that dispatch on what
-the descriptor refers to, and then `socket`/`bind`/`listen`/`accept`/`connect`
-on top. It would make the filesystem usable from ring 3 at the same time,
-which is the other half of why it is first.
-
-### 2. Per-CPU run queues
+### 1. Per-CPU run queues
 
 The scheduler runs on the boot processor and the other processors idle. What
 remains is the part that makes four processors useful rather than merely
@@ -232,10 +325,10 @@ when one queue empties, a reschedule IPI, and every scheduler invariant
 re-examined for two processors entering it at once.
 
 It needs the local APIC timer first - the single 8254 cannot drive four
-processors - which is item 9 below, and that makes this the one item in this
+processors - which is item 7 below, and that makes this the one item in this
 list whose dependencies are not already in place.
 
-### 3. NX, and therefore real W^X
+### 2. NX, and therefore real W^X
 
 The one piece of hardening that is a project rather than a patch. A 32-bit
 page table entry has no execute-disable bit, so the kernel's text is
@@ -256,7 +349,7 @@ and the PAE-before-paging ordering are already written down and tested in
 smaller: UMIP is a CR4 bit, KASLR is relocations, and `-fstack-protector`
 wants the per-CPU area the SMP work brings.
 
-### 4. Interrupt-driven serial transmit
+### 3. Interrupt-driven serial transmit
 
 `console_write` currently holds interrupts off for the whole of a polled UART
 write. On QEMU that is free; on real hardware at 115200 it is ~87 µs per
@@ -266,50 +359,28 @@ Needs: a transmit ring buffer, the THR-empty interrupt enabled in IER, and a
 drain path in the existing `serial_irq`. The panic path has to keep polling,
 because it cannot rely on interrupts.
 
-### 5. Reclaim empty page tables
+### 4. Reclaim empty page tables
 
 Unmapping the last page in a 4 MiB region leaves its table allocated. Needs a
 per-table mapped-page count, decremented in `vmm_unmap`, freeing the frame and
 clearing the directory entry at zero — and a `tlb` flush of the recursive
 window entry for that slot.
 
-### 6. Symbolising the profiler's call graph
+### 5. Symbolising the profiler's call graph
 
 Samples are attributed to the leaf function only, so a helper called from
 several places aggregates all of its callers together. Walking the
 frame-pointer chain at sample time would fix it, and the backtrace code
 already exists - see [PERFORMANCE.md](PERFORMANCE.md).
 
-### 7. Writing to the filesystem, and a VFS
-
-Reading is done. Writing means allocating from the FAT, updating both copies
-of it, extending a directory entry's size and cluster chain, and surviving
-being interrupted between any two of those - which is where the interesting
-part is, and it is a journalling discussion rather than a filesystem-format
-one.
-
-A VFS layer belongs with it rather than before it: one filesystem behind an
-interface is an interface with one implementation, and the second
-implementation is what shows whether the interface was right. Long filenames
-and `argv` for `exec` are the two smaller gaps the current driver leaves.
-
-A negative-lookup cache belongs here too, and it closes a known bug rather
-than adding a feature: `exec()` of a path that does not exist does a disk
-lookup every time, so a ring-3 loop can make the kernel do unbounded
-synchronous polled-PIO I/O. The syscall fuzzer found it — it is most of the
-600 µs average cost of a call during a fuzz run — and it is left open
-deliberately, because caching a name's absence needs the invalidation story
-that arrives with write support. It is resource exhaustion, not a memory
-safety bug; see [FUZZING.md](FUZZING.md).
-
-### 8. A slab allocator over the heap
+### 6. A slab allocator over the heap
 
 The heap is one arena, so a long-lived small allocation can keep a large region
 from coalescing. Per-size caches for the common fixed-size objects (`struct
 task`, page-table wrappers) would fix the fragmentation and speed up the common
 path. `heap_check()` already exists to validate the result.
 
-### 9. The I/O APIC, and the local APIC timer
+### 7. The I/O APIC, and the local APIC timer
 
 The MADT's I/O APIC entries and its interrupt source overrides are already
 parsed - including that IRQ 0 arrives as GSI 2 on QEMU, which a kernel that
@@ -317,17 +388,28 @@ assumed otherwise would lose its timer to. Nothing is programmed yet: device
 interrupts still go through the 8259s to the boot processor, so there is no
 interrupt distribution and no affinity.
 
-The local APIC timer belongs with it, and is the prerequisite for item 2: the
+The local APIC timer belongs with it, and is the prerequisite for item 1: the
 single 8254 cannot drive four processors, so per-CPU preemption needs a timer
 per CPU.
 
-### 10. A `/proc`
+### 8. A `/proc`
 
 The introspection the shell does through direct calls - `ps`, `meminfo`,
 `irq`, `disk`, `mount`, `harden` - belongs behind readable files instead.
-That needs a VFS with at least two filesystems in it (item 7) and write
-support for the synthetic one, so it follows them rather than preceding
-them.
+The VFS and its two real filesystems are in place, so what remains is a
+third backend whose files are generated on read - which is the one thing
+neither `devfs` nor the FAT driver does, and the reason this is still an item
+rather than done.
+
+### 9. A negative-lookup cache for `exec`
+
+The one item the VFS work left open deliberately. `exec()` of a path that does
+not exist does a disk lookup every time, so a ring-3 loop can make the kernel
+do unbounded synchronous polled-PIO I/O. The syscall fuzzer found it - it is
+most of the 600 µs average cost of a call during a fuzz run - and caching a
+name's *absence* needs an invalidation story, which the write support has now
+provided. It is resource exhaustion rather than a memory safety bug; see
+[FUZZING.md](FUZZING.md).
 
 ---
 

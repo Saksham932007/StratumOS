@@ -272,10 +272,59 @@ line never does.
   Copy-on-write is the only laziness in the memory manager.
 - **No NX.** Without PAE, x86 cannot mark a page non-executable, so
   "read-only" is enforced but "non-executable" is not.
-- **Eleven system calls**, and no file descriptors — `write` goes to the
-  console unconditionally, so `fork` has no descriptor table to duplicate.
 - **No `argv` or environment.** `exec` takes a program name and nothing else.
+- **No signals**, so there is no way to interrupt a process that is blocked
+  in a system call. That is why every blocking call here has a bounded
+  timeout rather than waiting forever: a ring-3 program that blocked
+  permanently would be indistinguishable from a hung kernel, and nothing
+  could tell it otherwise.
+- **No `select` or `poll` across descriptors.** The `poll_read` and
+  `poll_write` operations exist and the blocking paths use them, so the
+  mechanism is there; what is missing is a call that waits on a *set*, which
+  needs a wait queue the scheduler does not have.
+- **Blocking is polling.** A blocked socket call spins the network and sleeps
+  a tick rather than waiting on a queue, for the same reason. The `sockets`
+  command counts how often a call had to wait, so the cost is visible rather
+  than implied.
 
-What used to be at the top of this list — one address space, no `fork`, no
-`exec`, no `wait` — is now [PROCESSES.md](PROCESSES.md). NX and the rest of
-the hardening work are the next items in [ROADMAP.md](ROADMAP.md).
+What used to be at the top of this list is now elsewhere: one address space,
+no `fork`, no `exec`, no `wait` is [PROCESSES.md](PROCESSES.md), and "eleven
+system calls, and no file descriptors" is the section below. NX is the
+remaining item in [ROADMAP.md](ROADMAP.md).
+
+## Descriptors, and then sockets
+
+The list above used to begin "eleven system calls, and no file descriptors —
+`write` goes to the console unconditionally, so `fork` has no descriptor
+table to duplicate". That was the single thing most in the way, and not only
+for files: the network stack had no sockets for exactly the same reason.
+There was no `open`, so there was nothing a descriptor could be, so `read`
+and `write` had nothing to name.
+
+There are now forty-odd calls. A process has a fixed table of descriptors,
+each pointing at a refcounted open file; `dup` shares a position, `fork`
+duplicates the table and not the open files, and the last close is what
+releases. Three backends sit behind one `struct vfs_ops` — a FAT file, the
+console, and a socket — which is what made the interface worth having: the
+NULL entries in that struct are exactly the places it would have been wrong
+if it had been designed against files alone. A socket has no `seek`, so the
+dispatcher refuses the call once rather than the socket layer saying so.
+
+`user/netcat.c` is what proves the socket half, and it runs in ring 3 on
+purpose. Every address it hands the kernel has to be validated, every socket
+is a descriptor in its own table, and the connection has to survive a process
+that can be preempted between any two calls. It opens a socket and checks
+`fstat` calls it one and `lseek` refuses it; does a UDP round trip; opens a
+TCP connection and reads its own bytes back; and then listens on a port and
+connects to it *from itself*, with the listener, the client and the accepted
+connection all alive at once.
+
+Two of the kernel's own bugs came out of this. The ring-3 fuzzer found that
+`user_range_ok()` never checked *writability*, so a pointer into a program's
+own read-only `.text` passed validation and then faulted in ring 0, where
+`CR0.WP` makes it a panic — latent since `wait()`'s status pointer. And the
+first version of `resolve()` let a ring-3 program make one system call emit a
+DNS query and block for five seconds, which is now a plausibility check on
+the name, a token bucket, and a 1.5-second bound. Neither is a memory-safety
+bug; the second is resource exhaustion, which is the same class as the `exec`
+negative-lookup finding in [FUZZING.md](FUZZING.md).

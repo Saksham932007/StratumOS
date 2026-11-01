@@ -260,6 +260,53 @@ void dns_cache_clear(void)
     memset(cache, 0, sizeof(cache));
 }
 
+/* Is this a name worth sending to a server?
+ *
+ * Three reasons this check exists, in increasing order of how much they
+ * matter:
+ *
+ *   A name with a character that cannot appear in a host name will not
+ *   resolve, so asking costs a query and a three-second wait to learn
+ *   nothing. The syscall fuzzer found this by resolving "/dev/zero" - a
+ *   string that happened to be in its own data segment - which is one long
+ *   label as far as the encoder is concerned, and perfectly sendable.
+ *
+ *   A resolver that puts arbitrary bytes into a QNAME is a resolver that can
+ *   be used to smuggle data to a nameserver the caller could not otherwise
+ *   reach. That is a real exfiltration channel and it is closed cheaply.
+ *
+ *   And it makes `resolve` from ring 3 fail immediately on nonsense instead
+ *   of blocking the caller for seconds, which is what turned a fuzz run into
+ *   a hang.
+ *
+ * Letters, digits, hyphen and dot. Underscore is deliberately excluded: it
+ * appears in SRV and TXT names, and this resolver only asks for A records of
+ * host names. */
+static bool name_plausible(const char *name)
+{
+    size_t n = 0;
+
+    for (const char *p = name; *p; p++, n++) {
+        char c = *p;
+
+        if (c >= 'a' && c <= 'z')
+            continue;
+        if (c >= 'A' && c <= 'Z')
+            continue;
+        if (c >= '0' && c <= '9')
+            continue;
+        if (c == '-' || c == '.')
+            continue;
+
+        return false;
+    }
+
+    /* A name with no dot in it is a bare label. Allowed, because a search
+     * domain would make it resolvable and because "localhost" is one - but a
+     * name with nothing in it is not. */
+    return n > 0 && n < DNS_NAME_MAX;
+}
+
 /* ---- encoding a name ---------------------------------------------------
  *
  * "www.example.com" becomes 3 w w w 7 e x a m p l e 3 c o m 0. Each label is
@@ -430,6 +477,11 @@ bool dns_query(const char *name)
 
     if (!name || !*name)
         return false;
+
+    if (!name_plausible(name)) {
+        pr_debug("'%s' is not a host name; not asking", name);
+        return false;
+    }
 
     /* A second lookup replaces the first. One at a time is a real limit and
      * is stated in the header; it is not a race, because the port is
@@ -667,6 +719,13 @@ i32 dns_resolve(const char *name, ipv4_addr *out, u32 timeout_ms)
         stats.cache_hits++;
         return 0;
     }
+
+    /* Checked here as well as in dns_query(), and before the server check,
+     * so that a caller gets EINVAL for a malformed name whether or not a
+     * resolver is configured - the name is wrong either way, and which
+     * answer comes back should not depend on the machine's configuration. */
+    if (!name_plausible(name))
+        return SYS_EINVAL;
 
     if (!server)
         return SYS_EHOSTUNREACH;

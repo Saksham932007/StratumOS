@@ -53,6 +53,7 @@
 #include <fs/vfs.h>
 #include <net/inet.h>
 #include <net/net.h>
+#include <net/socket.h>
 
 void ktest_check(struct ktest_result *r, bool ok, const char *what)
 {
@@ -3635,6 +3636,342 @@ static void test_inet(struct ktest_result *r)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * Sockets, from inside the kernel.
+ *
+ * The interesting half of the socket layer is tested from ring 3 by
+ * user/netcat.c, which is where it belongs: the point of a socket being a
+ * descriptor is that a *process* can use it, and a kernel thread calling
+ * socket() proves less. What is tested here is the half ring 3 cannot reach
+ * conveniently - the refusals, the type checks and the resource bounds -
+ * plus loopback, which nothing else can assert on without a peer.
+ * ------------------------------------------------------------------------- */
+
+static void test_sockets(struct ktest_result *r)
+{
+    u32 open_before = vfs_open_count();
+
+    /* --- what socket() refuses --------------------------------------- */
+    KT_EQ(r, socket_create(99, SOCK_STREAM, 0), SYS_ENOTSUP);
+    KT_EQ(r, socket_create(AF_INET, 99, 0), SYS_ENOTSUP);
+    /* A protocol of 0 means "the usual one", and naming the wrong one
+     * explicitly is an error rather than a hint. */
+    KT_EQ(r, socket_create(AF_INET, SOCK_STREAM, IPPROTO_UDP), SYS_ENOTSUP);
+    KT_EQ(r, socket_create(AF_INET, SOCK_DGRAM, IPPROTO_TCP), SYS_ENOTSUP);
+
+    /* --- a socket is a descriptor ------------------------------------ */
+    {
+        i32 fd = socket_create(AF_INET, SOCK_STREAM, 0);
+
+        KT_ASSERT(r, fd >= 0);
+
+        struct vfs_file *f = fd_get(fd);
+
+        KT_ASSERT(r, f != NULL);
+        KT_EQ(r, (u32)f->type, (u32)S_TYPE_SOCKET);
+
+        struct sys_stat st;
+
+        KT_EQ(r, vfs_stat_file(f, &st), 0);
+        KT_EQ(r, st.type, (u32)S_TYPE_SOCKET);
+        /* A stream has no position, so the VFS refuses the seek once rather
+         * than the socket layer saying so. The NULL op is the answer. */
+        KT_EQ(r, vfs_seek(f, 0, SEEK_SET), SYS_EINVAL);
+        /* And no directory entries, for the same reason. */
+        struct sys_dirent de;
+
+        KT_EQ(r, vfs_getdent(f, 0, &de), SYS_ENOTDIR);
+
+        /* Nothing is connected, so a read and a write have nowhere to go -
+         * and ENOTCONN is a different answer from EBADF, which is the
+         * distinction a caller acts on. */
+        char buf[4];
+
+        KT_EQ(r, vfs_read(f, buf, sizeof(buf)), SYS_ENOTCONN);
+        KT_EQ(r, vfs_write(f, buf, sizeof(buf)), SYS_ENOTCONN);
+
+        /* The non-blocking flag lives on the open file, which is where every
+         * other blocking decision in this kernel reads it from. */
+        KT_EQ(r, vfs_ioctl(f, FIONBIO, 1), 0);
+        KT_ASSERT(r, (f->flags & O_NONBLOCK) != 0);
+        KT_EQ(r, vfs_ioctl(f, FIONBIO, 0), 0);
+        KT_ASSERT(r, (f->flags & O_NONBLOCK) == 0);
+        KT_EQ(r, vfs_ioctl(f, 0x9999, 0), SYS_ENOTSUP);
+
+        KT_EQ(r, fd_close(fd), 0);
+    }
+
+    /* --- the wrong calls on the wrong things ------------------------- */
+    {
+        struct sys_sockaddr sa;
+
+        memset(&sa, 0, sizeof(sa));
+        sa.family = AF_INET;
+        sa.port = htons(9201);
+
+        /* Not a descriptor at all. */
+        KT_EQ(r, socket_bind(99, &sa), SYS_EBADF);
+        KT_EQ(r, socket_listen(99, 1), SYS_EBADF);
+        KT_EQ(r, socket_connect(99, &sa), SYS_EBADF);
+
+        /* A real descriptor that is not a socket. ENOTSUP rather than EBADF:
+         * the descriptor is fine, the operation is not - and conflating the
+         * two would send a caller looking for a closed file. */
+        i32 dev = fd_open("/dev/null", O_RDWR);
+
+        KT_ASSERT(r, dev >= 0);
+        KT_EQ(r, socket_bind(dev, &sa), SYS_ENOTSUP);
+        KT_EQ(r, socket_listen(dev, 1), SYS_ENOTSUP);
+        KT_EQ(r, socket_accept(dev, NULL), SYS_ENOTSUP);
+        KT_EQ(r, fd_close(dev), 0);
+
+        /* A datagram socket cannot listen, and a stream socket has no
+         * sendto. */
+        i32 d = socket_create(AF_INET, SOCK_DGRAM, 0);
+        i32 t = socket_create(AF_INET, SOCK_STREAM, 0);
+
+        KT_ASSERT(r, d >= 0 && t >= 0);
+        KT_EQ(r, socket_listen(d, 1), SYS_ENOTSUP);
+        KT_EQ(r, socket_shutdown(d, SHUT_WR), SYS_ENOTSUP);
+        KT_EQ(r, socket_sendto(t, "x", 1, &sa), SYS_ENOTSUP);
+        KT_EQ(r, socket_recvfrom(t, NULL, 0, NULL), SYS_ENOTSUP);
+
+        /* listen() before bind() has no port to listen on. */
+        KT_EQ(r, socket_listen(t, 1), SYS_EINVAL);
+        /* accept() on something that is not listening. */
+        KT_EQ(r, socket_accept(t, NULL), SYS_EINVAL);
+        /* shutdown() on an unconnected stream. */
+        KT_EQ(r, socket_shutdown(t, SHUT_WR), SYS_ENOTCONN);
+        KT_EQ(r, socket_shutdown(t, 99), SYS_EINVAL);
+
+        /* Port 0 is not a port, and a family we do not have is not a
+         * family. */
+        struct sys_sockaddr bad = sa;
+
+        bad.port = 0;
+        KT_EQ(r, socket_bind(t, &bad), SYS_EINVAL);
+        bad = sa;
+        bad.family = 99;
+        KT_EQ(r, socket_bind(t, &bad), SYS_ENOTSUP);
+
+        KT_EQ(r, fd_close(d), 0);
+        KT_EQ(r, fd_close(t), 0);
+    }
+
+    /* --- bind, listen, and the second bind that must fail ------------ */
+    {
+        struct sys_sockaddr sa;
+
+        memset(&sa, 0, sizeof(sa));
+        sa.family = AF_INET;
+        sa.port = htons(9202);
+
+        i32 a = socket_create(AF_INET, SOCK_STREAM, 0);
+        i32 b = socket_create(AF_INET, SOCK_STREAM, 0);
+
+        KT_ASSERT(r, a >= 0 && b >= 0);
+        KT_EQ(r, socket_bind(a, &sa), 0);
+        KT_EQ(r, socket_listen(a, 4), 0);
+        /* A second listener on the same port would make the destination
+         * port ambiguous. The bind itself succeeds - a stream socket's bind
+         * only records the number - and the listen is what claims it. */
+        KT_EQ(r, socket_bind(b, &sa), 0);
+        KT_EQ(r, socket_listen(b, 4), SYS_EADDRINUSE);
+        /* Binding twice is a caller error either way. */
+        KT_EQ(r, socket_bind(a, &sa), SYS_EINVAL);
+        /* Nothing has connected, and a non-blocking accept says so rather
+         * than waiting. */
+        {
+            struct vfs_file *f = fd_get(a);
+
+            KT_EQ(r, vfs_ioctl(f, FIONBIO, 1), 0);
+            KT_EQ(r, socket_accept(a, NULL), SYS_EAGAIN);
+        }
+        /* And a listener cannot then connect. */
+        KT_EQ(r, socket_connect(a, &sa), SYS_EINVAL);
+
+        KT_EQ(r, fd_close(b), 0);
+        KT_EQ(r, fd_close(a), 0);
+
+        /* Closing the listener released the port, or a program that opened
+         * and closed a listening socket could never open it again. */
+        i32 c = socket_create(AF_INET, SOCK_STREAM, 0);
+
+        KT_ASSERT(r, c >= 0);
+        KT_EQ(r, socket_bind(c, &sa), 0);
+        KT_EQ(r, socket_listen(c, 4), 0);
+        KT_EQ(r, fd_close(c), 0);
+    }
+
+    /* --- a datagram socket's bind and default peer ------------------- */
+    {
+        struct sys_sockaddr sa;
+
+        memset(&sa, 0, sizeof(sa));
+        sa.family = AF_INET;
+        sa.port = htons(9203);
+
+        i32 a = socket_create(AF_INET, SOCK_DGRAM, 0);
+        i32 b = socket_create(AF_INET, SOCK_DGRAM, 0);
+
+        KT_ASSERT(r, a >= 0 && b >= 0);
+        KT_EQ(r, socket_bind(a, &sa), 0);
+        /* A datagram bind really claims the port, because a datagram socket
+         * owns a receive queue. The second one has nowhere to put what
+         * arrives. */
+        KT_EQ(r, socket_bind(b, &sa), SYS_EADDRINUSE);
+
+        /* An unconnected datagram socket has nothing to write to. */
+        struct vfs_file *f = fd_get(b);
+
+        KT_EQ(r, vfs_write(f, "x", 1), SYS_ENOTCONN);
+
+        /* connect() on a datagram socket sends nothing and cannot fail for
+         * any reason to do with the network - it records a default peer,
+         * which is what makes send() and recv() work on one. */
+        sa.addr = IPV4(10, 0, 2, 2);
+        KT_EQ(r, socket_connect(b, &sa), 0);
+
+        KT_EQ(r, fd_close(a), 0);
+        KT_EQ(r, fd_close(b), 0);
+    }
+
+    /* --- socket options ---------------------------------------------- */
+    {
+        i32 fd = socket_create(AF_INET, SOCK_STREAM, 0);
+        u32 v = 0;
+
+        KT_ASSERT(r, fd >= 0);
+
+        KT_EQ(r, socket_getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &v), 0);
+        KT_ASSERT(r, v > 0); /* there is a default, and it is not infinite */
+
+        KT_EQ(r, socket_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, 1500), 0);
+        KT_EQ(r, socket_getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &v), 0);
+        KT_EQ(r, v, 1500u);
+
+        /* Bounded, for the same reason sleep() is: a ring-3 program must not
+         * be able to ask for a timeout long enough to look like a hang. */
+        KT_EQ(r, socket_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, 0xFFFFFFFFu),
+              0);
+        KT_EQ(r, socket_getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &v), 0);
+        KT_ASSERT(r, v <= 60000u);
+
+        /* Zero means the default rather than "never". */
+        KT_EQ(r, socket_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, 0), 0);
+        KT_EQ(r, socket_getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &v), 0);
+        KT_ASSERT(r, v > 0);
+
+        KT_EQ(r, socket_setsockopt(fd, 99, SO_RCVTIMEO, 1), SYS_ENOTSUP);
+        KT_EQ(r, socket_setsockopt(fd, SOL_SOCKET, 99, 1), SYS_ENOTSUP);
+        KT_EQ(r, socket_getsockopt(fd, SOL_SOCKET, 99, &v), SYS_ENOTSUP);
+
+        /* SO_ERROR reads and clears, as Berkeley sockets define it: the
+         * error belongs to the operation that failed, and leaving it set
+         * would make the next read report a failure already seen. */
+        KT_EQ(r, socket_getsockopt(fd, SOL_SOCKET, SO_ERROR, &v), 0);
+        KT_EQ(r, v, 0u);
+
+        KT_EQ(r, fd_close(fd), 0);
+    }
+
+    /* --- the table's ceiling ----------------------------------------
+     *
+     * A ring-3 loop calling socket() has to hit a bound rather than an
+     * allocator, which is the same argument the open-file table makes.
+     * Whichever limit is reached first, the answer is a refusal and not a
+     * crash - and the sockets opened along the way all close again.
+     */
+    {
+        i32 fds[SOCKET_MAX + 4];
+        u32 made = 0;
+
+        for (u32 i = 0; i < ARRAY_SIZE(fds); i++) {
+            fds[i] = socket_create(AF_INET, SOCK_DGRAM, 0);
+            if (fds[i] < 0)
+                break;
+            made++;
+        }
+
+        /* It stopped, and it stopped for a reason a caller can act on. */
+        KT_ASSERT(r, made < ARRAY_SIZE(fds));
+        KT_ASSERT(r, made > 0);
+
+        i32 refused = socket_create(AF_INET, SOCK_DGRAM, 0);
+
+        KT_ASSERT(r, refused == SYS_ENFILE || refused == SYS_EMFILE);
+
+        for (u32 i = 0; i < made; i++)
+            KT_EQ(r, fd_close(fds[i]), 0);
+
+        /* And the ceiling was not permanent. */
+        i32 again = socket_create(AF_INET, SOCK_DGRAM, 0);
+
+        KT_ASSERT(r, again >= 0);
+        KT_EQ(r, fd_close(again), 0);
+    }
+
+    /* --- loopback ---------------------------------------------------
+     *
+     * Nothing else in this suite can assert on this without a peer, and it
+     * is the reason the ring-3 socket program works at all: a controller
+     * does not receive its own transmissions, so a datagram to this
+     * machine's own address has to be turned round in software.
+     */
+    {
+        const struct net_config *cfg = net_get_config();
+
+        KT_ASSERT(r, net_is_loopback(IPV4(127, 0, 0, 1)));
+        KT_ASSERT(r, net_is_loopback(IPV4(127, 255, 255, 254)));
+        KT_ASSERT(r, !net_is_loopback(IPV4(10, 0, 2, 2)));
+        KT_ASSERT(r, !net_is_loopback(IPV4(128, 0, 0, 1)));
+
+        if (cfg->addr) {
+            KT_ASSERT(r, net_is_loopback(cfg->addr));
+
+            /* A real round trip, with no network involved. The UDP echo
+             * service answers it, which means the datagram went down
+             * through IPv4, into the loopback queue, back up through
+             * ipv4_input and udp_input, and out again. */
+            u16 port = udp_bind_ephemeral();
+
+            KT_ASSERT(r, port != 0);
+
+            static const char payload[] = "loopback";
+            const struct loopback_stats *ls = loopback_get_stats();
+            u32 sent_before = ls->sent;
+
+            KT_ASSERT(r, udp_send(cfg->addr, port, udp_echo_port(), payload,
+                                  sizeof(payload) - 1));
+            /* Queued, not delivered: the whole point of the queue is that a
+             * send from inside a receive cannot nest. */
+            KT_ASSERT(r, ls->sent > sent_before);
+            KT_ASSERT(r, loopback_queued() > 0);
+
+            /* Two drains: the first delivers the request to the echo
+             * service, which queues the reply; the second delivers the
+             * reply. One call cannot do both, by design. */
+            for (u32 i = 0; i < 8 && !udp_queued(port); i++)
+                loopback_drain();
+
+            KT_ASSERT(r, udp_queued(port) > 0);
+
+            struct udp_dgram d;
+            i32 n = udp_recv(port, &d);
+
+            KT_EQ(r, n, (i32)(sizeof(payload) - 1));
+            KT_ASSERT(r, memcmp(d.data, payload, sizeof(payload) - 1) == 0);
+            KT_ASSERT(r, d.src == cfg->addr);
+            KT_EQ(r, (u32)d.src_port, (u32)udp_echo_port());
+
+            udp_unbind(port);
+        }
+    }
+
+    /* Nothing leaked across the whole suite. */
+    KT_EQ(r, vfs_open_count(), open_before);
+}
+
 static const struct ktest tests[] = {
     {"string", "string and formatting primitives", test_string},
     {"boot", "boot protocol normalisation", test_boot},
@@ -3659,6 +3996,8 @@ static const struct ktest tests[] = {
     {"net", "checksums, addresses, ARP, and the wire", test_net},
     {"inet", "URL parsing, DNS name compression, DHCP and HTTP state",
      test_inet},
+    {"sock", "sockets as descriptors, their refusals, and loopback",
+     test_sockets},
     {"ksyms", "embedded symbol table lookup", test_ksyms},
     {"profile", "sampling profiler attribution", test_profile},
 };

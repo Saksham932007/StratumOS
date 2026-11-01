@@ -30,6 +30,8 @@
 #include <mm/vmm.h>
 
 #include <fs/vfs.h>
+#include <net/inet.h>
+#include <net/socket.h>
 
 /* The largest single read or write a system call will move. Not a limit on
  * what a program can transfer - it loops - but a limit on how much kernel
@@ -399,6 +401,213 @@ static i32 sys_path_op(u32 ptr, i32 (*op)(const char *))
     return op(path);
 }
 
+/* ---- sockets ------------------------------------------------------------
+ *
+ * Every one of these copies the ring-3 structure into kernel memory before
+ * the socket layer sees it, and copies the result back afterwards. That is
+ * the whole of what this layer adds: net/socket.c never dereferences a
+ * user-space address, so the validation lives in one file and a new socket
+ * call cannot forget it.
+ */
+
+static i32 user_sockaddr(u32 ptr, struct sys_sockaddr *out)
+{
+    if (!ptr)
+        return SYS_EFAULT;
+
+    return copy_from_user(out, ptr, sizeof(*out));
+}
+
+/* SYS_SENDTO and SYS_RECVFROM want five arguments where there are three
+ * registers, so they take a `struct sys_msg` holding the rest. The pointers
+ * *inside* it are still ring-3 pointers and are checked exactly like any
+ * other, which is the part that would be easy to skip: a structure that
+ * arrived safely does not make its contents safe. */
+static i32 sys_sendto(u32 fd, u32 msgptr)
+{
+    struct sys_msg m;
+    struct sys_sockaddr to;
+    char buf[SYS_IO_MAX];
+    i32 rc = copy_from_user(&m, msgptr, sizeof(m));
+
+    if (rc < 0)
+        return rc;
+
+    if (m.len > sizeof(buf))
+        m.len = sizeof(buf);
+
+    rc = user_sockaddr(m.addr, &to);
+    if (rc < 0)
+        return rc;
+
+    rc = copy_from_user(buf, m.buf, m.len);
+    if (rc < 0)
+        return rc;
+
+    return socket_sendto((i32)fd, buf, m.len, &to);
+}
+
+static i32 sys_recvfrom(u32 fd, u32 msgptr)
+{
+    struct sys_msg m;
+    struct sys_sockaddr from;
+    char buf[SYS_IO_MAX];
+    i32 rc = copy_from_user(&m, msgptr, sizeof(m));
+
+    if (rc < 0)
+        return rc;
+
+    if (m.len > sizeof(buf))
+        m.len = sizeof(buf);
+
+    /* Both destinations are checked before the receive happens, so that a
+     * datagram is not taken off the queue and then dropped because the
+     * caller's buffer turned out to be unwritable. A lost datagram is not
+     * recoverable; a refused call is. */
+    if (m.len && !user_range_writable(m.buf, m.len))
+        return SYS_EFAULT;
+    if (m.addr && !user_range_writable(m.addr, sizeof(from)))
+        return SYS_EFAULT;
+
+    i32 n = socket_recvfrom((i32)fd, buf, m.len, m.addr ? &from : NULL);
+
+    if (n < 0)
+        return n;
+
+    rc = copy_to_user(m.buf, buf, (u32)n);
+    if (rc < 0)
+        return rc;
+
+    if (m.addr) {
+        rc = copy_to_user(m.addr, &from, sizeof(from));
+        if (rc < 0)
+            return rc;
+    }
+
+    return n;
+}
+
+static i32 sys_accept(u32 fd, u32 peerptr)
+{
+    struct sys_sockaddr peer;
+
+    if (peerptr && !user_range_writable(peerptr, sizeof(peer)))
+        return SYS_EFAULT;
+
+    i32 nfd = socket_accept((i32)fd, peerptr ? &peer : NULL);
+
+    if (nfd < 0)
+        return nfd;
+
+    if (peerptr) {
+        i32 rc = copy_to_user(peerptr, &peer, sizeof(peer));
+
+        if (rc < 0) {
+            /* The descriptor exists and the caller cannot be told who is on
+             * the other end. Closing it is the only coherent answer: leaving
+             * it open would leak a descriptor the caller does not know it
+             * has. */
+            fd_close(nfd);
+            return rc;
+        }
+    }
+
+    return nfd;
+}
+
+/* How long a ring-3 resolve may block, and how many may be started per
+ * second.
+ *
+ * Both exist because of what the syscall fuzzer did to the first version of
+ * this call. A lookup that misses the cache sends a query and waits for an
+ * answer, so a program can make one system call cost seconds - and, worse,
+ * can make the kernel emit one DNS query per call, using the machine as an
+ * amplifier aimed at whatever resolver it was configured with. Neither is a
+ * memory-safety bug and both are resource exhaustion, which is the same class
+ * as the `exec` negative-lookup finding in FUZZING.md.
+ *
+ * A token bucket rather than a flat interval, so that a program doing a
+ * handful of lookups in a burst - which is what a normal program does - is
+ * not slowed down, while one doing them in a loop is. */
+#define RESOLVE_TIMEOUT_MS 1500
+#define RESOLVE_PER_SEC    4
+#define RESOLVE_BURST      8
+
+static i32 resolve_budget(void)
+{
+    static u32 tokens = RESOLVE_BURST;
+    static u64 last_ms;
+
+    u64 now = timer_ms();
+
+    if (!last_ms)
+        last_ms = now;
+
+    u64 elapsed = now - last_ms;
+    u32 earned = (u32)((elapsed * RESOLVE_PER_SEC) / 1000u);
+
+    if (earned) {
+        /* Only advance the clock by what was actually converted into
+         * tokens, or the remainder is thrown away and the effective rate
+         * depends on how often the call is made. */
+        last_ms += ((u64)earned * 1000u) / RESOLVE_PER_SEC;
+        tokens += earned;
+        if (tokens > RESOLVE_BURST)
+            tokens = RESOLVE_BURST;
+    }
+
+    if (!tokens)
+        return SYS_EAGAIN;
+
+    tokens--;
+    return 0;
+}
+
+/* Resolve a name for ring 3. The one call in this group that is not a socket
+ * operation, and it is here because a program that can open a connection but
+ * cannot turn a name into an address can only talk to numbers. */
+static i32 sys_resolve(u32 nameptr, u32 outptr)
+{
+    char name[DNS_NAME_MAX];
+    ipv4_addr addr = 0;
+    i32 rc;
+
+    if (!user_copy_string(nameptr, name, sizeof(name)))
+        return SYS_EFAULT;
+
+    if (outptr && !user_range_writable(outptr, sizeof(addr)))
+        return SYS_EFAULT;
+
+    /* A dotted quad and a cached name both resolve without a query and
+     * without blocking, so they are not charged for - which keeps the limit
+     * aimed at what it is for. dns_resolve() answers both from memory, so
+     * this is a cheap pre-pass rather than a duplicate of its logic. */
+    if (!ipv4_parse(name, &addr)) {
+        rc = resolve_budget();
+        if (rc < 0) {
+            pr_warn_ratelimited(
+                "pid %u is resolving names faster than %u per second",
+                current_pid(), RESOLVE_PER_SEC);
+            return rc;
+        }
+        addr = 0;
+    } else {
+        return outptr
+                   ? (copy_to_user(outptr, &addr, sizeof(addr)) < 0 ? SYS_EFAULT
+                                                                    : 0)
+                   : 0;
+    }
+
+    rc = dns_resolve(name, &addr, RESOLVE_TIMEOUT_MS);
+    if (rc < 0)
+        return rc;
+
+    if (outptr)
+        return copy_to_user(outptr, &addr, sizeof(addr)) < 0 ? SYS_EFAULT : 0;
+
+    return 0;
+}
+
 static void syscall_handler(struct regs *r)
 {
     i32 ret;
@@ -512,6 +721,94 @@ static void syscall_handler(struct regs *r)
 
     case SYS_SYNC:
         ret = vfs_sync();
+        break;
+
+    /* ---- sockets --------------------------------------------------- */
+    case SYS_SOCKET:
+        ret = socket_create((int)r->ebx, (int)r->ecx, (int)r->edx);
+        break;
+
+    case SYS_BIND: {
+        struct sys_sockaddr a;
+
+        ret = user_sockaddr(r->ecx, &a);
+        if (ret < 0)
+            break;
+
+        ret = socket_bind((i32)r->ebx, &a);
+        break;
+    }
+
+    case SYS_LISTEN:
+        ret = socket_listen((i32)r->ebx, (int)r->ecx);
+        break;
+
+    case SYS_ACCEPT:
+        ret = sys_accept(r->ebx, r->ecx);
+        break;
+
+    case SYS_CONNECT: {
+        struct sys_sockaddr a;
+
+        ret = user_sockaddr(r->ecx, &a);
+        if (ret < 0)
+            break;
+
+        ret = socket_connect((i32)r->ebx, &a);
+        break;
+    }
+
+    case SYS_SEND:
+        /* send() with no flags is write(), and is implemented as write()
+         * rather than duplicated - which is also why a program can use
+         * either on a socket. */
+        ret = sys_write_fd(r->ebx, r->ecx, r->edx);
+        break;
+
+    case SYS_RECV:
+        ret = sys_read_fd(r->ebx, r->ecx, r->edx);
+        break;
+
+    case SYS_SENDTO:
+        ret = sys_sendto(r->ebx, r->ecx);
+        break;
+
+    case SYS_RECVFROM:
+        ret = sys_recvfrom(r->ebx, r->ecx);
+        break;
+
+    case SYS_SHUTDOWN:
+        ret = socket_shutdown((i32)r->ebx, (int)r->ecx);
+        break;
+
+    case SYS_SETSOCKOPT:
+        /* Three registers hold the descriptor, the option name and the
+         * value; the level is folded into the name's high half rather than
+         * taking a fourth register for a field that only ever holds
+         * SOL_SOCKET. */
+        ret = socket_setsockopt((i32)r->ebx, (int)(r->ecx >> 16),
+                                (int)(r->ecx & 0xFFFFu), r->edx);
+        break;
+
+    case SYS_GETSOCKOPT: {
+        u32 value = 0;
+
+        if (!r->edx || !user_range_writable(r->edx, sizeof(value))) {
+            ret = SYS_EFAULT;
+            break;
+        }
+
+        ret = socket_getsockopt((i32)r->ebx, (int)(r->ecx >> 16),
+                                (int)(r->ecx & 0xFFFFu), &value);
+        if (ret < 0)
+            break;
+
+        ret = copy_to_user(r->edx, &value, sizeof(value)) < 0 ? SYS_EFAULT : 0;
+        break;
+    }
+
+    case SYS_RESOLVE:
+        ret = sys_resolve(r->ebx, r->ecx);
         break;
 
     case SYS_GETPID:

@@ -56,6 +56,104 @@ u32 ipv4_pseudo_sum(ipv4_addr src, ipv4_addr dst, u8 proto, u16 length)
     return checksum_partial(pseudo, sizeof(pseudo), 0);
 }
 
+/* ---- loopback ----------------------------------------------------------
+ *
+ * See the note in net.h. The short version: a controller does not receive
+ * its own transmissions, so a datagram to this machine's own address has to
+ * be turned round in software, and it is queued rather than delivered
+ * inline so that a send from inside a receive cannot nest.
+ */
+
+struct loopback_slot {
+    ipv4_addr src;
+    u16 len;
+    u8 data[ETH_MTU];
+};
+
+static struct loopback_slot loopback_q[LOOPBACK_QUEUE_MAX];
+static u32 loopback_head, loopback_count;
+static struct loopback_stats loopback_stats;
+
+const struct loopback_stats *loopback_get_stats(void)
+{
+    return &loopback_stats;
+}
+
+u32 loopback_queued(void)
+{
+    return loopback_count;
+}
+
+bool net_is_loopback(ipv4_addr ip)
+{
+    const struct net_config *cfg = net_get_config();
+
+    /* 127.0.0.0/8, in network byte order: the first octet is the low byte. */
+    if ((ip & 0xFFu) == 127u)
+        return true;
+
+    return cfg->addr && ip == cfg->addr;
+}
+
+/* Take a copy of the datagram. A copy and not a pointer, because the frame
+ * it came from is a caller's stack variable that will be gone before this is
+ * delivered - which is the whole reason the queue exists. */
+static bool loopback_queue(ipv4_addr src, const u8 *packet, u32 len)
+{
+    if (len > ETH_MTU) {
+        loopback_stats.dropped_big++;
+        return false;
+    }
+
+    if (loopback_count == LOOPBACK_QUEUE_MAX) {
+        /* Dropped, and counted. A full loopback queue means something is
+         * sending to itself faster than the poll loop drains, and silently
+         * overwriting would turn that into mysterious packet loss. */
+        loopback_stats.dropped_full++;
+        return false;
+    }
+
+    u32 slot = (loopback_head + loopback_count) % LOOPBACK_QUEUE_MAX;
+
+    loopback_q[slot].src = src;
+    loopback_q[slot].len = (u16)len;
+    memcpy(loopback_q[slot].data, packet, len);
+    loopback_count++;
+    loopback_stats.sent++;
+    return true;
+}
+
+u32 loopback_drain(void)
+{
+    u32 done = 0;
+
+    /* Bounded by what was queued when this started, not by the queue being
+     * empty: delivering a datagram can queue a reply, and draining until
+     * empty would turn a TCP connection to oneself into an unbounded loop
+     * inside one call. */
+    u32 budget = loopback_count;
+
+    while (budget-- && loopback_count) {
+        struct loopback_slot *d = &loopback_q[loopback_head];
+
+        loopback_head = (loopback_head + 1) % LOOPBACK_QUEUE_MAX;
+        loopback_count--;
+        loopback_stats.delivered++;
+        done++;
+
+        /* Delivered at the IPv4 layer rather than at Ethernet: there is no
+         * Ethernet header on it, and there should not be - a loopback
+         * interface has no hardware address, and pushing it through
+         * eth_input() would mean building a header for a frame that never
+         * leaves the machine so that the receive filter could accept it. */
+        net_stats()->rx_frames++;
+        net_stats()->rx_bytes += d->len;
+        ipv4_input(&mac_zero, d->data, d->len);
+    }
+
+    return done;
+}
+
 bool ipv4_output_frame(struct net_frame *f, ipv4_addr dst, u8 proto)
 {
     const struct net_config *cfg = net_get_config();
@@ -73,7 +171,13 @@ bool ipv4_output_frame(struct net_frame *f, ipv4_addr dst, u8 proto)
     if (payload_len + IPV4_HDR_LEN > ETH_MTU)
         return false;
 
-    if (!arp_resolve(dst, &next))
+    /* Loopback is decided before ARP, because there is nothing to resolve:
+     * the datagram is not going to a link. Deciding it after would try to
+     * ARP for this machine's own address, get no answer from anyone, and
+     * drop every datagram a program sent to itself. */
+    bool loop = net_is_loopback(dst);
+
+    if (!loop && !arp_resolve(dst, &next))
         return false; /* the request is away; this datagram is dropped */
 
     h = (struct ipv4_hdr *)net_frame_prepend(f, IPV4_HDR_LEN);
@@ -95,6 +199,14 @@ bool ipv4_output_frame(struct net_frame *f, ipv4_addr dst, u8 proto)
      * is assigned after. The header has no options, so this is always 20
      * bytes. */
     h->checksum = checksum(h, IPV4_HDR_LEN);
+
+    if (loop) {
+        if (!loopback_queue(h->src, (const u8 *)h, IPV4_HDR_LEN + payload_len))
+            return false;
+
+        net_stats()->ip_tx++;
+        return true;
+    }
 
     if (!eth_output_frame(f, &next, ETHERTYPE_IPV4))
         return false;

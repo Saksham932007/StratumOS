@@ -4,21 +4,23 @@ An operating system kernel and bootloader, written from scratch in C and
 assembly. It takes a machine from the BIOS's first instruction in 16-bit real
 mode to a preemptively scheduled, higher-half, paged kernel with per-process
 address spaces, copy-on-write `fork`, `exec` from a FAT16 filesystem on disk,
-a TCP/IP stack over a real Ethernet controller, and a hardened kernel/user
-boundary enforced by SMEP, SMAP and `CR0.WP`.
+a writable FAT16 filesystem behind a VFS, a TCP/IP stack with congestion
+control over a real Ethernet controller, DHCP, DNS and an HTTP client, BSD
+sockets usable from ring 3, and a hardened kernel/user boundary enforced by
+SMEP, SMAP and `CR0.WP`.
 
 It also reaches 64-bit long mode and back, and the portable half of it runs
 on RISC-V 64.
 
 [![CI](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml/badge.svg)](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml)
-![language](https://img.shields.io/badge/C11%20%2B%20asm-32.5k%20lines-blue)
+![language](https://img.shields.io/badge/C11%20%2B%20asm-38.7k%20lines-blue)
 ![arch](https://img.shields.io/badge/arch-i686%20%2B%20riscv64-lightgrey)
-![tests](https://img.shields.io/badge/tests-633%20assertions%2C%2012%20boot%20scenarios-brightgreen)
+![tests](https://img.shields.io/badge/tests-1123%20assertions%2C%2013%20boot%20scenarios-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 The same kernel binary boots two ways — through a bootloader written for this
-project, and through GRUB via Multiboot2 — and every push runs **633
-assertions across 92 host unit tests, 21 in-kernel suites and 12 QEMU boot
+project, and through GRUB via Multiboot2 — and every push runs **1123
+assertions across 92 host unit tests, 24 in-kernel suites and 13 QEMU boot
 scenarios**, plus four libFuzzer targets over the real kernel sources and the
 same kernel built and booted for a second architecture.
 
@@ -34,6 +36,8 @@ BIOS ─► stage 1 ─────► stage 2 ─────► protected mode
         retry/verify   32 KiB reads   ELF32 loader      paging, heap   FAT16        exec
         + partition                                     SMEP/SMAP      e1000        wait
           table                                         W^X            ARP/IP/TCP int 0x80
+                                                        descriptors    DHCP/DNS     sockets
+                                                        + a VFS        HTTP         open/read
 
                GRUB ─► Multiboot2 ─────────────────────► (same kernel binary)
 
@@ -118,7 +122,8 @@ the formatter, string layer and logger linked from the *same source files*
 the x86 kernel uses. The port's real output is a number: **55% of the kernel
 outside the architecture layer compiles for RISC-V unmodified**, and 88 of
 the 89 failures had one root cause — `paddr_t` and `vaddr_t` were `u32`.
-Invisible on i386, passes all 633 assertions, and only findable by building
+Invisible on i386, passed every assertion there was, and only findable by
+building
 for something wider.
 → [docs/PORTING.md](docs/PORTING.md)
 
@@ -203,7 +208,10 @@ Concretely, from power-on:
 9. **The network** comes up if there is an Intel e1000 on the PCI bus: the
    driver sets up descriptor rings the device reads by DMA, answers an ARP
    who-has so the machine can be found, replies to a ping, and listens on a
-   TCP port that completes a three-way handshake and echoes.
+   TCP port that completes a three-way handshake and echoes. From the shell,
+   `dhcp` gets an address from a real DHCP server, `dns` resolves a name, and
+   `fetch` downloads an `http://` URL over an outgoing TCP connection with
+   slow start, fast retransmit and a measured retransmission timeout.
 10. **The shell** runs as a scheduled task, reachable from the VGA console or
     over a serial line, with line editing and command history.
 
@@ -221,6 +229,9 @@ interrupts down or costs time that every boot should not pay:
   happens on demand.
 - **`fuzz`** issues 40,000 deliberately malformed system calls from ring 3,
   and the pass condition is that the kernel is still running afterwards.
+- **`netcat`** exercises the socket layer from ring 3: a UDP round trip, an
+  outgoing TCP connection, and a listener it connects to from itself, with
+  the listener, the client and the accepted connection all alive at once.
 - **`make ARCH=riscv64`** builds the same kernel's portable half for RISC-V 64
   and runs it on QEMU's `virt` board — machine mode to supervisor mode to
   Sv39 paging.
@@ -245,7 +256,7 @@ cd StratumOS
 make              # kernel, disk image, GRUB ISO, and the test images
 make run          # boot through the custom bootloader
 make run-iso      # boot through GRUB / Multiboot2
-make test         # host unit tests + 12 QEMU boot scenarios
+make test         # host unit tests + 13 QEMU boot scenarios
 ```
 
 `make toolchain` reports exactly which tools were found, and for which
@@ -576,7 +587,7 @@ Everything marked ✅ is implemented and covered by a test.
 | ✅ | `kprintf` with width/precision/64-bit support, levelled logging |
 | ✅ | **Per-call-site log rate limiting**, so ring 3 cannot flood the console |
 | ✅ | 64-bit division helpers — the kernel links against nothing at all |
-| ✅ | 37-command shell with line editing, history, and fault injection |
+| ✅ | 54-command shell with line editing, history, and fault injection |
 | ✅ | Embedded symbol table: panics print `function+0x1c`, no addr2line needed |
 | ✅ | 14 TSC-calibrated microbenchmarks, overhead-subtracted, median of 24 |
 | ✅ | Timer-driven sampling profiler with symbol attribution |
@@ -592,10 +603,17 @@ Everything marked ✅ is implemented and covered by a test.
 | ✅ | **IPv4** — header validation, the one's-complement checksum, one-gateway routing |
 | ✅ | **ICMP echo both ways** — the machine answers a ping, and `ping` works from the shell |
 | ✅ | **UDP** with the pseudo-header checksum, and the zero-means-none special case |
-| ✅ | **TCP**: three-way handshake, MSS option, a real send queue, retransmission with a bounded retry, half-open timeout, graceful close, and RFC 793 resets built from the offending segment |
+| ✅ | **Software loopback** — a datagram to this machine's own address is turned round in a queue, because a controller does not receive its own transmissions and `ping` on one's own address would otherwise time out |
+| ✅ | **TCP**: both opens, several connections demultiplexed on the four-tuple, MSS option, a real send queue, half-open timeout, graceful close, and RFC 793 resets built from the offending segment |
+| ✅ | **Congestion control by RFC 5681** — slow start, congestion avoidance, fast retransmit on three duplicate acknowledgements, fast recovery, and a loss window on timeout |
+| ✅ | **A measured retransmission timeout** — Jacobson's estimator with the variance term, exponential backoff, and Karn's rule so a retransmitted segment produces no sample |
+| ✅ | **DHCP** — the four-message exchange, and the existing configuration is untouched until an ACK arrives |
+| ✅ | **DNS** — a stub resolver with a cache, and a name parser hardened against the compression-pointer loop that is the classic remote denial of service in a DNS client |
+| ✅ | **An HTTP client** — one GET, all three ways an HTTP/1.1 response can be framed, including the one that ends when the server closes the connection |
+| ✅ | **BSD sockets as descriptors**, usable from ring 3: `socket`/`bind`/`listen`/`accept`/`connect`/`send`/`recv`/`sendto`/`recvfrom`/`shutdown`, and `read`/`write` work on them because a socket is a file |
 | ✅ | Per-layer counters, because "the ping did not come back" is a question about which layer stopped it |
-| ✅ | Verified against a **packet capture** parsed by CI, not against the kernel's own log |
-| ❌ | No congestion control, no out-of-order reassembly, no IP fragment reassembly, no DHCP, no sockets API — each with its reasoning in [docs/NETWORK.md](docs/NETWORK.md) |
+| ✅ | Verified against a **packet capture** parsed by CI, *and* against a real peer — QEMU's own DHCP server and an HTTP server on the host that counts what it served |
+| ❌ | No out-of-order reassembly, no TLS and therefore no `https`, no IP fragment reassembly, no window scaling or SACK, no `select` — each with its reasoning in [docs/NETWORK.md](docs/NETWORK.md) |
 
 ### Beyond 32-bit x86
 
@@ -604,7 +622,7 @@ Everything marked ✅ is implemented and covered by a test.
 | ✅ | **64-bit long mode, entered and left** — four-level page table, the documented enable sequence, a payload that is impossible in 32-bit mode, and the kernel still running afterwards |
 | ✅ | **A second architecture**: RISC-V 64 on QEMU's `virt` board — machine mode to supervisor mode by `mret`, two trap vectors, the CLINT timer, Sv39 three-level paging |
 | ✅ | The formatter, string layer, 64-bit division and logger linked into it **from the same source files** the x86 kernel uses |
-| ✅ | **55% of the kernel outside the architecture layer** compiles for RISC-V unmodified, measured by `make portability` rather than claimed |
+| ✅ | **63% of the kernel outside the architecture layer** compiles for RISC-V unmodified, measured by `make portability` rather than claimed |
 | ✅ | One `ARCH` variable drives both builds; each architecture's build lives beside its code |
 | ❌ | Not a 64-bit kernel and not a full port — the boundary of each claim is in [docs/LONGMODE.md](docs/LONGMODE.md) and [docs/PORTING.md](docs/PORTING.md) |
 
@@ -612,8 +630,8 @@ Everything marked ✅ is implemented and covered by a test.
 
 | | |
 | --- | --- |
-| ✅ | **21 in-kernel suites, 633 assertions**, run against real hardware state |
-| ✅ | **12 QEMU boot scenarios** — both boot paths, four processors, SMEP/SMAP, x86-64, an e1000, no e1000, and two that must panic |
+| ✅ | **24 in-kernel suites, 1123 assertions**, run against real hardware state |
+| ✅ | **13 QEMU boot scenarios** — both boot paths, four processors, SMEP/SMAP, x86-64, an e1000, no e1000, a real HTTP server on the host, and two that must panic |
 | ✅ | **Four libFuzzer targets over the real kernel sources** under AddressSanitizer, plus a ring-3 syscall fuzzer |
 | ✅ | 20 pre-boot validation checks on every link, before an image is ever booted |
 | ✅ | A disk-image validator: the MBR, the FAT geometry, every file in `/BIN` |
@@ -797,7 +815,7 @@ error: cast to 'void *' from smaller integer type 'u32' (aka 'unsigned int')
 ```
 
 `paddr_t` and `vaddr_t` were `typedef u32`. Correct on i386, silently
-truncating on anything wider, invisible to 633 passing assertions, and fixed
+truncating on anything wider, invisible to every assertion there was, and fixed
 by one line — `uintptr_t` was available the whole time. That is a latent
 correctness bug in shared code that **no amount of testing on one
 architecture could have surfaced**, which is the argument for porting as a
@@ -866,6 +884,84 @@ TCP echo result: (b'hello from the host\n', b'second line\n')
 
 Two separate writes echoed in order, connection closed to TIME_WAIT, zero
 retransmits.
+
+### And then actually on the internet
+
+```bash
+stratum> dhcp
+```
+
+```
+DISCOVER sent; waiting for an offer
+state     : bound
+messages  : 1 discover, 1 offer, 1 request, 1 ack, 0 nak, 0 timeout
+address   : 10.0.2.15
+netmask   : 255.255.255.0
+gateway   : 10.0.2.2
+dns       : 10.0.2.3
+lease     : 86400 second(s) (not renewed; see net/inet.h)
+```
+
+```bash
+stratum> fetch http://example.com/ -h
+```
+
+```
+GET / from example.com port 80
+status    : 200 OK
+type      : text/html; charset=utf-8
+headers   : 342 byte(s)
+body      : 577 byte(s), chunked
+```
+
+A real name resolved through a real resolver, a real page downloaded over an
+outgoing TCP connection, and a chunked body decoded. There is no TLS, so
+there is no `https`, and `fetch` says so rather than quietly trying port 443:
+TLS is a certificate store, a chain validator and four primitives where being
+approximately right is the same as being broken.
+
+**Why these three landed together with congestion control.** Each of the
+three gaps was blocked on the same thing — one connection. A sockets API
+needs a listener and an accepted connection at once; an outgoing connection
+needs the echo port still listening; and a congestion window on a stack that
+holds one connection cannot be tested against anything, because there is no
+second flow to be fair to. So the single static connection became a table,
+and then all four were possible.
+
+The send path used to be limited only by the peer's receive window, which is
+exactly wrong on a congested path in a way that is invisible on a loopback:
+the receive window says what the *peer* can absorb and nothing about what the
+*path between you* can carry. There are now two windows and the smaller
+governs, moving by RFC 5681 — and a retransmission timeout that is measured
+by Jacobson's estimator rather than the constant 500 ms it was.
+
+### Sockets, from ring 3
+
+```bash
+stratum> netcat
+```
+
+```
+[net] sockets from ring 3, pid 4
+  [net] ok: socket() gives a descriptor, fstat calls it a socket, lseek refuses
+  [net] ok: a UDP datagram went out and came back, with its sender
+  [net] ok: a TCP connection was opened from ring 3, and echoed what it sent
+  [net] ok: a listener accepted a connection from this same process, and both
+           ends carried data
+[net] all socket checks passed
+```
+
+The last one is the interesting one: a listener, a client and an accepted
+connection all alive at the same moment, in one single-threaded ring-3
+process. That is exactly what a single-connection stack could never have
+done, and it is why the connection table was made a table.
+
+The socket layer itself is a short file, and that is the payoff from having
+built file descriptors first. `read` is a receive, `write` is a send,
+`poll_read` is what makes a blocking receive work, and the only calls that
+needed anything new are the three with no file equivalent. A socket that was
+not a descriptor would have needed its own table, its own close-on-exit path,
+its own `fork` semantics and its own `read`.
 
 **The bug worth telling you about.** The first working driver transmitted
 every frame with a source MAC of `00:00:00:00:00:00`. `struct net_device`
@@ -1013,7 +1109,7 @@ QEMU.
 | **Host unit tests** | the kernel's real `printf`/`string`/`div64` sources, compiled for the host, diffed against glibc | 92 checks |
 | **Pre-boot validation** | Multiboot2 header and checksum, ELF type, entry point inside a load segment, load address, `.bss` alignment, the higher-half split, every embedded ring-3 program, absence of SSE | 20 failure conditions, every link |
 | **Image validation** | the boot signature, stage 1 not overlapping its own partition table, the stage 2 header pointing at a real ELF, every partition inside the image, the FAT geometry, and every file in `/BIN` being an i386 ELF with `INIT` among them | every image, every build |
-| **In-kernel suites** | allocator, paging, address spaces, copy-on-write, heap coalescing, interrupts, scheduler, processes, hardening, ATA and partitions, FAT16, ACPI/APIC/locks/IPIs, the 32→64→32 transition, checksums and the wire, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 633 checks in 21 suites |
+| **In-kernel suites** | allocator, paging, address spaces, copy-on-write, heap coalescing, interrupts, scheduler, processes, hardening, ATA and partitions, FAT16 reads and writes, path resolution and descriptors, ACPI/APIC/locks/IPIs, the 32→64→32 transition, checksums and the wire, TCP's connection table, DNS name compression, sockets and loopback, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 1123 checks in 24 suites |
 | **Boot scenarios** | custom bootloader unattended, **the same image on four processors**, the same image on a CPU with SMEP and SMAP, **the same image on a CPU with x86-64**, **the frames it puts on the wire, parsed from a pcap**, the same image with no Ethernet at all, GRUB/Multiboot2 unattended, 50 shell commands typed over serial, benchmarks + profile | 10 scenarios |
 | **Deliberate faults** | a write to the kernel's own `.text`, and a write below a task's stack — each must panic, naming the address, the reason and the region, and exit with the panic code | 2 scenarios |
 | **Fuzzing** | four libFuzzer targets over the **real** `elf.c`/`fat16.c`/`heap.c`/`acpi.c` under AddressSanitizer, plus 40,000 malformed system calls issued from ring 3 | 6 bugs found |

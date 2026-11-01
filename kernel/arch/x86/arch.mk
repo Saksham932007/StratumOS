@@ -121,7 +121,7 @@ STAGE2_BIN   := $(OUT)/stage2.bin
 # show that exec replaced an address space rather than reloading one; `fuzz`
 # attacks the syscall boundary from ring 3, which is the only seat from which
 # the kernel's pointer validation can actually be attacked.
-USER_PROGS := init hello fuzz
+USER_PROGS := init hello fuzz netcat
 USER_ELFS  := $(USER_PROGS:%=$(OUT)/user/%.elf)
 USER_BLOBS := $(USER_PROGS:%=$(OUT)/user/%_blob.o)
 

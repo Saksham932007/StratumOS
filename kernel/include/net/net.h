@@ -232,6 +232,42 @@ struct net_config {
 void net_configure(ipv4_addr addr, ipv4_addr netmask, ipv4_addr gateway);
 const struct net_config *net_get_config(void);
 
+/* ---- loopback ----------------------------------------------------------
+ *
+ * A datagram addressed to this machine's own address, or to anything in
+ * 127.0.0.0/8, never reaches a wire. That is not an optimisation and it is
+ * not optional: a network controller does not receive its own
+ * transmissions, and QEMU's user-mode networking does not reflect a frame
+ * sent to the guest's own address either. Without this, `ping 10.0.2.15`
+ * times out on the machine it is run on, and a program that connects to a
+ * server it is itself running cannot work at all.
+ *
+ * It is a queue rather than a direct call. Handing the datagram straight to
+ * ipv4_input() would work, and would nest: the receive would run TCP, which
+ * would send an acknowledgement, which would loop back, which would run TCP
+ * again - all on one kernel stack, with the depth decided by how much data
+ * was in flight. The queue bounds it at one, which is also how a real
+ * loopback device behaves: it is a network interface with a transmit ring,
+ * and nothing about it is synchronous.
+ */
+#define LOOPBACK_QUEUE_MAX 8
+
+/* Deliver whatever is queued. Called from net_poll(), and directly by a
+ * caller that is about to wait for a reply to something it just sent to
+ * itself. */
+u32 loopback_drain(void);
+u32 loopback_queued(void);
+
+struct loopback_stats {
+    u32 sent, delivered, dropped_full, dropped_big;
+};
+
+const struct loopback_stats *loopback_get_stats(void);
+
+/* Is this address one of ours - this machine's configured address, or
+ * 127.0.0.0/8? */
+bool net_is_loopback(ipv4_addr ip);
+
 /* Is this address on our own link, or does it need the gateway? The whole of
  * this stack's routing. */
 bool net_is_local(ipv4_addr ip);

@@ -481,6 +481,30 @@ SHELL_SCRIPT: list[tuple[str, list[str]]] = [
     ("stress 2 40", [r"heap integrity: consistent"]),
     ("ring3", [r"\[ring3\] hello from user mode",
                r"\[ring3\] calling exit\(0\)"]),
+    # After `ring3`, which is a once-per-boot demo: a command that spawns a
+    # ring-3 program consumes it, and running netcat first made `ring3`
+    # report it had already run.
+    # Loopback: a datagram to this machine's own address never reaches a
+    # wire, because a controller does not receive its own transmissions.
+    # Without it `ping` on one's own address times out, and a program that
+    # connects to a server it is itself running cannot work at all.
+    ("ping 10.0.2.15 1", [r"reply from 10\.0\.2\.15", r"0 lost"]),
+    ("selftest sock", [r"ktest: sock \.\.\. PASS"]),
+    ("selftest inet", [r"ktest: inet \.\.\. PASS"]),
+    # The socket layer driven from ring 3, which is the whole reason the
+    # descriptor table and the connection table were built. Every step is
+    # asserted individually, so a failure says which layer failed.
+    ("netcat",
+     [r"\[net\] sockets from ring 3, pid \d+",
+      r"ok: socket\(\) gives a descriptor, fstat calls it a socket",
+      r"ok: a UDP datagram went out and came back, with its sender",
+      r"ok: a TCP connection was opened from ring 3, and echoed what it sent",
+      r"ok: a listener accepted a connection from this same process",
+      r"\[net\] all socket checks passed",
+      r"exited with 0"]),
+    ("sockets", [r"open      : \d+ of 16",
+                 r"lifetime  : [1-9]\d* created, [1-9]\d* closed",
+                 r"bytes     : [1-9]\d* sent, [1-9]\d* received"]),
     ("nosuchcommand", [r"command not found"]),
     ("log debug", [r"log level set to DEBUG"]),
 ]

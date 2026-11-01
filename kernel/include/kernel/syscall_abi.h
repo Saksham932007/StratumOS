@@ -188,6 +188,17 @@ struct sys_dirent {
  */
 #define TIOCNREAD   1 /* how many bytes could be read without blocking   */
 #define TIOCSECHO   2 /* turn input echo on (arg != 0) or off            */
+/* Turn non-blocking mode on (arg != 0) or off, on anything that can block.
+ *
+ * This is fcntl(F_SETFL) under another name, and it is an ioctl because
+ * fcntl is a second general-purpose multiplexer onto descriptors and one is
+ * enough. O_NONBLOCK can also be passed to open(), but a socket is not
+ * opened by path, so without this there would be no way to make one
+ * non-blocking at all - which matters for the one case a single-threaded
+ * program cannot otherwise express: connecting to a listener it owns
+ * itself, where a blocking connect would wait for an accept the same
+ * process has not reached yet. */
+#define FIONBIO     3
 
 /* ---- sockets -----------------------------------------------------------
  *

@@ -131,6 +131,169 @@ static inline i32 sys_sync(void)
     return syscall3(SYS_SYNC, 0, 0, 0);
 }
 
+/* ---- sockets -----------------------------------------------------------
+ *
+ * The Berkeley calls, with two adaptations to a three-register convention.
+ * sendto and recvfrom pass a `struct sys_msg` because they want five
+ * arguments; setsockopt and getsockopt fold the level into the high half of
+ * the option name, because the level only ever holds SOL_SOCKET and a fourth
+ * register for a constant would be a strange trade.
+ */
+
+static inline i32 sys_socket(int domain, int type, int protocol)
+{
+    return syscall3(SYS_SOCKET, (u32)domain, (u32)type, (u32)protocol);
+}
+
+static inline i32 sys_bind(int fd, const struct sys_sockaddr *addr)
+{
+    return syscall3(SYS_BIND, (u32)fd, (u32)addr, 0);
+}
+
+static inline i32 sys_listen(int fd, int backlog)
+{
+    return syscall3(SYS_LISTEN, (u32)fd, (u32)backlog, 0);
+}
+
+/* `peer` may be null, in which case the caller does not learn who connected.
+ * Returns a new descriptor. */
+static inline i32 sys_accept(int fd, struct sys_sockaddr *peer)
+{
+    return syscall3(SYS_ACCEPT, (u32)fd, (u32)peer, 0);
+}
+
+static inline i32 sys_connect(int fd, const struct sys_sockaddr *addr)
+{
+    return syscall3(SYS_CONNECT, (u32)fd, (u32)addr, 0);
+}
+
+static inline i32 sys_send(int fd, const void *buf, u32 len)
+{
+    return syscall3(SYS_SEND, (u32)fd, (u32)buf, len);
+}
+
+static inline i32 sys_recv(int fd, void *buf, u32 len)
+{
+    return syscall3(SYS_RECV, (u32)fd, (u32)buf, len);
+}
+
+static inline i32 sys_sendto(int fd, const void *buf, u32 len,
+                             const struct sys_sockaddr *to)
+{
+    struct sys_msg m;
+
+    m.buf = (u32)buf;
+    m.len = len;
+    m.addr = (u32)to;
+    m.flags = 0;
+    return syscall3(SYS_SENDTO, (u32)fd, (u32)&m, 0);
+}
+
+static inline i32 sys_recvfrom(int fd, void *buf, u32 len,
+                               struct sys_sockaddr *from)
+{
+    struct sys_msg m;
+
+    m.buf = (u32)buf;
+    m.len = len;
+    m.addr = (u32)from;
+    m.flags = 0;
+    return syscall3(SYS_RECVFROM, (u32)fd, (u32)&m, 0);
+}
+
+/* Make a descriptor non-blocking. Named for what it does rather than for the
+ * ioctl it uses, because a program should not have to know that this kernel
+ * has no fcntl. */
+static inline i32 sys_fcntl_nonblock(int fd)
+{
+    return sys_ioctl(fd, FIONBIO, 1);
+}
+
+static inline i32 sys_shutdown(int fd, int how)
+{
+    return syscall3(SYS_SHUTDOWN, (u32)fd, (u32)how, 0);
+}
+
+static inline i32 sys_setsockopt(int fd, int level, int name, u32 value)
+{
+    return syscall3(SYS_SETSOCKOPT, (u32)fd,
+                    ((u32)level << 16) | ((u32)name & 0xFFFFu), value);
+}
+
+static inline i32 sys_getsockopt(int fd, int level, int name, u32 *out)
+{
+    return syscall3(SYS_GETSOCKOPT, (u32)fd,
+                    ((u32)level << 16) | ((u32)name & 0xFFFFu), (u32)out);
+}
+
+/* Turn a name into an IPv4 address, in network byte order. A dotted quad
+ * resolves to itself without a query. */
+static inline i32 sys_resolve(const char *name, unsigned int *addr_out)
+{
+    return syscall3(SYS_RESOLVE, (u32)name, (u32)addr_out, 0);
+}
+
+/* Byte order, for user code. Written out rather than taken from the kernel's
+ * headers, because this file is the whole of what a program compiles
+ * against. */
+static inline unsigned short u_htons(unsigned short v)
+{
+    return (unsigned short)((v << 8) | (v >> 8));
+}
+
+static inline unsigned short u_ntohs(unsigned short v)
+{
+    return u_htons(v);
+}
+
+/* Fill in a sockaddr. `addr` is already in network order - which is what
+ * sys_resolve returns - and `port` is in host order, because a port is a
+ * number a programmer writes. */
+static inline void u_sockaddr(struct sys_sockaddr *sa, unsigned int addr,
+                              unsigned short port)
+{
+    unsigned int i;
+    unsigned char *p = (unsigned char *)sa;
+
+    for (i = 0; i < sizeof(*sa); i++)
+        p[i] = 0;
+
+    sa->family = AF_INET;
+    sa->port = u_htons(port);
+    sa->addr = addr;
+}
+
+/* "10.0.2.2" -> an address in network byte order. Returns 0 on anything that
+ * is not four decimal octets, which is also why 0.0.0.0 cannot be expressed:
+ * a program that wants the any-address does not need to parse it. */
+static inline unsigned int u_inet_addr(const char *s)
+{
+    unsigned int octet[4] = {0, 0, 0, 0};
+    int i = 0;
+    int digits = 0;
+
+    for (; *s; s++) {
+        if (*s >= '0' && *s <= '9') {
+            octet[i] = octet[i] * 10u + (unsigned int)(*s - '0');
+            if (octet[i] > 255)
+                return 0;
+            digits++;
+            continue;
+        }
+
+        if (*s != '.' || !digits || i == 3)
+            return 0;
+
+        i++;
+        digits = 0;
+    }
+
+    if (i != 3 || !digits)
+        return 0;
+
+    return octet[0] | (octet[1] << 8) | (octet[2] << 16) | (octet[3] << 24);
+}
+
 static inline i32 sys_getpid(void)
 {
     return syscall3(SYS_GETPID, 0, 0, 0);

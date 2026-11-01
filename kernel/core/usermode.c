@@ -56,6 +56,8 @@ extern const u8 _binary_hello_elf_start[];
 extern const u8 _binary_hello_elf_end[];
 extern const u8 _binary_fuzz_elf_start[];
 extern const u8 _binary_fuzz_elf_end[];
+extern const u8 _binary_netcat_elf_start[];
+extern const u8 _binary_netcat_elf_end[];
 
 /* The programs this kernel can run, by name.
  *
@@ -74,6 +76,7 @@ static const struct {
     {"init", _binary_init_elf_start, _binary_init_elf_end},
     {"hello", _binary_hello_elf_start, _binary_hello_elf_end},
     {"fuzz", _binary_fuzz_elf_start, _binary_fuzz_elf_end},
+    {"netcat", _binary_netcat_elf_start, _binary_netcat_elf_end},
 };
 
 static bool ran;

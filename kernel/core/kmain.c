@@ -61,6 +61,7 @@
 #include <fs/fat16.h>
 #include <fs/vfs.h>
 #include <net/net.h>
+#include <net/socket.h>
 
 /* QEMU `isa-debug-exit` turns a port write into a process exit status of
  * (code << 1) | 1, so these become 3, 5 and 35 respectively. */
@@ -494,8 +495,15 @@ void kmain(u32 magic, u32 info_addr)
     vfs_init();
     devfs_init();
     fatfs_init();
+    /* Sockets are the third backend and the reason the other two were
+     * written behind an interface rather than called directly. Initialised
+     * here rather than in net_init() because a socket is a descriptor first
+     * and a network object second: it needs the VFS, which comes up long
+     * after the PCI scan that finds the controller. */
+    socket_init();
     log_boot_step("vfs", true,
-                  fat16_mounted() ? "devfs + fat16" : "devfs only");
+                  fat16_mounted() ? "devfs + fat16 + sockets"
+                                  : "devfs + sockets");
 
     /* 11. Tasks, then the syscall gate they will use. */
     sched_init();

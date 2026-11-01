@@ -211,6 +211,12 @@ u32 net_poll(u32 max_frames)
     /* The timers run on every poll rather than on a separate tick, so that a
      * retransmission happens even if nothing is arriving - which is exactly
      * the situation a retransmission exists for. */
+    /* Anything this machine sent to itself. Drained before the timers, so
+     * that a loopback acknowledgement is seen as having arrived rather than
+     * as having been lost - which would make a connection to oneself
+     * retransmit on every poll. */
+    handled += loopback_drain();
+
     tcp_tick();
 
     /* The application protocols' timers, for the same reason: a DHCP
