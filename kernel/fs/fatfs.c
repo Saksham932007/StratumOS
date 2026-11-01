@@ -30,6 +30,33 @@
 #include <fs/fat16.h>
 #include <fs/vfs.h>
 
+/* One place that turns a FAT create failure into an errno, used by both
+ * open(O_CREAT) and mkdir() so the two cannot disagree about what a given
+ * failure means. */
+static i32 create_error_to_errno(enum fat_create_error e)
+{
+    switch (e) {
+    case FAT_CREATE_OK:
+        return 0;
+    case FAT_CREATE_NO_PARENT:
+        return SYS_ENOENT;
+    case FAT_CREATE_BAD_NAME:
+        /* 8.3 cannot hold the name. ENAMETOOLONG rather than EINVAL because
+         * that is overwhelmingly the reason - and a caller that shortens the
+         * name will succeed, which is what the error should suggest. */
+        return SYS_ENAMETOOLONG;
+    case FAT_CREATE_BAD_PATH:
+        return SYS_EINVAL;
+    case FAT_CREATE_EXISTS:
+        return SYS_EEXIST;
+    case FAT_CREATE_FULL:
+        return SYS_ENOSPC;
+    case FAT_CREATE_IO:
+    default:
+        return SYS_EIO;
+    }
+}
+
 /* The per-open state: the directory entry, copied. Small enough that the
  * allocation is the only reason this is not stored inline in struct vfs_file,
  * and it is kept out of there so that struct vfs_file does not grow a member
@@ -41,6 +68,8 @@ struct fatfs_open {
 static u32 opens;
 static u32 reads;
 static u32 bytes_read;
+static u32 writes;
+static u32 bytes_written;
 
 static i32 fatfs_read(struct vfs_file *f, void *buf, u32 len)
 {
@@ -71,6 +100,48 @@ static i32 fatfs_read(struct vfs_file *f, void *buf, u32 len)
     return got;
 }
 
+static i32 fatfs_write(struct vfs_file *f, const void *buf, u32 len)
+{
+    struct fatfs_open *o = f->priv;
+
+    if (!o)
+        return SYS_EBADF;
+
+    i32 wrote = fat16_write(&o->ent, f->offset, buf, len);
+
+    if (wrote < 0)
+        return SYS_EIO;
+
+    f->offset += (u32)wrote;
+    writes++;
+    bytes_written += (u32)wrote;
+
+    /* A short write is a full disk, not an error. The caller sees fewer bytes
+     * than it asked for and can decide what to do; returning ENOSPC after
+     * having written half of them would lose the information that half got
+     * through. */
+    return wrote;
+}
+
+static i32 fatfs_truncate(struct vfs_file *f, u32 length)
+{
+    struct fatfs_open *o = f->priv;
+
+    if (!o)
+        return SYS_EBADF;
+
+    if (!fat16_truncate(&o->ent, length))
+        return SYS_EIO;
+
+    /* The position is clamped rather than left where it was. A descriptor
+     * sitting past the end of a file it just shortened would have its next
+     * write open a hole, which is not what truncate was asked to do. */
+    if (f->offset > o->ent.size)
+        f->offset = o->ent.size;
+
+    return 0;
+}
+
 static i32 fatfs_seek(struct vfs_file *f, i32 offset, int whence)
 {
     struct fatfs_open *o = f->priv;
@@ -94,13 +165,20 @@ static i32 fatfs_seek(struct vfs_file *f, i32 offset, int whence)
     }
 
     /* Computed in 64 bits and then checked, so that a negative or enormous
-     * offset cannot wrap into a plausible-looking position. A seek past the
-     * end is legal on a real filesystem and would create a hole on write; it
-     * is rejected here because this driver cannot write, and allowing a
-     * position no read could ever use would only hide the error. */
+     * offset cannot wrap into a plausible-looking position.
+     *
+     * A seek past the end is allowed on a descriptor that can write, because
+     * writing there is how a file gets a hole - and fat16_write() fills the
+     * gap with zeros, so the hole is readable rather than whatever the
+     * clusters used to hold. On a read-only descriptor the same seek is
+     * refused: it would leave the position somewhere no read could ever
+     * return from, which hides the caller's arithmetic error instead of
+     * reporting it. */
     i64 want = base + (i64)offset;
+    bool may_write = (f->flags & O_ACCMODE) != O_RDONLY;
+    i64 limit = may_write ? (i64)0xFFFFFFFFll : (i64)o->ent.size;
 
-    if (want < 0 || want > (i64)o->ent.size)
+    if (want < 0 || want > limit)
         return SYS_EINVAL;
 
     f->offset = (u32)want;
@@ -149,8 +227,10 @@ static void fatfs_close(struct vfs_file *f)
 static const struct vfs_ops fatfs_file_ops = {
     .name = "fat16",
     .read = fatfs_read,
+    .write = fatfs_write,
     .seek = fatfs_seek,
     .stat = fatfs_stat_file,
+    .truncate = fatfs_truncate,
     .close = fatfs_close,
 };
 
@@ -168,31 +248,64 @@ static i32 fatfs_open(const char *path, u32 flags, struct vfs_file *f)
     if (!fat16_mounted())
         return SYS_ENOENT;
 
-    /* Read-only, and the check goes *before* the lookup deliberately.
-     *
-     * Doing it after meant that open("/new.txt", O_WRONLY | O_CREAT) failed
-     * the lookup first and returned ENOENT - which tells the caller the file
-     * is missing and invites it to create one, which is the thing that
-     * cannot work. EROFS says the filesystem will never accept a write, so
-     * retrying is pointless. The suite asserts this ordering because the
-     * first version of this file had it the wrong way round.
-     *
-     * O_TRUNC is included for the same reason: it modifies the file. */
-    if ((flags & O_ACCMODE) != O_RDONLY || (flags & (O_CREAT | O_TRUNC)))
-        return SYS_EROFS;
+    bool wants_write = (flags & O_ACCMODE) != O_RDONLY;
 
     /* The root directory has no directory entry of its own to find, so it is
      * synthesised. Without this, opendir("/") - the first thing any `ls`
      * does - would fail on a filesystem that is plainly mounted. */
     bool is_root = path[0] == '/' && path[1] == '\0';
+    bool exists;
 
     if (is_root) {
         memset(&ent, 0, sizeof(ent));
         strlcpy(ent.name, "/", sizeof(ent.name));
         ent.is_dir = true;
         ent.attr = FAT_ATTR_DIRECTORY;
-    } else if (!fat16_stat(path, &ent)) {
-        return SYS_ENOENT;
+        exists = true;
+    } else {
+        exists = fat16_stat(path, &ent);
+    }
+
+    /* The flag combinations, in the order their refusals are most specific.
+     *
+     * O_EXCL before "does not exist", because a caller that asked for
+     * exclusive creation and found the file already there wants EEXIST, not a
+     * report about what it was going to do. */
+    if (exists && (flags & O_CREAT) && (flags & O_EXCL))
+        return SYS_EEXIST;
+
+    if (exists && ent.is_dir && wants_write)
+        return SYS_EISDIR;
+
+    if (!exists) {
+        if (!(flags & O_CREAT))
+            return SYS_ENOENT;
+
+        if (!fat16_writable())
+            return SYS_EROFS;
+
+        /* Created only now, after every reason to refuse has been ruled out.
+         * A create that happened earlier and was then rejected for a flag
+         * would leave an empty file behind as a side effect of a failed
+         * open. */
+        enum fat_create_error e = fat16_create_ex(path, false, &ent);
+
+        if (e != FAT_CREATE_OK)
+            return create_error_to_errno(e);
+    }
+
+    if (wants_write && !fat16_writable())
+        return SYS_EROFS;
+
+    /* O_TRUNC on an existing file, once it is known that writing is allowed.
+     * Truncation is a modification, so it needs write access - a read-only
+     * open with O_TRUNC is a contradiction rather than a request. */
+    if (exists && (flags & O_TRUNC) && !ent.is_dir) {
+        if (!wants_write)
+            return SYS_EINVAL;
+
+        if (!fat16_truncate(&ent, 0))
+            return SYS_EIO;
     }
 
     if (!ent.is_dir && (flags & O_DIRECTORY))
@@ -225,7 +338,7 @@ static i32 fatfs_stat_path(const char *path, struct sys_stat *out)
 
     if (path[0] == '/' && path[1] == '\0') {
         out->type = S_TYPE_DIR;
-        out->mode = S_MODE_READ;
+        out->mode = S_MODE_READ | (fat16_writable() ? S_MODE_WRITE : 0);
         return 0;
     }
 
@@ -234,7 +347,7 @@ static i32 fatfs_stat_path(const char *path, struct sys_stat *out)
 
     out->size = ent.size;
     out->type = ent.is_dir ? S_TYPE_DIR : S_TYPE_FILE;
-    out->mode = S_MODE_READ;
+    out->mode = S_MODE_READ | (fat16_writable() ? S_MODE_WRITE : 0);
     out->blocks =
         info && info->cluster_bytes
             ? (ent.size + info->cluster_bytes - 1) / info->cluster_bytes
@@ -246,11 +359,99 @@ static i32 fatfs_stat_path(const char *path, struct sys_stat *out)
 /* "/" rather than "/mnt" or anything else: this is the root filesystem, and
  * the prefix match in the VFS makes it the fallback for every path no other
  * filesystem claims. */
+static i32 fatfs_unlink(const char *path)
+{
+    struct fat_dirent ent;
+
+    if (!fat16_mounted())
+        return SYS_ENOENT;
+    if (!fat16_writable())
+        return SYS_EROFS;
+
+    /* Distinguished before attempting it, so the caller is told which of the
+     * two reasons applied. fat16_unlink() refuses a directory too, but it can
+     * only return false, and "no such file" and "that is a directory" lead a
+     * caller to do different things. */
+    if (!fat16_stat(path, &ent))
+        return SYS_ENOENT;
+
+    if (ent.is_dir)
+        return SYS_EISDIR;
+
+    return fat16_unlink(path) ? 0 : SYS_EIO;
+}
+
+static i32 fatfs_mkdir(const char *path)
+{
+    struct fat_dirent ent;
+
+    if (!fat16_mounted())
+        return SYS_ENOENT;
+    if (!fat16_writable())
+        return SYS_EROFS;
+
+    if (fat16_stat(path, &ent))
+        return SYS_EEXIST;
+
+    return create_error_to_errno(fat16_create_ex(path, true, NULL));
+}
+
+static i32 fatfs_rmdir(const char *path)
+{
+    struct fat_dirent ent;
+
+    if (!fat16_mounted())
+        return SYS_ENOENT;
+    if (!fat16_writable())
+        return SYS_EROFS;
+
+    if (!fat16_stat(path, &ent))
+        return SYS_ENOENT;
+
+    if (!ent.is_dir)
+        return SYS_ENOTDIR;
+
+    /* The only remaining reason fat16_rmdir() refuses a directory that exists
+     * and is a directory is that it still has something in it. */
+    return fat16_rmdir(path) ? 0 : SYS_ENOTEMPTY;
+}
+
+static i32 fatfs_rename(const char *from, const char *to)
+{
+    struct fat_dirent ent;
+
+    if (!fat16_mounted())
+        return SYS_ENOENT;
+    if (!fat16_writable())
+        return SYS_EROFS;
+
+    if (!fat16_stat(from, &ent))
+        return SYS_ENOENT;
+
+    if (fat16_stat(to, &ent))
+        return SYS_EEXIST;
+
+    return fat16_rename(from, to) ? 0 : SYS_EIO;
+}
+
+static i32 fatfs_sync(void)
+{
+    if (!fat16_mounted())
+        return 0;
+
+    return fat16_sync() ? 0 : SYS_EIO;
+}
+
 static const struct vfs_fs fatfs = {
     .prefix = "/",
     .name = "fat16",
     .open = fatfs_open,
     .stat = fatfs_stat_path,
+    .unlink = fatfs_unlink,
+    .mkdir = fatfs_mkdir,
+    .rmdir = fatfs_rmdir,
+    .rename = fatfs_rename,
+    .sync = fatfs_sync,
 };
 
 void fatfs_init(void)
@@ -266,4 +467,12 @@ void fatfs_counters(u32 *o, u32 *r, u32 *b)
         *r = reads;
     if (b)
         *b = bytes_read;
+}
+
+void fatfs_write_counters(u32 *w, u32 *b)
+{
+    if (w)
+        *w = writes;
+    if (b)
+        *b = bytes_written;
 }

@@ -54,10 +54,31 @@ const struct ata_drive *ata_get_drive(u32 index);
  * the buffer can hold. */
 bool ata_read(u32 drive, u64 lba, u32 count, void *buf);
 
+/* Write `count` sectors from `buf` starting at `lba`. Split the same way as
+ * a read, bounds-checked the same way, and followed by a cache flush.
+ *
+ * The flush is not optional and is the only part of writing that has no
+ * counterpart in the read path. A drive acknowledges WRITE SECTORS once the
+ * data is in its write-back cache, not once it is on the platter; without
+ * FLUSH CACHE a filesystem that updated its allocation table and then lost
+ * power has no guarantee about which of its writes survived - and the whole
+ * difficulty of writing a filesystem is reasoning about exactly that
+ * ordering. See fs/fat16.h on write ordering, and docs/STORAGE.md. */
+bool ata_write(u32 drive, u64 lba, u32 count, const void *buf);
+
+/* Ask the drive to commit its write cache to the medium. Called at the end of
+ * every ata_write(), and exposed because a filesystem that has just finished
+ * a multi-step update wants one flush after the last step rather than one
+ * per sector. */
+bool ata_flush(u32 drive);
+
 /* Counters, for `disk` in the shell and for the test suite. */
 struct ata_stats {
     u32 reads; /* ata_read() calls                    */
     u32 sectors_read;
+    u32 writes; /* ata_write() calls                   */
+    u32 sectors_written;
+    u32 flushes;
     u32 commands; /* individual ATA commands issued      */
     u32 errors;
     u32 timeouts;

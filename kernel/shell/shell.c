@@ -1182,6 +1182,297 @@ static int cmd_ls(int argc, char **argv)
     return 0;
 }
 
+/* ---- writing ------------------------------------------------------------
+ *
+ * These exist so that the write path can be driven by hand and, more
+ * importantly, by the test harness over the serial console - which is how the
+ * `filesystem-durability` scenario creates a file in one boot and another
+ * tool checks the disk image afterwards. A write path verified only by the
+ * kernel's own assertions is a write path verified by the thing under test.
+ */
+static int cmd_write(int argc, char **argv)
+{
+    if (argc < 3) {
+        kprintf("usage: write <path> <text...>\n");
+        kprintf("       appends a line to a file, creating it if needed\n");
+        return 1;
+    }
+
+    char abs[VFS_PATH_MAX];
+
+    if (!fd_resolve(argv[1], abs, sizeof(abs))) {
+        kprintf("%s: path too long\n", argv[1]);
+        return 1;
+    }
+
+    i32 fd = fd_open(abs, O_WRONLY | O_CREAT | O_APPEND);
+
+    if (fd < 0) {
+        kprintf("%s: %s\n", abs, sys_strerror(fd));
+        return 1;
+    }
+
+    u32 total = 0;
+
+    for (int i = 2; i < argc; i++) {
+        const char *word = argv[i];
+        u32 len = (u32)strlen(word);
+        i32 wrote = fd_write(fd, word, len);
+
+        if (wrote < 0) {
+            kprintf("%s: %s\n", abs, sys_strerror(wrote));
+            fd_close(fd);
+            return 1;
+        }
+
+        total += (u32)wrote;
+
+        /* A separator between words, and a newline at the end, so that the
+         * file holds the line the user typed rather than its words run
+         * together. */
+        const char *tail = (i + 1 < argc) ? " " : "\n";
+        i32 n = fd_write(fd, tail, 1);
+
+        if (n > 0)
+            total += (u32)n;
+    }
+
+    if (fd_close(fd) < 0) {
+        kprintf("%s: close failed\n", abs);
+        return 1;
+    }
+
+    kprintf("wrote %u byte(s) to %s\n", total, abs);
+    return 0;
+}
+
+/* One helper for the four commands that take a path and either work or do
+ * not. Each is two lines of its own, so the table below stays readable. */
+static int path_command(int argc, char **argv, const char *usage,
+                        i32 (*op)(const char *), const char *verb)
+{
+    if (argc < 2) {
+        kprintf("usage: %s\n", usage);
+        return 1;
+    }
+
+    char abs[VFS_PATH_MAX];
+
+    if (!fd_resolve(argv[1], abs, sizeof(abs))) {
+        kprintf("%s: path too long\n", argv[1]);
+        return 1;
+    }
+
+    i32 e = op(abs);
+
+    if (e < 0) {
+        kprintf("%s: %s\n", abs, sys_strerror(e));
+        return 1;
+    }
+
+    kprintf("%s %s\n", verb, abs);
+    return 0;
+}
+
+static int cmd_rm(int argc, char **argv)
+{
+    return path_command(argc, argv, "rm <path>", vfs_unlink, "removed");
+}
+
+static int cmd_mkdir(int argc, char **argv)
+{
+    return path_command(argc, argv, "mkdir <path>", vfs_mkdir, "created");
+}
+
+static int cmd_rmdir(int argc, char **argv)
+{
+    return path_command(argc, argv, "rmdir <path>", vfs_rmdir, "removed");
+}
+
+static int cmd_touch(int argc, char **argv)
+{
+    if (argc < 2) {
+        kprintf("usage: touch <path>\n");
+        return 1;
+    }
+
+    char abs[VFS_PATH_MAX];
+
+    if (!fd_resolve(argv[1], abs, sizeof(abs))) {
+        kprintf("%s: path too long\n", argv[1]);
+        return 1;
+    }
+
+    /* Not O_EXCL: touching a file that exists is a no-op, not an error. */
+    i32 fd = fd_open(abs, O_WRONLY | O_CREAT);
+
+    if (fd < 0) {
+        kprintf("%s: %s\n", abs, sys_strerror(fd));
+        return 1;
+    }
+
+    fd_close(fd);
+    kprintf("touched %s\n", abs);
+    return 0;
+}
+
+static int cmd_mv(int argc, char **argv)
+{
+    if (argc < 3) {
+        kprintf("usage: mv <from> <to>\n");
+        return 1;
+    }
+
+    char from[VFS_PATH_MAX];
+    char to[VFS_PATH_MAX];
+
+    if (!fd_resolve(argv[1], from, sizeof(from)) ||
+        !fd_resolve(argv[2], to, sizeof(to))) {
+        kprintf("path too long\n");
+        return 1;
+    }
+
+    i32 e = vfs_rename(from, to);
+
+    if (e < 0) {
+        kprintf("%s -> %s: %s\n", from, to, sys_strerror(e));
+        return 1;
+    }
+
+    kprintf("renamed %s to %s\n", from, to);
+    return 0;
+}
+
+static int cmd_cp(int argc, char **argv)
+{
+    if (argc < 3) {
+        kprintf("usage: cp <from> <to>\n");
+        return 1;
+    }
+
+    char from[VFS_PATH_MAX];
+    char to[VFS_PATH_MAX];
+
+    if (!fd_resolve(argv[1], from, sizeof(from)) ||
+        !fd_resolve(argv[2], to, sizeof(to))) {
+        kprintf("path too long\n");
+        return 1;
+    }
+
+    i32 in = fd_open(from, O_RDONLY);
+
+    if (in < 0) {
+        kprintf("%s: %s\n", from, sys_strerror(in));
+        return 1;
+    }
+
+    /* O_EXCL: a copy that silently overwrote its destination would be a
+     * destructive command that looks harmless. */
+    i32 out = fd_open(to, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC);
+
+    if (out < 0) {
+        kprintf("%s: %s\n", to, sys_strerror(out));
+        fd_close(in);
+        return 1;
+    }
+
+    char buf[512];
+    u32 total = 0;
+    bool ok = true;
+
+    for (;;) {
+        i32 got = fd_read(in, buf, sizeof(buf));
+
+        if (got < 0) {
+            kprintf("%s: %s\n", from, sys_strerror(got));
+            ok = false;
+            break;
+        }
+
+        if (got == 0)
+            break;
+
+        i32 put = fd_write(out, buf, (u32)got);
+
+        if (put < got) {
+            kprintf("%s: %s\n", to,
+                    put < 0 ? sys_strerror(put) : "short write (disk full?)");
+            ok = false;
+            break;
+        }
+
+        total += (u32)put;
+    }
+
+    fd_close(in);
+    fd_close(out);
+
+    if (!ok)
+        return 1;
+
+    kprintf("copied %u byte(s) to %s\n", total, to);
+    return 0;
+}
+
+static int cmd_sync(int argc, char **argv)
+{
+    UNUSED(argc);
+    UNUSED(argv);
+
+    i32 e = vfs_sync();
+
+    if (e < 0) {
+        kprintf("sync: %s\n", sys_strerror(e));
+        return 1;
+    }
+
+    kprintf("sync: every filesystem flushed\n");
+    return 0;
+}
+
+static int cmd_df(int argc, char **argv)
+{
+    UNUSED(argc);
+    UNUSED(argv);
+
+    if (!fat16_mounted()) {
+        kprintf("nothing is mounted\n");
+        return 1;
+    }
+
+    u32 free_clusters = 0, total_clusters = 0;
+
+    if (!fat16_space(&free_clusters, &total_clusters)) {
+        kprintf("df: cannot read the allocation table\n");
+        return 1;
+    }
+
+    const struct fat_info *f = fat16_get_info();
+    u32 kib = f->cluster_bytes / 1024;
+
+    kprintf("  %-10s %10s %10s %10s %5s  %s\n", "FILESYSTEM", "SIZE", "USED",
+            "FREE", "USE%", "MOUNT");
+    kprintf("  %-10s %9uK %9uK %9uK %4u%%  %s\n", "fat16", total_clusters * kib,
+            (total_clusters - free_clusters) * kib, free_clusters * kib,
+            total_clusters
+                ? (total_clusters - free_clusters) * 100 / total_clusters
+                : 0,
+            "/");
+    kprintf("  counted by scanning the allocation table: %u of %u clusters "
+            "free, %u bytes each\n",
+            free_clusters, total_clusters, f->cluster_bytes);
+
+    u32 writes = 0, sectors = 0, allocated = 0, freed = 0, dirents = 0;
+
+    fat16_write_stats(&writes, &sectors, &allocated, &freed, &dirents);
+    kprintf("  writes    : %u call(s), %u sector(s) written\n", writes,
+            sectors);
+    kprintf("  clusters  : %u allocated, %u freed\n", allocated, freed);
+    kprintf("  dirents   : %u update(s)\n", dirents);
+
+    return 0;
+}
+
 static int cmd_pwd(int argc, char **argv)
 {
     UNUSED(argc);
@@ -1880,6 +2171,15 @@ static const struct shell_command commands[] = {
     {"ls", "ls [path]", "list a directory", cmd_ls},
     {"cat", "cat <path>", "print a file or device", cmd_cat},
     {"cd", "cd [path]", "change the working directory", cmd_cd},
+    {"write", "write <path> <text...>", "append a line to a file", cmd_write},
+    {"touch", "touch <path>", "create an empty file", cmd_touch},
+    {"rm", "rm <path>", "remove a file", cmd_rm},
+    {"mkdir", "mkdir <path>", "create a directory", cmd_mkdir},
+    {"rmdir", "rmdir <path>", "remove an empty directory", cmd_rmdir},
+    {"mv", "mv <from> <to>", "rename a file or directory", cmd_mv},
+    {"cp", "cp <from> <to>", "copy a file", cmd_cp},
+    {"sync", "sync", "flush every filesystem to its device", cmd_sync},
+    {"df", "df", "free space, and what writing has done", cmd_df},
     {"pwd", "pwd", "print the working directory", cmd_pwd},
     {"fds", "fds",
      "open files, the descriptor pool and per-backend "

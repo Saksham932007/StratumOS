@@ -96,6 +96,41 @@ bool blockdev_read(const struct blockdev *dev, u64 offset, u32 count, void *buf)
     return ata_read(dev->drive, dev->first_lba + offset, count, buf);
 }
 
+/* The write side of the same translation, and the same bounds check.
+ *
+ * The check matters more here. A read that runs past a partition returns the
+ * wrong bytes and a filesystem notices, eventually, that its metadata makes
+ * no sense. A write that runs past a partition destroys whatever is next on
+ * the disk - which on this image is either the other partition or, at offset
+ * zero, the boot sector and the partition table that describe where anything
+ * is. The whole reason this layer exists is so that "within this partition"
+ * is checked once instead of in every caller.
+ */
+bool blockdev_write(const struct blockdev *dev, u64 offset, u32 count,
+                    const void *buf)
+{
+    if (!dev || !dev->present) {
+        pr_err("write to a device that is not present");
+        return false;
+    }
+
+    if (offset + count > dev->sectors || offset + count < offset) {
+        pr_err("%s: write of %u blocks at %llu runs past the device's %llu",
+               dev->name, count, offset, dev->sectors);
+        return false;
+    }
+
+    return ata_write(dev->drive, dev->first_lba + offset, count, buf);
+}
+
+bool blockdev_flush(const struct blockdev *dev)
+{
+    if (!dev || !dev->present)
+        return false;
+
+    return ata_flush(dev->drive);
+}
+
 static struct blockdev *alloc_device(void)
 {
     for (u32 i = 0; i < ARRAY_SIZE(devices); i++)

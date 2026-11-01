@@ -2430,6 +2430,464 @@ static void test_vfs_paths(struct ktest_result *r)
     KT_ASSERT(r, !vfs_resolve("/", "/bin", tiny, sizeof(tiny)));
 }
 
+/* ------------------------------------------------------------------------- */
+/* Writing to the filesystem                                                */
+/* ------------------------------------------------------------------------- */
+
+/* Everything this suite creates, it removes. That is not tidiness - it is
+ * what makes the suite runnable twice.
+ *
+ * A write test mutates the disk image, and the image is a build artefact that
+ * is not regenerated between boots. Six CI scenarios boot the same
+ * stratum-test.img and run these assertions, one after another. A suite that
+ * created /TEST.TXT and left it there would pass in the first scenario and
+ * fail in the second with EEXIST - and would then pass again after a rebuild,
+ * which is the worst possible failure mode: a test that depends on how
+ * recently `make` ran.
+ *
+ * So the first thing it does is delete anything a previous run left behind,
+ * ignoring the result, and the last thing it does is delete what it made.
+ */
+#define TEST_FILE  "/KTEST.TXT"
+#define TEST_FILE2 "/KTEST2.TXT"
+#define TEST_DIR   "/KTESTDIR"
+
+static void vfs_write_cleanup(void)
+{
+    /* Order matters: the directory has to be emptied before it can go. */
+    (void)vfs_unlink(TEST_DIR "/INNER.TXT");
+    (void)vfs_rmdir(TEST_DIR);
+    (void)vfs_unlink(TEST_FILE);
+    (void)vfs_unlink(TEST_FILE2);
+}
+
+static void test_vfs_write(struct ktest_result *r)
+{
+    if (!fat16_mounted()) {
+        /* On the GRUB ISO path there is nothing to write to, and every write
+         * call has to say so rather than fail in a way that suggests the
+         * attempt nearly worked. */
+        log_expect_errors(true);
+        KT_EQ(r, fd_open(TEST_FILE, O_WRONLY | O_CREAT), SYS_ENOENT);
+        KT_EQ(r, vfs_mkdir(TEST_DIR), SYS_ENOENT);
+        KT_EQ(r, vfs_unlink(TEST_FILE), SYS_ENOENT);
+        log_expect_errors(false);
+        return;
+    }
+
+    KT_ASSERT(r, fat16_writable());
+
+    u32 open_before = vfs_open_count();
+
+    log_expect_errors(true);
+    vfs_write_cleanup();
+    log_expect_errors(false);
+
+    /* --- free space is a real number, read off the disk ---------------- */
+    u32 free_before = 0, total = 0;
+
+    KT_ASSERT(r, fat16_space(&free_before, &total));
+    KT_ASSERT(r, total > 0);
+    KT_ASSERT(r, free_before > 0);
+    KT_ASSERT(r, free_before <= total);
+
+    /* --- create, write, close, reopen, read back ----------------------- */
+    static const char payload[] =
+        "StratumOS wrote this through the VFS, onto a FAT16 partition, "
+        "with a cluster allocated from the allocation table and both "
+        "copies of that table updated.\n";
+    const u32 payload_len = (u32)(sizeof(payload) - 1);
+
+    i32 fd = fd_open(TEST_FILE, O_WRONLY | O_CREAT | O_EXCL);
+
+    KT_ASSERT(r, fd >= 0);
+
+    if (fd < 0) {
+        log_expect_errors(true);
+        vfs_write_cleanup();
+        log_expect_errors(false);
+        return;
+    }
+
+    KT_EQ(r, fd_write(fd, payload, payload_len), (i32)payload_len);
+
+    /* A write-only descriptor refuses a read, by access mode. */
+    log_expect_errors(true);
+    KT_EQ(r, fd_read(fd, (char[8]){0}, 8), SYS_EINVAL);
+    log_expect_errors(false);
+
+    struct sys_stat st;
+
+    KT_EQ(r, fd_stat(fd, &st), 0);
+    KT_EQ(r, st.size, payload_len);
+    KT_ASSERT(r, st.blocks >= 1);
+    KT_EQ(r, fd_close(fd), 0);
+
+    /* Reopened from scratch, so what is read back comes off the disk via a
+     * fresh directory lookup rather than out of the descriptor that wrote
+     * it. That is the difference between testing the write and testing the
+     * buffer it was written from. */
+    char back[256];
+
+    KT_ASSERT(r, payload_len <= sizeof(back));
+
+    fd = fd_open(TEST_FILE, O_RDONLY);
+    KT_ASSERT(r, fd >= 0);
+
+    if (fd >= 0) {
+        KT_EQ(r, fd_stat(fd, &st), 0);
+        KT_EQ(r, st.size, payload_len);
+        KT_EQ(r, fd_read(fd, back, payload_len), (i32)payload_len);
+        KT_EQ(r, memcmp(back, payload, payload_len), 0);
+        /* And nothing beyond it. */
+        KT_EQ(r, fd_read(fd, back, sizeof(back)), 0);
+        KT_EQ(r, fd_close(fd), 0);
+    }
+
+    /* It is visible by path and in its directory, not just by descriptor. */
+    KT_EQ(r, vfs_stat(TEST_FILE, &st), 0);
+    KT_EQ(r, st.size, payload_len);
+    KT_ASSERT(r, (st.mode & S_MODE_WRITE) != 0);
+
+    i32 rootfd = fd_open("/", O_RDONLY);
+    bool listed = false;
+
+    if (rootfd >= 0) {
+        struct sys_dirent de;
+
+        for (u32 i = 0; i < 256; i++) {
+            if (fd_getdent(rootfd, i, &de) != 1)
+                break;
+            if (strcasecmp(de.name, "KTEST.TXT") == 0) {
+                listed = true;
+                KT_EQ(r, de.size, payload_len);
+            }
+        }
+        KT_EQ(r, fd_close(rootfd), 0);
+    }
+    KT_ASSERT(r, listed);
+
+    /* --- O_EXCL, O_TRUNC, O_APPEND ------------------------------------- */
+    log_expect_errors(true);
+    KT_EQ(r, fd_open(TEST_FILE, O_WRONLY | O_CREAT | O_EXCL), SYS_EEXIST);
+    /* O_TRUNC without write access is a contradiction, not a request. */
+    KT_EQ(r, fd_open(TEST_FILE, O_RDONLY | O_TRUNC), SYS_EINVAL);
+    log_expect_errors(false);
+
+    fd = fd_open(TEST_FILE, O_WRONLY | O_APPEND);
+    KT_ASSERT(r, fd >= 0);
+
+    if (fd >= 0) {
+        /* O_APPEND positioned at the end, so this lands after the payload
+         * rather than over it. */
+        KT_EQ(r, fd_seek(fd, 0, SEEK_CUR), (i32)payload_len);
+        KT_EQ(r, fd_write(fd, "appended", 8), 8);
+        KT_EQ(r, fd_close(fd), 0);
+    }
+
+    KT_EQ(r, vfs_stat(TEST_FILE, &st), 0);
+    KT_EQ(r, st.size, payload_len + 8);
+
+    fd = fd_open(TEST_FILE, O_RDONLY);
+    if (fd >= 0) {
+        KT_EQ(r, fd_seek(fd, (i32)payload_len, SEEK_SET), (i32)payload_len);
+        KT_EQ(r, fd_read(fd, back, 8), 8);
+        KT_EQ(r, memcmp(back, "appended", 8), 0);
+        KT_EQ(r, fd_close(fd), 0);
+    }
+
+    /* O_TRUNC empties it, and an empty file holds no clusters at all - which
+     * is why first_cluster goes to 0 rather than keeping one allocated. */
+    fd = fd_open(TEST_FILE, O_WRONLY | O_TRUNC);
+    KT_ASSERT(r, fd >= 0);
+    if (fd >= 0) {
+        KT_EQ(r, fd_stat(fd, &st), 0);
+        KT_EQ(r, st.size, 0u);
+        KT_EQ(r, fd_close(fd), 0);
+    }
+    KT_EQ(r, vfs_stat(TEST_FILE, &st), 0);
+    KT_EQ(r, st.size, 0u);
+
+    /* --- a write that crosses a cluster boundary ----------------------- */
+    const struct fat_info *fi = fat16_get_info();
+    u32 big_len = fi->cluster_bytes + 777;
+
+    KT_ASSERT(r, fi->cluster_bytes > 0);
+
+    u8 *big = kmalloc(big_len);
+
+    KT_ASSERT(r, big != NULL);
+
+    if (big) {
+        /* A pattern that is position-dependent, so that a chain followed in
+         * the wrong order, or a sector written to the wrong place, shows up
+         * as a mismatch rather than as more of the same byte. */
+        for (u32 i = 0; i < big_len; i++)
+            big[i] = (u8)(i * 7 + (i >> 8));
+
+        fd = fd_open(TEST_FILE, O_RDWR | O_TRUNC);
+        KT_ASSERT(r, fd >= 0);
+
+        if (fd >= 0) {
+            u32 done = 0;
+
+            /* Written in pieces that do not divide the sector size, so the
+             * read-modify-write path for a partial sector is exercised
+             * rather than assumed. */
+            while (done < big_len) {
+                u32 n = big_len - done;
+
+                if (n > 333)
+                    n = 333;
+
+                i32 w = fd_write(fd, big + done, n);
+
+                KT_ASSERT(r, w > 0);
+                if (w <= 0)
+                    break;
+                done += (u32)w;
+            }
+
+            KT_EQ(r, done, big_len);
+            KT_EQ(r, fd_close(fd), 0);
+        }
+
+        /* More than one cluster was allocated, which is what makes this a
+         * test of the chain rather than of a single cluster. */
+        KT_EQ(r, vfs_stat(TEST_FILE, &st), 0);
+        KT_EQ(r, st.size, big_len);
+        KT_ASSERT(r, st.blocks >= 2);
+
+        u8 *check = kmalloc(big_len);
+
+        KT_ASSERT(r, check != NULL);
+
+        if (check) {
+            memset(check, 0, big_len);
+
+            fd = fd_open(TEST_FILE, O_RDONLY);
+            KT_ASSERT(r, fd >= 0);
+
+            if (fd >= 0) {
+                u32 got = 0;
+
+                while (got < big_len) {
+                    i32 n = fd_read(fd, check + got, big_len - got);
+
+                    if (n <= 0)
+                        break;
+                    got += (u32)n;
+                }
+
+                KT_EQ(r, got, big_len);
+                KT_EQ(r, memcmp(check, big, big_len), 0);
+                KT_EQ(r, fd_close(fd), 0);
+            }
+
+            kfree(check);
+        }
+
+        /* --- truncate, both directions --------------------------------- */
+        fd = fd_open(TEST_FILE, O_RDWR);
+        KT_ASSERT(r, fd >= 0);
+
+        if (fd >= 0) {
+            /* Shrink to inside the first cluster: the tail of the chain has
+             * to be freed, and the surviving part must still read correctly
+             * up to the new end. */
+            KT_EQ(r, vfs_truncate_file(fd_get(fd), 100), 0);
+            KT_EQ(r, fd_stat(fd, &st), 0);
+            KT_EQ(r, st.size, 100u);
+
+            KT_EQ(r, fd_seek(fd, 0, SEEK_SET), 0);
+            KT_EQ(r, fd_read(fd, back, 100), 100);
+            KT_EQ(r, memcmp(back, big, 100), 0);
+
+            /* Grow by truncate: the gap has to read as zeros, not as
+             * whatever those clusters held before. */
+            KT_EQ(r, vfs_truncate_file(fd_get(fd), 300), 0);
+            KT_EQ(r, fd_stat(fd, &st), 0);
+            KT_EQ(r, st.size, 300u);
+
+            KT_EQ(r, fd_seek(fd, 100, SEEK_SET), 100);
+            KT_EQ(r, fd_read(fd, back, 200), 200);
+
+            bool zeros = true;
+            for (u32 i = 0; i < 200; i++)
+                if (back[i] != 0)
+                    zeros = false;
+            KT_ASSERT(r, zeros);
+
+            KT_EQ(r, fd_close(fd), 0);
+        }
+
+        kfree(big);
+    }
+
+    /* --- a write past the end leaves a readable hole ------------------- */
+    fd = fd_open(TEST_FILE2, O_RDWR | O_CREAT | O_EXCL);
+    KT_ASSERT(r, fd >= 0);
+
+    if (fd >= 0) {
+        KT_EQ(r, fd_seek(fd, 2000, SEEK_SET), 2000);
+        KT_EQ(r, fd_write(fd, "end", 3), 3);
+        KT_EQ(r, fd_stat(fd, &st), 0);
+        KT_EQ(r, st.size, 2003u);
+
+        KT_EQ(r, fd_seek(fd, 0, SEEK_SET), 0);
+        KT_EQ(r, fd_read(fd, back, 256), 256);
+
+        bool hole_is_zero = true;
+        for (u32 i = 0; i < 256; i++)
+            if (back[i] != 0)
+                hole_is_zero = false;
+        KT_ASSERT(r, hole_is_zero);
+
+        KT_EQ(r, fd_close(fd), 0);
+    }
+
+    /* --- directories --------------------------------------------------- */
+    KT_EQ(r, vfs_mkdir(TEST_DIR), 0);
+
+    log_expect_errors(true);
+    KT_EQ(r, vfs_mkdir(TEST_DIR), SYS_EEXIST);
+    /* A directory is not a file, in both directions. */
+    KT_EQ(r, vfs_unlink(TEST_DIR), SYS_EISDIR);
+    KT_EQ(r, vfs_rmdir(TEST_FILE), SYS_ENOTDIR);
+    log_expect_errors(false);
+
+    KT_EQ(r, vfs_stat(TEST_DIR, &st), 0);
+    KT_EQ(r, st.type, (unsigned)S_TYPE_DIR);
+
+    /* A new directory contains exactly "." and "..", which have to be there
+     * for it to be a directory at all - and ".." of a directory in the root
+     * is cluster 0, which is how FAT spells "the root". */
+    i32 dfd2 = fd_open(TEST_DIR, O_RDONLY | O_DIRECTORY);
+
+    KT_ASSERT(r, dfd2 >= 0);
+
+    if (dfd2 >= 0) {
+        struct sys_dirent de;
+        bool dot = false, dotdot = false;
+        u32 others = 0;
+
+        for (u32 i = 0; i < 64; i++) {
+            if (fd_getdent(dfd2, i, &de) != 1)
+                break;
+            if (strcmp(de.name, ".") == 0)
+                dot = true;
+            else if (strcmp(de.name, "..") == 0)
+                dotdot = true;
+            else
+                others++;
+        }
+
+        KT_ASSERT(r, dot);
+        KT_ASSERT(r, dotdot);
+        KT_EQ(r, others, 0u);
+        KT_EQ(r, fd_close(dfd2), 0);
+    }
+
+    /* A file inside the new directory, so that the path walk goes through an
+     * entry this kernel wrote rather than one mkfat.py wrote. */
+    fd = fd_open(TEST_DIR "/INNER.TXT", O_WRONLY | O_CREAT);
+    KT_ASSERT(r, fd >= 0);
+
+    if (fd >= 0) {
+        KT_EQ(r, fd_write(fd, "nested", 6), 6);
+        KT_EQ(r, fd_close(fd), 0);
+    }
+
+    KT_EQ(r, vfs_stat(TEST_DIR "/INNER.TXT", &st), 0);
+    KT_EQ(r, st.size, 6u);
+
+    /* chdir into it, and a relative open resolves there. */
+    KT_EQ(r, fd_chdir(TEST_DIR), 0);
+    fd = fd_open("INNER.TXT", O_RDONLY);
+    KT_ASSERT(r, fd >= 0);
+    if (fd >= 0) {
+        KT_EQ(r, fd_read(fd, back, 6), 6);
+        KT_EQ(r, memcmp(back, "nested", 6), 0);
+        KT_EQ(r, fd_close(fd), 0);
+    }
+    KT_EQ(r, fd_chdir("/"), 0);
+
+    /* A directory with something in it cannot be removed. */
+    log_expect_errors(true);
+    KT_EQ(r, vfs_rmdir(TEST_DIR), SYS_ENOTEMPTY);
+    log_expect_errors(false);
+
+    /* --- rename -------------------------------------------------------- */
+    KT_EQ(r, vfs_rename(TEST_FILE2, TEST_DIR "/MOVED.TXT"), 0);
+    log_expect_errors(true);
+    KT_EQ(r, vfs_stat(TEST_FILE2, &st), SYS_ENOENT);
+    log_expect_errors(false);
+    KT_EQ(r, vfs_stat(TEST_DIR "/MOVED.TXT", &st), 0);
+    KT_EQ(r, st.size, 2003u);
+
+    /* Back again, and a rename onto an existing name is refused rather than
+     * silently replacing it. */
+    KT_EQ(r, vfs_rename(TEST_DIR "/MOVED.TXT", TEST_FILE2), 0);
+    log_expect_errors(true);
+    KT_EQ(r, vfs_rename(TEST_FILE2, TEST_FILE), SYS_EEXIST);
+    KT_EQ(r, vfs_rename("/NOSUCH.TXT", "/ALSONO.TXT"), SYS_ENOENT);
+    log_expect_errors(false);
+
+    /* --- names FAT cannot express are refused, not truncated ---------- */
+    log_expect_errors(true);
+    /* 8.3 cannot hold an eleven-character stem. ENAMETOOLONG, not ENOSPC:
+     * the disk is fine, the name is not, and the two suggest different
+     * fixes. This started as ENOSPC because the backend mapped every create
+     * failure to one code. */
+    KT_EQ(r, fd_open("/TOOLONGNAME.TXT", O_WRONLY | O_CREAT), SYS_ENAMETOOLONG);
+    KT_EQ(r, vfs_mkdir("/NOSUCHDIR/CHILD"), SYS_ENOENT);
+    log_expect_errors(false);
+
+    /* --- removal, and the space coming back --------------------------- */
+    KT_EQ(r, vfs_unlink(TEST_DIR "/INNER.TXT"), 0);
+    KT_EQ(r, vfs_rmdir(TEST_DIR), 0);
+    KT_EQ(r, vfs_unlink(TEST_FILE), 0);
+    KT_EQ(r, vfs_unlink(TEST_FILE2), 0);
+
+    log_expect_errors(true);
+    KT_EQ(r, vfs_stat(TEST_FILE, &st), SYS_ENOENT);
+    KT_EQ(r, vfs_stat(TEST_DIR, &st), SYS_ENOENT);
+    KT_EQ(r, vfs_unlink(TEST_FILE), SYS_ENOENT);
+    KT_EQ(r, vfs_rmdir(TEST_DIR), SYS_ENOENT);
+    log_expect_errors(false);
+
+    /* Every cluster that was allocated has been returned. This is the
+     * assertion that catches a leak in the allocator, and it is why the
+     * free count was taken before anything was created: the number is read
+     * off the allocation table both times, so it cannot agree by accident
+     * with a running total the driver kept. */
+    u32 free_after = 0;
+
+    KT_ASSERT(r, fat16_space(&free_after, NULL));
+    KT_EQ(r, free_after, free_before);
+
+    /* And the directory entries are gone, not merely unreachable: a scan of
+     * the root must not find the name. */
+    rootfd = fd_open("/", O_RDONLY);
+    if (rootfd >= 0) {
+        struct sys_dirent de;
+        bool still_there = false;
+
+        for (u32 i = 0; i < 256; i++) {
+            if (fd_getdent(rootfd, i, &de) != 1)
+                break;
+            if (strcasecmp(de.name, "KTEST.TXT") == 0)
+                still_there = true;
+        }
+
+        KT_ASSERT(r, !still_there);
+        KT_EQ(r, fd_close(rootfd), 0);
+    }
+
+    KT_EQ(r, fat16_sync(), true);
+    KT_EQ(r, vfs_open_count(), open_before);
+}
+
 static void test_vfs(struct ktest_result *r)
 {
     test_vfs_paths(r);
@@ -2725,13 +3183,11 @@ static void test_vfs(struct ktest_result *r)
             KT_EQ(r, fd_close(dfd), 0);
         }
 
-        /* Read-only, and specific about why. */
+        /* A descriptor opened O_RDONLY refuses a write regardless of
+         * whether the filesystem could take one - the access mode is
+         * checked by the dispatcher, before any backend is asked. */
         log_expect_errors(true);
-        KT_EQ(r, fd_write(ffd, "x", 1), SYS_EINVAL); /* opened O_RDONLY */
-        KT_EQ(r, fd_open("/bin/init", O_WRONLY), SYS_EROFS);
-        KT_EQ(r, fd_open("/newfile.txt", O_WRONLY | O_CREAT), SYS_EROFS);
-        KT_EQ(r, vfs_unlink("/BIN/INIT"), SYS_EROFS);
-        KT_EQ(r, vfs_mkdir("/NEWDIR"), SYS_EROFS);
+        KT_EQ(r, fd_write(ffd, "x", 1), SYS_EINVAL);
         log_expect_errors(false);
 
         KT_EQ(r, fd_close(ffd), 0);
@@ -2802,6 +3258,8 @@ static void test_vfs(struct ktest_result *r)
 
     /* The failed chdirs left the working directory alone. */
     KT_ASSERT(r, strcmp(fd_cwd(), "/") == 0);
+
+    test_vfs_write(r);
 
     /* Nothing leaked across the whole suite. */
     KT_EQ(r, vfs_open_count(), open_before);

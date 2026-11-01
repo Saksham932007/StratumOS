@@ -255,5 +255,6 @@ void devfs_counters(u32 *reads, u32 *bytes_in, u32 *bytes_out);
  * still has to have a working /dev. */
 void fatfs_init(void);
 void fatfs_counters(u32 *opens, u32 *reads, u32 *bytes_read);
+void fatfs_write_counters(u32 *writes, u32 *bytes_written);
 
 #endif /* _FS_VFS_H */

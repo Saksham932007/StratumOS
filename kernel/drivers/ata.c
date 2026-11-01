@@ -19,52 +19,56 @@
 #include <kernel/string.h>
 
 /* Command block, relative to the channel base. */
-#define ATA_REG_DATA       0x00
-#define ATA_REG_ERROR      0x01 /* reading                      */
-#define ATA_REG_FEATURES   0x01 /* writing                      */
-#define ATA_REG_SECCOUNT   0x02
-#define ATA_REG_LBA_LOW    0x03
-#define ATA_REG_LBA_MID    0x04
-#define ATA_REG_LBA_HIGH   0x05
-#define ATA_REG_DRIVE      0x06
-#define ATA_REG_STATUS     0x07 /* reading; clears the IRQ       */
-#define ATA_REG_COMMAND    0x07 /* writing                      */
+#define ATA_REG_DATA        0x00
+#define ATA_REG_ERROR       0x01 /* reading                      */
+#define ATA_REG_FEATURES    0x01 /* writing                      */
+#define ATA_REG_SECCOUNT    0x02
+#define ATA_REG_LBA_LOW     0x03
+#define ATA_REG_LBA_MID     0x04
+#define ATA_REG_LBA_HIGH    0x05
+#define ATA_REG_DRIVE       0x06
+#define ATA_REG_STATUS      0x07 /* reading; clears the IRQ       */
+#define ATA_REG_COMMAND     0x07 /* writing                      */
 
 /* Control block. Reading the alternate status register has the same value as
  * the status register but does *not* acknowledge the interrupt, which is what
  * makes it the right one to poll with. */
-#define ATA_REG_ALT_STATUS 0x00
-#define ATA_REG_CONTROL    0x00
+#define ATA_REG_ALT_STATUS  0x00
+#define ATA_REG_CONTROL     0x00
 
 /* Status bits. */
-#define ATA_SR_ERR         0x01 /* an error; details in the error register */
-#define ATA_SR_DRQ         0x08 /* ready to transfer a block              */
-#define ATA_SR_SRV         0x10
-#define ATA_SR_DF          0x20 /* device fault                            */
-#define ATA_SR_RDY         0x40
-#define ATA_SR_BSY         0x80 /* busy; every other bit is meaningless    */
+#define ATA_SR_ERR          0x01 /* an error; details in the error register */
+#define ATA_SR_DRQ          0x08 /* ready to transfer a block              */
+#define ATA_SR_SRV          0x10
+#define ATA_SR_DF           0x20 /* device fault                            */
+#define ATA_SR_RDY          0x40
+#define ATA_SR_BSY          0x80 /* busy; every other bit is meaningless    */
 
 /* Error bits. */
-#define ATA_ER_AMNF        0x01
-#define ATA_ER_TK0NF       0x02
-#define ATA_ER_ABRT        0x04
-#define ATA_ER_MCR         0x08
-#define ATA_ER_IDNF        0x10
-#define ATA_ER_MC          0x20
-#define ATA_ER_UNC         0x40
-#define ATA_ER_BBK         0x80
+#define ATA_ER_AMNF         0x01
+#define ATA_ER_TK0NF        0x02
+#define ATA_ER_ABRT         0x04
+#define ATA_ER_MCR          0x08
+#define ATA_ER_IDNF         0x10
+#define ATA_ER_MC           0x20
+#define ATA_ER_UNC          0x40
+#define ATA_ER_BBK          0x80
 
-#define ATA_CMD_READ_PIO   0x20
-#define ATA_CMD_READ_PIO48 0x24
-#define ATA_CMD_IDENTIFY   0xEC
+#define ATA_CMD_READ_PIO    0x20
+#define ATA_CMD_READ_PIO48  0x24
+#define ATA_CMD_WRITE_PIO   0x30
+#define ATA_CMD_WRITE_PIO48 0x34
+#define ATA_CMD_FLUSH       0xE7
+#define ATA_CMD_FLUSH48     0xEA
+#define ATA_CMD_IDENTIFY    0xEC
 
-#define ATA_CTRL_NIEN      0x02 /* stop the drive asserting its IRQ */
+#define ATA_CTRL_NIEN       0x02 /* stop the drive asserting its IRQ */
 
 /* Bounds. A drive that misses these is broken, and saying so beats hanging.
  * 30 million inb()s is on the order of seconds under emulation; the real
  * ATA specification allows 30 seconds for a spin-up, which no test wants to
  * wait for. */
-#define ATA_SPIN_LIMIT     3000000u
+#define ATA_SPIN_LIMIT      3000000u
 
 static const u16 channel_base[2] = {0x1F0, 0x170};
 static const u16 channel_ctrl[2] = {0x3F6, 0x376};
@@ -378,4 +382,167 @@ bool ata_read(u32 drive, u64 lba, u32 count, void *buf)
     }
 
     return true;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Writing                                                                   */
+/* ------------------------------------------------------------------------- */
+
+/* The register setup is identical to read_chunk()'s - the same six bytes of
+ * address through the same three ports - so only the command byte and the
+ * direction of the data loop differ. They are still two functions rather than
+ * one with a flag, because the thing that follows a write has no counterpart
+ * in a read: the drive has to be told to flush, and it has to be given a
+ * chance to report a fault *after* the last word has gone out.
+ */
+static bool write_chunk(const struct ata_drive *d, u64 lba, u8 count,
+                        const u8 *buf)
+{
+    u16 base = channel_base[d->channel];
+    bool use48 = d->lba48 && (lba + count) > 0x0FFFFFFFull;
+
+    if (wait_not_busy(d->channel) == 0xFF)
+        return false;
+
+    if (use48) {
+        outb(base + ATA_REG_DRIVE, (u8)(0x40 | (d->slot << 4)));
+        outb(base + ATA_REG_SECCOUNT, 0);
+        outb(base + ATA_REG_LBA_LOW, (u8)(lba >> 24));
+        outb(base + ATA_REG_LBA_MID, (u8)(lba >> 32));
+        outb(base + ATA_REG_LBA_HIGH, (u8)(lba >> 40));
+        outb(base + ATA_REG_SECCOUNT, count);
+        outb(base + ATA_REG_LBA_LOW, (u8)lba);
+        outb(base + ATA_REG_LBA_MID, (u8)(lba >> 8));
+        outb(base + ATA_REG_LBA_HIGH, (u8)(lba >> 16));
+        outb(base + ATA_REG_COMMAND, ATA_CMD_WRITE_PIO48);
+    } else {
+        outb(base + ATA_REG_DRIVE,
+             (u8)(0xE0 | (d->slot << 4) | ((lba >> 24) & 0x0F)));
+        outb(base + ATA_REG_SECCOUNT, count);
+        outb(base + ATA_REG_LBA_LOW, (u8)lba);
+        outb(base + ATA_REG_LBA_MID, (u8)(lba >> 8));
+        outb(base + ATA_REG_LBA_HIGH, (u8)(lba >> 16));
+        outb(base + ATA_REG_COMMAND, ATA_CMD_WRITE_PIO);
+    }
+
+    stats.commands++;
+    select_delay(d->channel);
+
+    for (u32 sector = 0; sector < count; sector++) {
+        /* One DRQ handshake per sector on the way out as well as on the way
+         * in. The drive asserts DRQ to say "send me the next block", and a
+         * driver that pushed every sector after one wait would work on QEMU
+         * and corrupt data on hardware - the same trap the read path
+         * documents, in the direction where getting it wrong is destructive
+         * rather than merely wrong. */
+        if (!wait_for_data(d->channel))
+            return false;
+
+        const u16 *src = (const u16 *)(buf + sector * ATA_SECTOR_SIZE);
+
+        for (u32 i = 0; i < ATA_SECTOR_SIZE / 2; i++)
+            outw(base + ATA_REG_DATA, src[i]);
+    }
+
+    /* After the last word, BSY goes up while the drive takes the data. A
+     * failure reported here - a write-protected or failing medium - arrives
+     * only at this point, so a driver that returned as soon as the loop ended
+     * would report success for a write that did not happen. */
+    u8 status = wait_not_busy(d->channel);
+
+    if (status == 0xFF)
+        return false;
+
+    if (status & (ATA_SR_ERR | ATA_SR_DF)) {
+        u8 err = inb(base + ATA_REG_ERROR);
+
+        stats.errors++;
+        pr_err("channel %u: write failed, status %02x error %02x%s%s",
+               d->channel, status, err, (err & ATA_ER_ABRT) ? " (aborted)" : "",
+               (status & ATA_SR_DF) ? " (device fault)" : "");
+        return false;
+    }
+
+    return true;
+}
+
+bool ata_flush(u32 drive)
+{
+    const struct ata_drive *d = ata_get_drive(drive);
+
+    if (!d)
+        return false;
+
+    u16 base = channel_base[d->channel];
+
+    if (wait_not_busy(d->channel) == 0xFF)
+        return false;
+
+    outb(base + ATA_REG_DRIVE, (u8)(0xE0 | (d->slot << 4)));
+    outb(base + ATA_REG_COMMAND, d->lba48 ? ATA_CMD_FLUSH48 : ATA_CMD_FLUSH);
+
+    stats.commands++;
+    stats.flushes++;
+    select_delay(d->channel);
+
+    /* A flush can take as long as the drive's cache is deep, which is why the
+     * bound here is the same generous one every other wait uses rather than
+     * something tuned to how fast QEMU answers. */
+    u8 status = wait_not_busy(d->channel);
+
+    if (status == 0xFF)
+        return false;
+
+    if (status & (ATA_SR_ERR | ATA_SR_DF)) {
+        stats.errors++;
+        pr_err("hd%u: cache flush failed (status %02x)", drive, status);
+        return false;
+    }
+
+    return true;
+}
+
+bool ata_write(u32 drive, u64 lba, u32 count, const void *buf)
+{
+    const struct ata_drive *d = ata_get_drive(drive);
+
+    if (!d) {
+        pr_err("write to hd%u, which is not present", drive);
+        return false;
+    }
+
+    if (count == 0)
+        return true;
+
+    if (!buf) {
+        pr_err("write from a null buffer");
+        return false;
+    }
+
+    if (lba + count > d->sectors || lba + count < lba) {
+        pr_err("write of %u sectors at LBA %llu runs past hd%u's %llu sectors",
+               count, lba, drive, d->sectors);
+        return false;
+    }
+
+    stats.writes++;
+
+    const u8 *in = buf;
+
+    while (count > 0) {
+        u8 chunk = count > 255 ? 255 : (u8)count;
+
+        if (!write_chunk(d, lba, chunk, in))
+            return false;
+
+        stats.sectors_written += chunk;
+        lba += chunk;
+        in += (u32)chunk * ATA_SECTOR_SIZE;
+        count -= chunk;
+    }
+
+    /* One flush per ata_write(), not per chunk: the point is that the whole
+     * request is durable when this returns, and a drive asked to flush four
+     * times does the same work as one asked once. */
+    return ata_flush(drive);
 }

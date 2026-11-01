@@ -49,6 +49,17 @@ const struct blockdev *blockdev_find(const char *name);
 bool blockdev_read(const struct blockdev *dev, u64 offset, u32 count,
                    void *buf);
 
+/* Write `count` blocks at `offset` within this device, bounds-checked the
+ * same way - which matters more on this side, because a write that escapes a
+ * partition destroys what is next on the disk rather than merely reading it.
+ * Durable when it returns: ata_write() ends with a cache flush. */
+bool blockdev_write(const struct blockdev *dev, u64 offset, u32 count,
+                    const void *buf);
+
+/* Commit the underlying drive's write cache. For a caller that has just
+ * finished a multi-step update and wants one flush at the end of it. */
+bool blockdev_flush(const struct blockdev *dev);
+
 /* The first partition holding a filesystem this kernel can mount, or NULL. */
 const struct blockdev *blockdev_first_fs(void);
 
