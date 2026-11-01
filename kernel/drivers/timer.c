@@ -12,6 +12,7 @@
  */
 #define LOG_TAG "timer"
 
+#include <arch/apic.h>
 #include <arch/io.h>
 #include <arch/irq.h>
 
@@ -34,7 +35,18 @@ static void timer_irq(struct regs *r)
      * costs one symbol lookup. See kernel/core/profile.c. */
     profile_tick(r);
 
-    sched_tick();
+    /* Preemption, but only while it is still this controller's job.
+     *
+     * The 8254 has one output and it is wired to one processor, so a kernel
+     * that preempts from here can only ever preempt on the boot processor.
+     * Once the local APIC timer is calibrated and running, every processor
+     * has a tick of its own and preemption moves there - and this handler
+     * must stop doing it, or the boot processor would be preempted twice as
+     * often as every other one for no reason.
+     *
+     * The clock itself stays here either way. See arch/apic.h. */
+    if (!apic_timer_running())
+        sched_tick();
 }
 
 void timer_init(u32 hz)

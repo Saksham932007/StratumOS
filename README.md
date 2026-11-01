@@ -608,6 +608,7 @@ Everything marked ✅ is implemented and covered by a test.
 | ✅ | Kernel heap: first-fit, coalescing, guard magics, grows on demand |
 | ✅ | Preemptive round-robin scheduler, per-task stacks, sleep/yield/exit |
 | ✅ | **An address space per process**, the kernel's page directory shared *by pointer*, `CR3` switched on context switch |
+| ✅ | **A local APIC timer per processor**, calibrated against the 8254 every boot, so preemption is not the boot processor's alone |
 | ✅ | **`fork` with copy-on-write** — software PTE bit, per-frame reference counts, no copy for the last sharer |
 | ✅ | **`exec`** by rewriting the syscall's own trap frame, so the return lands in the new image |
 | ✅ | **`wait` and real zombies** — resources released by either the reaper or the parent, exit status held until collected |
@@ -1456,9 +1457,13 @@ Being clear about scope is more useful than a longer feature list.
   burns a timeslice per read on real hardware. The trade-off, and what it
   buys, is in [docs/STORAGE.md](docs/STORAGE.md#ata-by-programmed-io).
 - **The scheduler runs on one processor.** Every processor is brought up,
-  runs kernel code, holds real locks and services IPIs — but run queues are
-  still per-system rather than per-CPU, so the other processors idle. That is
-  the next large piece; see [docs/SMP.md](docs/SMP.md#what-is-missing).
+  runs kernel code, holds real locks, services IPIs and — since the local
+  APIC timer landed — has its own 100 Hz tick and preempts itself. The run
+  queue is still the boot processor's, so the others idle. The blocker is not
+  the scheduler: **no subsystem in this kernel is lock-protected**, so two
+  processors running tasks concurrently would corrupt the heap on the first
+  `kmalloc`. Locks per subsystem come first; see
+  [docs/SMP.md](docs/SMP.md#what-is-missing).
 - **The I/O APIC is parsed but not programmed.** Device interrupts still go
   through the 8259s to the boot processor, so there is no interrupt
   distribution and no affinity. It is also what the per-CPU run queues need

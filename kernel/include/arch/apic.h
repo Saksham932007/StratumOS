@@ -81,6 +81,7 @@
 #define APIC_VECTOR_IPI_PING 0xF0 /* "are you there", for the tests      */
 #define APIC_VECTOR_IPI_TLB  0xF1 /* TLB shootdown                       */
 #define APIC_VECTOR_IPI_HALT 0xF2 /* stop, for panic                     */
+#define APIC_VECTOR_TIMER    0xF3 /* this CPU's own periodic tick         */
 
 /* Map and enable this CPU's local APIC. Called once on the boot processor,
  * which maps the registers, and then once on each application processor,
@@ -111,11 +112,49 @@ void apic_broadcast_ipi(u32 vector);
  * trampoline has to be below 1 MiB and page aligned. */
 void apic_start_ap(u8 apic_id, u8 vector);
 
+/* ---- the local APIC timer ----------------------------------------------
+ *
+ * One timer per processor, counting down from a register and reloading
+ * itself. This is what makes a processor other than the boot processor able
+ * to preempt at all: the 8254 has a single output, wired to a single CPU, so
+ * a kernel whose only clock is the PIT can only ever preempt on one
+ * processor however many it has brought up.
+ *
+ * It has to be calibrated, because the count is in bus clocks and nothing
+ * reports what the bus clock is. The PIT is the reference: run the APIC
+ * timer wide open for a known interval measured by the PIT, see how far it
+ * got, and divide. Every processor in a machine shares the bus clock, so the
+ * calibration is done once on the boot processor and the result is reused.
+ *
+ * The 8254 is not switched off. It stays the kernel's timebase - the tick
+ * count, the uptime and every sleep deadline come from it - because a single
+ * monotonic clock is worth more than symmetry, and because a machine with no
+ * usable local APIC still has to keep time. What moves here is preemption,
+ * and only preemption.
+ */
+
+/* Calibrate against the PIT and start this processor's timer at `hz`.
+ * Returns false if there is no APIC, or if the calibration produced a figure
+ * that cannot be right - in which case the kernel keeps preempting from the
+ * PIT and says so. Call on the boot processor, after timer_init(). */
+bool apic_timer_init(u32 hz);
+
+/* Start this processor's timer using the boot processor's calibration. */
+void apic_timer_init_ap(void);
+
+/* True once apic_timer_init() has succeeded, which is the signal to the PIT
+ * handler that preemption is no longer its job. */
+bool apic_timer_running(void);
+
+/* Bus clocks per second, as measured. Zero until calibration succeeds. */
+u32 apic_timer_hz_measured(void);
+
 struct apic_stats {
     u32 ipis_sent;
     u32 eois;
     u32 spurious;
     u32 errors;
+    u32 timer_ticks; /* summed over every processor */
 };
 void apic_get_stats(struct apic_stats *out);
 

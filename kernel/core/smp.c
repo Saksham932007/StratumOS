@@ -237,6 +237,7 @@ NORETURN void ap_main(void)
     vmm_switch_address_space(vmm_kernel_root_phys());
 
     apic_init_ap();
+    apic_timer_init_ap();
 
     /* Only now is the processor's own APIC id meaningful, and it must match
      * what ACPI said - the whole index-to-APIC-id mapping depends on it. */

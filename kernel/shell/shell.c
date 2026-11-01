@@ -1108,10 +1108,18 @@ static int cmd_cpus(int argc, char **argv)
     else
         kprintf("  absent    : this kernel is running on the 8259s alone\n");
 
+    if (apic_timer_running())
+        kprintf("  timer     : %u Hz on every processor, bus clock %u.%03u MHz "
+                "measured; %u tick(s)\n",
+                TIMER_HZ, apic_timer_hz_measured() / 1000000u,
+                (apic_timer_hz_measured() / 1000u) % 1000u, as.timer_ticks);
+    else
+        kprintf("  timer     : not running; the 8254 preempts cpu 0 alone\n");
+
     kprintf("Processors (%u online of %u reported)\n", smp_cpu_count(),
             smp_cpus_present());
-    kprintf("  %4s %5s %5s %-9s %10s %8s %8s %12s\n", "CPU", "APIC", "ROLE",
-            "STATE", "STACK", "PINGS", "TLB", "IDLE LOOPS");
+    kprintf("  %4s %5s %5s %-9s %10s %8s %8s %10s %12s\n", "CPU", "APIC",
+            "ROLE", "STATE", "STACK", "PINGS", "TLB", "TICKS", "IDLE LOOPS");
 
     for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
         const struct cpu *c = smp_cpu(i);
@@ -1119,10 +1127,10 @@ static int cmd_cpus(int argc, char **argv)
         if (!c)
             continue;
 
-        kprintf("  %4u %5u %5s %-9s %10p %8u %8u %12llu%s\n", c->index,
+        kprintf("  %4u %5u %5s %-9s %10p %8u %8u %10u %12llu%s\n", c->index,
                 c->apic_id, c->is_bsp ? "bsp" : "ap",
                 c->online ? "online" : "OFFLINE", (void *)c->stack_top,
-                c->ipi_ping, c->ipi_tlb, c->idle_loops,
+                c->ipi_ping, c->ipi_tlb, c->timer_ticks, c->idle_loops,
                 c->index == smp_cpu_index() ? "  <- this one" : "");
     }
 
@@ -1135,9 +1143,10 @@ static int cmd_cpus(int argc, char **argv)
         kprintf("  (one processor: the scheduler, the locks and the IPI "
                 "paths all still work, there is just nobody to talk to)\n");
     else
-        kprintf("  The scheduler runs on cpu %u only; the others service "
-                "interrupts. See docs/SMP.md.\n",
-                0u);
+        kprintf("  Every processor has its own timer and preempts itself, "
+                "but the run queue is\n"
+                "  still cpu 0's: the others service interrupts and idle. "
+                "See docs/SMP.md.\n");
 
     return 0;
 }

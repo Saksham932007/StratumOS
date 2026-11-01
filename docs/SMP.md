@@ -442,19 +442,106 @@ anything.
 
 ---
 
+## The local APIC timer
+
+The 8254 has one output and it is wired to one processor. So a kernel whose
+only clock is the PIT can only ever preempt on the boot processor, however
+many it has brought up — which is most of why the other three idled.
+
+Each local APIC has a timer of its own: a 32-bit count that decrements at the
+bus clock divided by a programmable divisor, and reloads itself in periodic
+mode. The only awkward part is that nothing reports what the bus clock is, so
+it has to be measured. The PIT is the reference:
+
+```c
+apic_write(APIC_TIMER_DIV, APIC_TIMER_DIV_16);
+apic_write(APIC_LVT_TIMER, APIC_LVT_MASKED);
+apic_write(APIC_TIMER_ICR, 0xFFFFFFFFu);
+
+timer_busy_wait_ms(CALIBRATE_MS);
+
+u32 elapsed = 0xFFFFFFFFu - apic_read(APIC_TIMER_CCR);
+u64 bus_hz = (u64)elapsed * 16u * 1000u / CALIBRATE_MS;
+```
+
+Masked while calibrating, so a tick cannot be delivered on a vector whose
+handler is not installed yet. The divisor of 16 is what keeps a 32-bit count
+from wrapping during the measurement at a gigahertz bus clock, and 50 ms is
+five PIT ticks, so the quantisation error is under one percent. On QEMU this
+measures around 835 MHz, and it is measured on every boot rather than cached,
+because it is a property of the machine.
+
+A result that cannot be right is **reported rather than used**. Below 1 MHz
+means the counter barely moved, which is what a timer the hypervisor does not
+implement looks like; the kernel then keeps preempting from the PIT and the
+boot log says so, rather than silently running with no tick on three of four
+processors.
+
+Application processors do not calibrate. Every processor in a machine shares
+the bus clock, so an AP measuring its own would be measuring the same number
+more slowly — and would have to do it with the PIT, which is not its to use.
+`apic_timer_init_ap()` just programs the register from the boot processor's
+figure.
+
+Two consequences worth stating:
+
+- **The PIT stays.** It remains the kernel's timebase — `timer_ticks()`, the
+  uptime and every sleep deadline — because one monotonic clock is worth more
+  than symmetry, and because a machine with no usable local APIC still has to
+  keep time. What moved is preemption, and only preemption, which is why the
+  PIT handler now asks `apic_timer_running()` before calling `sched_tick()`.
+  Without that the boot processor would be preempted twice as often as every
+  other one, for no reason.
+- **The EOI goes first.** In this handler, unlike the IPI handlers, the
+  acknowledgement happens before the scheduler is called. Preemption is
+  performed at the tail of the interrupt path, and a processor that switched
+  away before acknowledging its own APIC would leave the interrupt in
+  service — so the next tick would never arrive and that processor would stop
+  preempting for good. Exactly the failure the note at the top of
+  `core/sched.c` describes, one controller along.
+
+The evidence is per-processor, because a summed count would be satisfied by
+one busy CPU. `struct cpu` carries its own `timer_ticks`, the `smp` suite
+asserts every online processor's is non-zero, and `cpus` prints the column:
+
+```
+stratum> cpus
+Local APIC
+  enabled   : id 0, version 14; 7 IPI(s) sent, 412 EOI(s), 0 spurious, 0 error(s)
+  timer     : 100 Hz on every processor, bus clock 835.322 MHz measured; 1648 tick(s)
+Processors (4 online of 4 reported)
+   CPU  APIC  ROLE STATE          STACK    PINGS      TLB      TICKS   IDLE LOOPS
+     0     0   bsp online    0xe8104000        0        0        412        91823  <- this one
+     1     1    ap online    0xe8204000        1        0        412      1402119
+     2     2    ap online    0xe8304000        1        0        412      1398774
+     3     3    ap online    0xe8404000        1        0        412      1401002
+```
+
+On a kernel preempting from the 8254 alone, three of those four columns are
+zero and stay zero.
+
+---
+
 ## What is missing
 
-- **Per-CPU run queues.** The scheduler runs on the boot processor and the
-  others idle. This is the large remaining piece: a run queue per processor
-  with work stealing, `current` becoming per-CPU, a reschedule IPI, and every
-  scheduler invariant re-examined for two processors entering it at once.
+- **Per-CPU run queues.** Every processor now has its own timer and preempts
+  itself — see below — but the run queue is still the boot processor's, so
+  the others service interrupts and idle. This is the large remaining piece,
+  and the scheduler is the smaller half of it: a run queue per processor,
+  `current` becoming per-CPU and a reschedule IPI are bounded work. What
+  gates it is that **no subsystem in this kernel is lock-protected**. The
+  heap, the VMM, the frame allocator, the VFS, FAT, the network stack and the
+  console all assume a single thread of kernel execution and exclude only
+  interrupts, by masking them. Two processors running tasks concurrently
+  would corrupt the heap non-deterministically on the first `kmalloc`. So the
+  order of work is a lock per subsystem with a documented hierarchy first,
+  and the scheduler change second — not the other way round, however much
+  the scheduler looks like the feature.
 - **The I/O APIC.** The MADT is parsed and its I/O APIC entries and interrupt
   source overrides are read — including that IRQ 0 arrives as GSI 2 on QEMU,
   which a kernel that assumed otherwise would lose its timer to. Nothing is
   programmed yet: device interrupts still go through the 8259s to the boot
   processor, so there is no interrupt distribution and no affinity.
-- **The local APIC timer.** Per-CPU preemption needs it; the single 8254 cannot
-  drive four processors.
 - **x2APIC.** The id is read as 8 bits, which caps this at 255 processors —
   academic next to the `SMP_MAX_CPUS` of 8.
 - **Lock ordering.** There is no lock hierarchy and nothing checks for one, so

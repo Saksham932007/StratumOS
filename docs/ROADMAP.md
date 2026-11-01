@@ -372,19 +372,61 @@ asserts both that the warning appears and that all 24 suites still pass; the
 `harden` suite asserts the exclusive-or where the bit exists and asserts it is
 set *nowhere* where it does not.
 
+### A timer on every processor
+
+The 8254 has one output and it is wired to one processor, so a kernel whose
+only clock is the PIT can only preempt on the boot processor however many it
+has brought up. Each local APIC has a timer of its own, and this calibrates
+it against the PIT - 50 ms wide open with the divisor at 16, read the
+remaining count, divide - then runs it periodic at 100 Hz on every processor,
+boot and application alike. Around 835 MHz on QEMU, measured every boot
+rather than cached, because it is a property of the machine.
+
+A calibration that cannot be right is reported rather than used: the kernel
+keeps preempting from the PIT and the boot log says so. The PIT itself stays
+as the timebase - ticks, uptime, sleep deadlines - and its handler now asks
+whether preemption is still its job, because otherwise the boot processor
+would be preempted twice as often as every other one.
+
+`struct cpu` carries its own tick count, the `smp` suite asserts that every
+online processor's is non-zero, and `cpus` prints the column. A summed count
+would be satisfied by one busy processor; four non-zero columns is the
+evidence that preemption is per-processor.
+
+This was the stated blocker for per-CPU run queues. What now gates *that* is
+not the scheduler: it is that no subsystem in this kernel is lock-protected -
+see the note under item 1.
+
 ## Next
 
-### 1. Per-CPU run queues
+### 1. Locks, and then per-CPU run queues
 
-The scheduler runs on the boot processor and the other processors idle. What
-remains is the part that makes four processors useful rather than merely
-present: a run queue per processor, `current` becoming per-CPU, work stealing
-when one queue empties, a reschedule IPI, and every scheduler invariant
-re-examined for two processors entering it at once.
+Every processor is brought up, runs kernel code, holds real spinlocks,
+services IPIs and - since the local APIC timer landed - preempts itself. The
+run queue is still the boot processor's, so the others idle.
 
-It needs the local APIC timer first - the single 8254 cannot drive four
-processors - which is item 6 below, and that makes this the one item in this
-list whose dependencies are not already in place.
+The scheduler half of this is bounded work: a run queue per processor,
+`current` and the idle task becoming per-CPU state in `struct cpu`, a
+reschedule IPI, and every scheduler invariant re-examined for two processors
+entering it at once.
+
+What gates it is the other half, and it is larger. **No subsystem in this
+kernel is lock-protected.** The heap, the frame allocator, the VMM, the VFS,
+FAT, the ATA driver, the network stack and the console all assume a single
+thread of kernel execution and exclude only interrupts, by masking them.
+There are exactly three spinlocks in the kernel today and they guard TLB
+shootdown, a benchmark and a test. Two processors running tasks concurrently
+would corrupt the heap non-deterministically on the first `kmalloc`, and the
+symptom would be a fault somewhere unrelated, minutes later.
+
+So the order is a lock per subsystem with a documented hierarchy first and
+the scheduler second - not the other way round, however much the scheduler
+looks like the feature. Roughly: `pmm`, `vmm` (with its two temporary mapping
+slots, which are a fixed resource that currently only asserts non-nesting),
+`heap`, `sched`, the descriptor table, `vfs`/`fat`/`ata`, `net`, `console`.
+The hazards are lock ordering, which wants a hierarchy checked rather than
+documented, and holding a lock across anything that can block - the ATA
+driver yields while it polls, and a spinlock is held with interrupts masked.
 
 ### 2. Interrupt-driven serial transmit
 
@@ -417,17 +459,16 @@ from coalescing. Per-size caches for the common fixed-size objects (`struct
 task`, page-table wrappers) would fix the fragmentation and speed up the common
 path. `heap_check()` already exists to validate the result.
 
-### 6. The I/O APIC, and the local APIC timer
+### 6. The I/O APIC
 
-The MADT's I/O APIC entries and its interrupt source overrides are already
-parsed - including that IRQ 0 arrives as GSI 2 on QEMU, which a kernel that
-assumed otherwise would lose its timer to. Nothing is programmed yet: device
-interrupts still go through the 8259s to the boot processor, so there is no
-interrupt distribution and no affinity.
+The MADT is parsed and its I/O APIC entries and interrupt source overrides
+are read - including that IRQ 0 arrives as GSI 2 on QEMU, which a kernel that
+assumed otherwise would lose its timer to. Nothing is programmed yet, so
+device interrupts still go through the 8259s to the boot processor and there
+is no interrupt distribution and no affinity.
 
-The local APIC timer belongs with it, and is the prerequisite for item 1: the
-single 8254 cannot drive four processors, so per-CPU preemption needs a timer
-per CPU.
+The local APIC timer, which used to be the other half of this item, landed -
+see above. It was the blocker for item 1; this is not.
 
 ### 7. A `/proc`
 

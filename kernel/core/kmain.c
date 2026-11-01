@@ -404,6 +404,24 @@ void kmain(u32 magic, u32 info_addr)
                   have_apic ? "enabled, IPIs available"
                             : "absent; uniprocessor only");
 
+    /* Before smp_init(), so that an application processor can start its own
+     * timer from the boot processor's calibration as soon as it reaches C.
+     * Calibration needs the 8254 already running, which is step 6. */
+    {
+        bool ticking = apic_timer_init(TIMER_HZ);
+        char detail[72];
+
+        if (ticking)
+            ksnprintf(detail, sizeof(detail),
+                      "%u Hz per processor, bus clock %u MHz measured",
+                      TIMER_HZ, apic_timer_hz_measured() / 1000000u);
+        else
+            strlcpy(detail, "unavailable; the 8254 preempts cpu 0 alone",
+                    sizeof(detail));
+
+        log_boot_step("APIC timer", ticking, detail);
+    }
+
     smp_init();
     {
         char detail[56];

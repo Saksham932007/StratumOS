@@ -69,6 +69,11 @@ struct cpu {
     volatile u32 ipi_tlb;    /* TLB shootdowns serviced            */
     volatile u32 interrupts; /* interrupts serviced                */
     volatile u64 idle_loops; /* times round the idle loop          */
+    /* Ticks from this processor's *own* local APIC timer. The number
+     * existing is the evidence that preemption is per-processor rather than
+     * the boot processor's alone: on a machine where it is not, every entry
+     * but one stays at zero. */
+    volatile u32 timer_ticks;
 };
 
 /* Discover the processors, start them, and wait for them to come online.

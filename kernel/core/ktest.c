@@ -1777,10 +1777,32 @@ static void test_smp(struct ktest_result *r)
         /* It reached its idle loop, which is the only thing an application
          * processor does in this phase. */
         KT_ASSERT(r, c->idle_loops > 0);
+
+        /* And its *own* local APIC timer is ticking. This is the assertion
+         * that distinguishes "the processor is awake" from "the processor can
+         * be preempted": the 8254 has one output wired to one CPU, so on a
+         * kernel without the APIC timer every entry here but the boot
+         * processor's stays at zero forever. */
+        if (apic_timer_running())
+            KT_ASSERT(r, c->timer_ticks > 0);
     }
 
     KT_EQ(r, online, smp_cpu_count());
     KT_EQ(r, distinct, 1u);
+
+    /* The timer's own accounting. The calibration is measured, so the figure
+     * cannot be asserted exactly - what can be asserted is that it is inside
+     * the range the calibration itself refuses to leave, and that the summed
+     * tick count across processors is at least as large as this processor's
+     * share of it. */
+    if (apic_timer_running()) {
+        struct apic_stats as;
+
+        apic_get_stats(&as);
+        KT_ASSERT(r, apic_timer_hz_measured() >= 1000000u);
+        KT_ASSERT(r, as.timer_ticks >= smp_this_cpu()->timer_ticks);
+        KT_ASSERT(r, smp_this_cpu()->timer_ticks > 0);
+    }
 
     /* --- locks ----------------------------------------------------------- */
     static spinlock_t probe = SPINLOCK_INIT("ktest-probe");

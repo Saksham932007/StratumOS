@@ -12,9 +12,13 @@
 #include <arch/io.h>
 #include <arch/irq.h>
 
+#include <drivers/timer.h>
+
 #include <kernel/kernel.h>
 #include <kernel/log.h>
 #include <kernel/panic.h>
+#include <kernel/sched.h>
+#include <kernel/smp.h>
 
 #include <mm/vmm.h>
 
@@ -322,4 +326,133 @@ void apic_start_ap(u8 target, u8 vector)
 
         stall_us(200);
     }
+}
+
+/* ------------------------------------------------------------------------- */
+/* The timer                                                                 */
+/* ------------------------------------------------------------------------- */
+/*
+ * See arch/apic.h for why this exists and why the 8254 stays. What follows is
+ * the calibration, which is the only part with a decision in it.
+ */
+
+/* Divide the bus clock by 16 before counting. The divider matters because the
+ * initial count is 32 bits: at a 1 GHz bus clock and no division, the counter
+ * wraps in four seconds, and the calibration interval has to be short enough
+ * not to wrap and long enough to measure. 16 makes both comfortable. */
+#define APIC_TIMER_DIV_16 0x3
+
+/* How long to let the timer run free while the PIT measures. Long enough that
+ * a one-tick PIT quantisation error is under one percent, short enough not to
+ * delay boot: at 100 Hz the PIT's resolution is 10 ms, so 50 ms is five
+ * ticks. */
+#define CALIBRATE_MS      50
+
+static u32 timer_bus_hz;
+static u32 timer_target_hz;
+static bool timer_started;
+
+static void timer_handler(struct regs *r)
+{
+    UNUSED(r);
+
+    __atomic_add_fetch(&stats.timer_ticks, 1, __ATOMIC_RELAXED);
+    smp_this_cpu()->timer_ticks++;
+
+    /* The EOI goes first here, unlike in the IPI handlers. Preemption happens
+     * at the tail of the interrupt path, after this returns, and a processor
+     * that switched away before acknowledging its own APIC would leave the
+     * interrupt in service - so the next tick would never arrive and that
+     * processor would stop preempting for good. The same reasoning as the
+     * note at the top of core/sched.c, one controller along. */
+    apic_eoi();
+
+    sched_tick();
+}
+
+/* Program this processor's timer, assuming the calibration is already done. */
+static void timer_start(void)
+{
+    u32 count = timer_bus_hz / 16 / timer_target_hz;
+
+    if (count == 0)
+        count = 1;
+
+    apic_write(APIC_TIMER_DIV, APIC_TIMER_DIV_16);
+    apic_write(APIC_LVT_TIMER, APIC_VECTOR_TIMER | APIC_LVT_PERIODIC);
+    apic_write(APIC_TIMER_ICR, count);
+}
+
+bool apic_timer_init(u32 hz)
+{
+    if (!apic_available() || hz == 0)
+        return false;
+
+    /* Masked while calibrating, so a tick cannot be delivered on a vector
+     * whose handler is not installed yet. */
+    apic_write(APIC_TIMER_DIV, APIC_TIMER_DIV_16);
+    apic_write(APIC_LVT_TIMER, APIC_LVT_MASKED);
+    apic_write(APIC_TIMER_ICR, 0xFFFFFFFFu);
+
+    timer_busy_wait_ms(CALIBRATE_MS);
+
+    u32 remaining = apic_read(APIC_TIMER_CCR);
+    u32 elapsed = 0xFFFFFFFFu - remaining;
+
+    apic_write(APIC_LVT_TIMER, APIC_LVT_MASKED);
+
+    /* `elapsed` is in divided clocks over CALIBRATE_MS. Scale to whole bus
+     * clocks per second, in 64 bits: the intermediate is about 10^9 at the
+     * low end and overflows 32 bits long before any real machine does. */
+    u64 bus_hz = (u64)elapsed * 16u * 1000u / CALIBRATE_MS;
+
+    /* A result that cannot be right is reported rather than used. Below
+     * 1 MHz means the counter barely moved, which is what a timer the
+     * hypervisor does not implement looks like; above 100 GHz means the read
+     * is nonsense. Either way the PIT keeps preempting, and the boot log says
+     * so instead of the kernel quietly running without a tick on half its
+     * processors. */
+    if (bus_hz < 1000000u || bus_hz > 100000000000ull) {
+        pr_warn("the local APIC timer calibrated to %u kHz, which cannot be "
+                "right; preemption stays on the 8254",
+                (unsigned)(bus_hz / 1000));
+        return false;
+    }
+
+    timer_bus_hz = (u32)bus_hz;
+    timer_target_hz = hz;
+
+    isr_install_handler(APIC_VECTOR_TIMER, timer_handler);
+    timer_start();
+    timer_started = true;
+
+    pr_info("local APIC timer: bus clock %u.%03u MHz measured against the "
+            "8254, periodic at %u Hz on vector %02x",
+            timer_bus_hz / 1000000u, (timer_bus_hz / 1000u) % 1000u, hz,
+            APIC_VECTOR_TIMER);
+    pr_info("preemption is now per-processor; the 8254 keeps the clock");
+
+    return true;
+}
+
+void apic_timer_init_ap(void)
+{
+    /* Nothing to calibrate: every processor in a machine shares the bus
+     * clock, so an application processor that measured its own would be
+     * measuring the same number more slowly - and would have to do it with
+     * the PIT, which is not its to use. */
+    if (!timer_started)
+        return;
+
+    timer_start();
+}
+
+bool apic_timer_running(void)
+{
+    return timer_started;
+}
+
+u32 apic_timer_hz_measured(void)
+{
+    return timer_bus_hz;
 }

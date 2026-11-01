@@ -87,6 +87,11 @@ COMMON_EXPECTED = [
      r"W\^X: \d+ pages of the kernel's linear map marked no-execute"
      r"|no NX bit on this processor"),
     ("hardening reported at boot", r"hardening\s+\[ok\]"),
+    # The local APIC timer, or an explicit statement that there is none. It is
+    # what gives a processor other than the boot processor a tick at all: the
+    # 8254 has one output, wired to one CPU.
+    ("per-processor timer, or a reason there is none",
+     r"boot: APIC timer\s+\[ok\]|APIC timer\s+\[FAIL\]"),
     # Processors. One or four, the step has to report cleanly - and the
     # local-APIC line has to be there either way, because enabling it is what
     # moved the 8259s behind LINT0.
@@ -465,7 +470,8 @@ SHELL_SCRIPT: list[tuple[str, list[str]]] = [
     ("udpsend 10.0.2.2 7 stratum udp probe",
      [r"sent \d+ byte\(s\) to 10\.0\.2\.2:7"]),
     ("cpus", [r"Local APIC", r"CPU\s+APIC\s+ROLE\s+STATE",
-              r"\s+0\s+0\s+bsp online", r"<- this one"]),
+              r"\s+0\s+0\s+bsp online", r"<- this one",
+              r"timer     : 100 Hz on every processor"]),
     ("disk", [r"DEV\s+MODEL\s+SECTORS\s+ADDR", r"hd0\s+\S",
               r"0 error\(s\), 0 timeout\(s\)",
               r"hd0p1\s+0e\s+\d+\s+\d+"]),
@@ -1634,6 +1640,16 @@ def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
                  r"smp: 4 of 4 processor\(s\) online"),
                 ("the boot step agrees",
                  r"processors\s+\[ok\] 4 of 4 processor\(s\) online"),
+                # Each processor's own local APIC timer is running. The smp
+                # suite asserts the per-CPU tick counts are all non-zero,
+                # which on a kernel preempting from the 8254 alone would be
+                # true of exactly one of them.
+                ("the APIC timer was calibrated",
+                 r"local APIC timer: bus clock \d+\.\d+ MHz measured "
+                 r"against the 8254, periodic at 100 Hz"),
+                ("preemption moved off the 8254",
+                 r"preemption is now per-processor; the 8254 keeps the "
+                 r"clock"),
             ],
         ),
         Scenario(
