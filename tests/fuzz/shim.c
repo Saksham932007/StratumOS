@@ -639,8 +639,14 @@ void shim_reset(void)
     page_count = 0;
     heap_outstanding = 0;
     heap_live_blocks = 0;
-    disk_data = NULL;
+    /* The disk *buffer* survives a reset: it is the shim's own allocation,
+     * reused from case to case, and only its contents are per-case. Clearing
+     * the pointer here while keeping disk_cap was a real bug - the next
+     * shim_set_disk() then saw its length as already within capacity, skipped
+     * the realloc, and copied into NULL. The fuzzer found it in three cases,
+     * which is the argument for the fuzzer. */
     disk_len = 0;
+    shim_dev.present = false;
     physmem = NULL;
     physmem_len = 0;
 }
