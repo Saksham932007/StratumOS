@@ -58,11 +58,29 @@ void uart_init(void)
     uart_reg_write(FCR, FCR_ENABLE | FCR_CLEAR);
 }
 
-/* The one symbol the portable formatter needs.
+/* The three symbols the portable formatter needs.
  *
  * kernel/core/printf.c compiles for this architecture completely unmodified
- * and this is its only undefined reference - which is most of why ksnprintf,
- * kprintf and the whole %-conversion machinery came across for free. */
+ * and these are its only undefined references - which is most of why
+ * ksnprintf, kprintf and the whole %-conversion machinery came across for
+ * free.
+ *
+ * console_begin/console_end bracket each format so that one line cannot be
+ * interleaved with another processor's. This port runs on one hart and has no
+ * scheduler, so there is nothing to interleave with and both are no-ops - but
+ * they are the formatter's interface, and a port answers an interface rather
+ * than editing it. When this port grows a second hart it grows a real lock
+ * here, and printf.c does not change again. */
+bool console_begin(void)
+{
+    return true;
+}
+
+void console_end(bool owned)
+{
+    (void)owned;
+}
+
 void console_putc(char c)
 {
     /* The newline convention is the console's business, not the formatter's,

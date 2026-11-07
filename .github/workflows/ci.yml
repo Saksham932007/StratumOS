@@ -162,7 +162,18 @@ jobs:
           sudo apt-get install -y -qq \
             "libclang-rt-$ver-dev" || \
             sudo apt-get install -y -qq libclang-rt-dev
-          sudo apt-get install -y -qq lib32stdc++-13-dev || true
+          # libFuzzer links libstdc++, and this is a 32-bit build, so the
+          # 32-bit one is needed. The package is versioned after gcc, so the
+          # name moves with the runner image - asking for one version and
+          # swallowing the failure with `|| true` is how this came to fail at
+          # link time instead of install time. Derive the version from the
+          # compiler actually installed, and fall back across neighbours.
+          gccver=$(gcc -dumpversion | cut -d. -f1)
+          for v in "$gccver" 15 14 13 12; do
+            sudo apt-get install -y -qq "lib32stdc++-$v-dev" && break
+          done
+          echo 'int main(){return 0;}' > /tmp/m.c
+          clang -m32 -lstdc++ /tmp/m.c -o /tmp/m
 
       - name: Fuzz
         run: make fuzz
