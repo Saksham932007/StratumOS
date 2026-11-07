@@ -408,6 +408,81 @@ static inline void u_putu(u32 v)
     u_puts(&buf[i]);
 }
 
+/* ---- a line, written in one call --------------------------------------
+ *
+ * Three calls to u_puts() for one line of output was fine when one processor
+ * ran one task at a time: nothing could get between them. Two processes on
+ * two processors interleave at the syscall boundary, and a line assembled
+ * from several writes comes out spliced into somebody else's - which is not
+ * a kernel bug, it is what concurrent writers to one descriptor means.
+ *
+ * So a program that wants a whole line has to write a whole line. These
+ * build it in the caller's own memory and spend one write() on it. Anything
+ * that does not fit is dropped rather than truncated mid-number: a partial
+ * line is the thing being avoided.
+ */
+#define U_LINE_MAX 200
+
+struct u_line {
+    char buf[U_LINE_MAX];
+    u32 len;
+};
+
+static inline void u_line_begin(struct u_line *l)
+{
+    l->len = 0;
+}
+
+static inline void u_line_str(struct u_line *l, const char *s)
+{
+    while (*s && l->len < U_LINE_MAX)
+        l->buf[l->len++] = *s++;
+}
+
+static inline void u_line_u(struct u_line *l, u32 v)
+{
+    char tmp[12];
+    int i = (int)sizeof(tmp);
+
+    tmp[--i] = '\0';
+    if (v == 0)
+        tmp[--i] = '0';
+    while (v && i > 0) {
+        tmp[--i] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+
+    u_line_str(l, &tmp[i]);
+}
+
+static inline void u_line_hex(struct u_line *l, u32 v)
+{
+    static const char hex[] = "0123456789abcdef";
+    char tmp[11];
+    int i = (int)sizeof(tmp);
+
+    tmp[--i] = '\0';
+    if (v == 0)
+        tmp[--i] = '0';
+    while (v && i > 2) {
+        tmp[--i] = hex[v & 0xF];
+        v >>= 4;
+    }
+    tmp[--i] = 'x';
+    tmp[--i] = '0';
+
+    u_line_str(l, &tmp[i]);
+}
+
+/* One write for the whole line, through u_write_all so a short write does not
+ * split it after all. */
+static inline void u_line_end(struct u_line *l)
+{
+    u_line_str(l, "\n");
+    (void)u_write_all(STDOUT_FD, l->buf, l->len);
+    l->len = 0;
+}
+
 static inline void u_puthex(u32 v)
 {
     static const char digits[] = "0123456789abcdef";

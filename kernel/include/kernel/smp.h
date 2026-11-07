@@ -8,13 +8,16 @@
  *     stack and local APIC configuration, and runs kernel code;
  *   - `spinlock_t` is a real spinlock rather than an interrupt mask;
  *   - processors can interrupt each other, and TLB shootdown works;
- *   - the *scheduler* still runs only on the boot processor. Application
- *     processors park in their own idle loop and service interrupts.
+ *   - every subsystem that holds shared state holds a lock to do it, at a
+ *     level the machine checks on every acquisition;
+ *   - the *scheduler* runs on every processor. Each has its own idle task,
+ *     its own `current`, its own timer and its own preemption, and they take
+ *     work from one shared run queue.
  *
- * That last line is the honest boundary of this phase. Per-CPU run queues are
- * a separate change with its own set of ways to be subtly wrong, and claiming
- * them before they exist would be the kind of overstatement this project was
- * started to correct. See docs/SMP.md.
+ * What that last line is *not* is per-processor run queues. The queue is
+ * shared and there is no affinity, which is a choice with a reason - see
+ * docs/SMP.md - and calling it anything grander would be the kind of
+ * overstatement this project was started to correct.
  *
  * Identifying the current CPU
  * ---------------------------
@@ -55,6 +58,8 @@
 /* Per-CPU state. One of these per processor, in a plain array: an array
  * indexed by a dense id is addressable from any CPU, which matters for the
  * IPI paths, and there are at most SMP_MAX_CPUS of them. */
+struct task; /* kernel/sched.h - only ever pointed at from here */
+
 struct cpu {
     bool present; /* the firmware reported it                    */
     bool online;  /* it reached C and said so                    */
@@ -62,6 +67,38 @@ struct cpu {
     u32 index; /* dense, 0..n-1; the BSP is not always 0      */
     u8 apic_id;
     u32 stack_top; /* its own kernel stack                        */
+
+    /* ---- what this processor is running ---------------------------------
+     *
+     * `current` and `idle` used to be two file-scope variables in sched.c,
+     * which is exactly as many as a kernel that schedules on one processor
+     * needs. They live here now because they are per-processor facts: two
+     * processors run two different tasks at the same instant, and an idle
+     * task is a processor's own - it owns that processor's boot stack and
+     * cannot be run anywhere else.
+     *
+     * Written by the processor they describe, under the scheduler's lock,
+     * and read by others only for reporting. */
+    struct task *current;
+    struct task *idle;
+
+    /* The task this processor has just switched away from, which the task it
+     * switched *to* is responsible for releasing. The outgoing task stays
+     * RUNNING until its stack pointer has actually been saved, because the
+     * moment it becomes READY another processor may pick it up - and picking
+     * up a task whose context is still being written is the one race a
+     * context switch cannot survive. See sched_handoff(). */
+    struct task *prev;
+
+    /* Set by this processor's timer tick, or by a reschedule IPI from
+     * another processor that has made something runnable. Read at the tail
+     * of the interrupt path. */
+    volatile bool need_resched;
+
+    /* Context switches performed by this processor. The sum is
+     * sched_switch_count(); the split is the evidence that more than one
+     * processor is scheduling, which a sum cannot show. */
+    volatile u32 switches;
 
     /* Counters, all written only by the CPU they describe except where
      * noted, so they need no lock. */
@@ -74,6 +111,7 @@ struct cpu {
      * the boot processor's alone: on a machine where it is not, every entry
      * but one stays at zero. */
     volatile u32 timer_ticks;
+    volatile u32 ipi_resched; /* reschedule IPIs serviced           */
 };
 
 /* Discover the processors, start them, and wait for them to come online.
@@ -115,6 +153,13 @@ static inline u32 smp_cpu_index(void)
 struct cpu *smp_this_cpu(void);
 const struct cpu *smp_cpu(u32 index);
 
+/* The same slot, writable. It exists for the scheduler, which owns the
+ * `current`, `idle`, `prev` and `need_resched` fields above and has to be
+ * able to set them for a processor other than the one it is running on -
+ * sched_init() builds an idle task for every processor that is already
+ * waiting. Returns NULL for an index no processor occupies. */
+struct cpu *smp_cpu_slot(u32 index);
+
 /* The entry point an application processor jumps to. Not called from C;
  * declared so that the trampoline's address can be taken. */
 void ap_main(void);
@@ -125,6 +170,14 @@ void ap_main(void);
  * Exists to prove the path works, which is worth having explicitly rather
  * than inferring it from TLB shootdown appearing to behave. */
 void smp_ping_others(void);
+
+/* Tell every other processor that the run queue has something in it.
+ *
+ * Sent whenever a task becomes runnable on a machine where another processor
+ * might be asleep in HLT. The receiver only sets its need_resched flag; the
+ * switch happens at the tail of its interrupt path, like any other
+ * preemption. A no-op on a machine with one processor. */
+void smp_reschedule_others(void);
 
 /* Invalidate one page on every other processor.
  *
@@ -141,6 +194,7 @@ void smp_halt_others(void);
 
 struct smp_stats {
     u32 pings_sent;
+    u32 reschedules_sent;
     u32 shootdowns_sent;
     u32 shootdowns_served;
     u32 start_failures;

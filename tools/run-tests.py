@@ -471,7 +471,14 @@ SHELL_SCRIPT: list[tuple[str, list[str]]] = [
      [r"sent \d+ byte\(s\) to 10\.0\.2\.2:7"]),
     ("cpus", [r"Local APIC", r"CPU\s+APIC\s+ROLE\s+STATE",
               r"\s+0\s+0\s+bsp online", r"<- this one",
-              r"timer     : 100 Hz on every processor"]),
+              r"timer     : 100 Hz on every processor",
+              # The shell image boots with one processor, so what this
+              # asserts is that the processor there is has run real tasks -
+              # a non-zero SWITCHES column - and that it names the task it
+              # is on, which is the shell asking the question.
+              r"SWITCHES\s+RESCHED\s+IDLE LOOPS\s+RUNNING",
+              r"bsp online\s+\d+\s+[1-9]\d*\s+\d+\s+\d+\s+shell",
+              r"\(one processor: the scheduler, the locks"]),
     ("disk", [r"DEV\s+MODEL\s+SECTORS\s+ADDR", r"hd0\s+\S",
               r"0 error\(s\), 0 timeout\(s\)",
               r"hd0p1\s+0e\s+\d+\s+\d+"]),
@@ -1388,7 +1395,11 @@ FAULT_CASES: list[tuple[str, str, list[str]]] = [
         "fault stackguard",
         [
             r"writing below this task's kernel stack",
-            r"faulting address: 0xe000[0-9a-f]{4}",
+            # Inside the kernel-stack region, but not at a fixed slot: which
+            # slot a task gets is an implementation detail, and it moved when
+            # the first slots were reserved for one idle task per processor.
+            # The region line below is the assertion that matters.
+            r"faulting address: 0xe0[0-9a-f]{6}",
             r"reason\s+: nothing is mapped at that address",
             r"region\s+: a kernel-stack guard page - a task overran its "
             r"stack",
@@ -1660,6 +1671,26 @@ def build_scenarios(build_dir: Path, only: str | None) -> list[Scenario]:
                 ("preemption moved off the 8254",
                  r"preemption is now per-processor; the 8254 keeps the "
                  r"clock"),
+                # And the thing all of it was for: the scheduler runs on
+                # every processor, not just the one that booted.
+                ("every processor has an idle task",
+                 r"scheduler ready; 4 processors, each with its own idle "
+                 r"task"),
+                # The sched suite starts six tasks and logs where the slices
+                # landed. Which processors they land on is a race by design,
+                # so the assertion is on the shape of the line and on the
+                # total - the suite itself asserts that more than one
+                # processor performed a context switch, which is the stable
+                # form of the same claim.
+                ("the scheduler reported its spread",
+                 r"ktest parallel: 240 slices over [1-4] processor\(s\): "
+                 r"\d+/\d+/\d+/\d+"),
+                # Four processors, four of them switching. This is the line
+                # that would have failed before any of this: three zeroes.
+                ("every processor ran something",
+                 r"cpu 3: online 1 bsp 0 switches [1-9]\d*"),
+                ("including the second and third",
+                 r"cpu 1: online 1 bsp 0 switches [1-9]\d*"),
             ],
         ),
         Scenario(

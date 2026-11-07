@@ -183,6 +183,22 @@ void interrupt_dispatch(struct regs *r)
 
     if (handlers[r->int_no]) {
         handlers[r->int_no](r);
+
+        /* The same tail as the hardware-IRQ path above, and for the same
+         * reason - but it took per-processor scheduling to notice it was
+         * missing. The interrupts that arrive through the local APIC rather
+         * than the 8259s come down this path: a processor's own timer tick
+         * and the reschedule IPI, both of which exist precisely to ask for a
+         * switch. Without this, an application processor set need_resched a
+         * hundred times a second and nothing ever read it, so every task ran
+         * on the boot processor - which is the bug the per-CPU run queue was
+         * supposed to fix, hiding one layer down.
+         *
+         * Vectors below 32 are CPU exceptions and never preempt: a fault is
+         * not a scheduling opportunity, and switching away from a page fault
+         * before it has been resolved would be a new kind of disaster. */
+        if (r->int_no >= IRQ_BASE)
+            sched_preempt();
         return;
     }
 

@@ -27,6 +27,7 @@
 #include <arch/apic.h>
 #include <arch/cpu.h>
 #include <arch/gdt.h>
+#include <arch/harden.h>
 #include <arch/idt.h>
 #include <arch/io.h>
 #include <arch/irq.h>
@@ -35,6 +36,7 @@
 #include <kernel/layout.h>
 #include <kernel/log.h>
 #include <kernel/panic.h>
+#include <kernel/sched.h>
 #include <kernel/smp.h>
 #include <kernel/spinlock.h>
 #include <kernel/string.h>
@@ -104,6 +106,13 @@ const struct cpu *smp_cpu(u32 index)
     return &cpus[index];
 }
 
+struct cpu *smp_cpu_slot(u32 index)
+{
+    if (index >= ARRAY_SIZE(cpus) || !cpus[index].present)
+        return NULL;
+    return &cpus[index];
+}
+
 /* ------------------------------------------------------------------------- */
 /* Inter-processor interrupts                                                */
 /* ------------------------------------------------------------------------- */
@@ -119,6 +128,29 @@ static void ping_handler(struct regs *r)
     UNUSED(r);
 
     smp_this_cpu()->ipi_ping++;
+    apic_eoi();
+}
+
+/* "Something is runnable; look at the queue again."
+ *
+ * This is how a processor that makes a task READY tells the others, and it
+ * exists because the alternative is waiting for their next timer tick. An
+ * idle processor is sitting in HLT: without the IPI a task woken by a network
+ * segment waits up to 10 ms to start running on a machine with three idle
+ * processors, which is absurd.
+ *
+ * The handler does not schedule. It sets the flag and acknowledges, and the
+ * switch happens at the tail of the interrupt path like every other
+ * preemption - which is the one place in the kernel where the stack is known
+ * to be in a state a switch can survive. */
+static void resched_handler(struct regs *r)
+{
+    UNUSED(r);
+
+    struct cpu *self = smp_this_cpu();
+
+    self->ipi_resched++;
+    self->need_resched = true;
     apic_eoi();
 }
 
@@ -158,6 +190,15 @@ void smp_ping_others(void)
 
     stats.pings_sent++;
     apic_broadcast_ipi(APIC_VECTOR_IPI_PING);
+}
+
+void smp_reschedule_others(void)
+{
+    if (!smp_enabled())
+        return;
+
+    stats.reschedules_sent++;
+    apic_broadcast_ipi(APIC_VECTOR_IPI_RESCHED);
 }
 
 void smp_tlb_shootdown(vaddr_t va)
@@ -247,6 +288,15 @@ NORETURN void ap_main(void)
         panic("cpu %u came up with APIC id %u; the MADT said %u", index,
               reported, self->apic_id);
 
+    /* Write protection and SMEP/SMAP are per-processor control-register
+     * bits, so this processor has to set its own. Fatal if it cannot match
+     * what the boot processor reported: a kernel that enforces W^X on one
+     * processor out of four does not enforce W^X. */
+    if (!harden_init_ap())
+        panic("cpu %u could not enable the hardening the boot processor has "
+              "(cr0 %08x, cr4 %08x)",
+              index, read_cr0(), read_cr4());
+
     tss_set_kernel_stack(self->stack_top);
 
     /* Published last, with a release so that everything above is visible to
@@ -256,13 +306,31 @@ NORETURN void ap_main(void)
     __atomic_store_n(&self->online, true, __ATOMIC_RELEASE);
 
     /* Interrupts on. From here this processor services IPIs and whatever the
-     * APIC delivers to it. It does not run the scheduler: see kernel/smp.h. */
+     * APIC delivers to it. */
     sti();
 
-    for (;;) {
+    /* Wait for the scheduler to exist, then join it.
+     *
+     * sched_init() runs on the boot processor after smp_init() returns, and
+     * it builds an idle task for every processor that is already online -
+     * including this one, using the stack this function is standing on. So
+     * there is nothing to do here but wait for that to have happened: before
+     * it has, this processor has no task to be.
+     *
+     * The wait is HLT rather than a spin because a tick will end it, and
+     * burning a core on a loop while the boot processor finishes booting is
+     * a poor first impression. */
+    while (!sched_ready_for_aps()) {
         self->idle_loops++;
         hlt();
     }
+
+    pr_debug("cpu %u joining the scheduler", index);
+
+    /* The body of this processor's idle task, which it is already running as:
+     * reap, halt, repeat, and get preempted into real work whenever the run
+     * queue has any. Never returns. */
+    sched_start();
 }
 
 /* ------------------------------------------------------------------------- */
@@ -372,6 +440,7 @@ void smp_init(void)
 
     isr_install_handler(APIC_VECTOR_IPI_PING, ping_handler);
     isr_install_handler(APIC_VECTOR_IPI_TLB, tlb_handler);
+    isr_install_handler(APIC_VECTOR_IPI_RESCHED, resched_handler);
     isr_install_handler(APIC_VECTOR_IPI_HALT, halt_handler);
 
     if (!apic_available()) {

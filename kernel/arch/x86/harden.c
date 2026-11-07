@@ -47,6 +47,36 @@ void user_access_end(void)
     __asm__ volatile(".byte 0x0f, 0x01, 0xca" ::: "cc");
 }
 
+/* Set the control-register bits that make this processor enforce what the
+ * page tables say. Returns the CR4 value it ended up with.
+ *
+ * CR0 and CR4 are *per processor*. The boot processor setting SMEP and SMAP
+ * protects the boot processor; an application processor that never sets them
+ * will happily execute a user page from ring 0, on a kernel that reports the
+ * feature as enabled. That was true in this kernel for as long as the
+ * application processors only idled - and stopped being merely untidy the
+ * moment they started running tasks, which is how the test suite found it:
+ * the hardening suite reads CR4 on whichever processor it happens to be
+ * running on, and started failing on three out of four. */
+static u32 harden_apply(bool smep, bool smap)
+{
+    u32 cr4 = read_cr4();
+
+    if (smep)
+        cr4 |= CR4_SMEP;
+    if (smap)
+        cr4 |= CR4_SMAP;
+
+    if (smep || smap)
+        write_cr4(cr4);
+
+    /* Read CR4 back rather than assuming the write took. A hypervisor may
+     * advertise a feature in CPUID and refuse the CR4 bit, and a kernel that
+     * then believed SMAP was on would skip the stac/clac pairs and fault on
+     * its first legitimate user access. */
+    return read_cr4();
+}
+
 void harden_init(void)
 {
     const struct cpu_info *cpu = cpu_get_info();
@@ -63,29 +93,16 @@ void harden_init(void)
     }
 
     u32 a, b, c, d;
+
     cpuid_raw(7, 0, &a, &b, &c, &d);
 
     state.smep_available = (b & CPUID7_SMEP) != 0;
     state.smap_available = (b & CPUID7_SMAP) != 0;
 
-    u32 cr4 = read_cr4();
+    u32 cr4 = harden_apply(state.smep_available, state.smap_available);
 
-    if (state.smep_available)
-        cr4 |= CR4_SMEP;
-    if (state.smap_available)
-        cr4 |= CR4_SMAP;
-
-    if (state.smep_available || state.smap_available) {
-        write_cr4(cr4);
-
-        /* Read CR4 back rather than assuming the write took. A hypervisor may
-         * advertise a feature in CPUID and refuse the CR4 bit, and a kernel
-         * that then believed SMAP was on would skip the stac/clac pairs and
-         * fault on its first legitimate user access. */
-        cr4 = read_cr4();
-        state.smep_enabled = (cr4 & CR4_SMEP) != 0;
-        state.smap_enabled = (cr4 & CR4_SMAP) != 0;
-    }
+    state.smep_enabled = (cr4 & CR4_SMEP) != 0;
+    state.smap_enabled = (cr4 & CR4_SMAP) != 0;
 
     pr_info("SMEP %s, SMAP %s",
             state.smep_enabled     ? "enabled"
@@ -94,4 +111,24 @@ void harden_init(void)
             state.smap_enabled     ? "enabled"
             : state.smap_available ? "available but refused by CR4"
                                    : "not supported by this CPU");
+}
+
+bool harden_init_ap(void)
+{
+    /* No CPUID here: the boot processor already asked, and a processor whose
+     * answer differed would be a machine this kernel cannot support anyway.
+     * What matters is that the *bits* get set on this processor. */
+    u32 cr4 = harden_apply(state.smep_available, state.smap_available);
+
+    bool ok = (!state.smep_enabled || (cr4 & CR4_SMEP)) &&
+              (!state.smap_enabled || (cr4 & CR4_SMAP));
+
+    /* CR0.WP too. boot.asm sets it for the boot processor and ap_boot.asm
+     * for an application processor, so this is a check rather than a change -
+     * but a check worth making, because write protection that is on for one
+     * processor and off for another is worse than it being off everywhere. */
+    if (!(read_cr0() & CR0_WP))
+        ok = false;
+
+    return ok;
 }

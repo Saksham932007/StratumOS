@@ -437,6 +437,33 @@ static void test_worker(void *arg)
     }
 }
 
+/* More tasks than processors, so that a machine with four has to use more
+ * than one of them to get through the work. */
+#define PARALLEL_TASKS  6
+#define PARALLEL_ROUNDS 40
+
+static volatile u32 parallel_seen[SMP_MAX_CPUS];
+static volatile u32 parallel_done;
+
+static void parallel_task(void *arg)
+{
+    UNUSED(arg);
+
+    for (u32 i = 0; i < PARALLEL_ROUNDS; i++) {
+        u32 cpu = smp_cpu_index();
+
+        if (cpu < SMP_MAX_CPUS)
+            __atomic_add_fetch(&parallel_seen[cpu], 1, __ATOMIC_RELAXED);
+
+        /* Yield rather than spin: the test is about where work is scheduled,
+         * not about how long a quantum is, and yielding makes the run short
+         * enough to sit inside a test suite. */
+        sched_yield();
+    }
+
+    __atomic_add_fetch(&parallel_done, 1, __ATOMIC_RELAXED);
+}
+
 static void test_scheduler(struct ktest_result *r)
 {
     struct task *self = task_current();
@@ -479,6 +506,121 @@ static void test_scheduler(struct ktest_result *r)
     u64 elapsed = timer_ms() - before_ms;
     KT_ASSERT(r, elapsed >= 50);
     KT_ASSERT(r, elapsed < 30000);
+
+    /* ---- and it runs on more than one processor -------------------------
+     *
+     * This is the assertion the per-CPU scheduler exists for, and it cannot
+     * be made by looking at one number: a summed switch count is satisfied
+     * by one busy processor. So: start more tasks than there are processors,
+     * have each record which processor it is on, and count how many
+     * processors were used.
+     *
+     * On a machine with one processor the answer is 1 and that is correct.
+     * On a machine with four it must be more than 1, and if it is not, the
+     * other three are awake and idle - which is precisely the thing this was
+     * supposed to fix. */
+    for (u32 i = 0; i < SMP_MAX_CPUS; i++)
+        parallel_seen[i] = 0;
+    parallel_done = 0;
+
+    u32 started = 0;
+
+    for (u32 i = 0; i < PARALLEL_TASKS; i++)
+        if (task_create("ktest-par", parallel_task, NULL))
+            started++;
+
+    KT_EQ(r, started, (u32)PARALLEL_TASKS);
+
+    /* Sleep rather than yield: yielding keeps this processor busy, and the
+     * point is to let the others pick the work up. Bounded so a scheduler
+     * bug fails the test rather than hanging the kernel. */
+    for (int spin = 0;
+         spin < 600 &&
+         __atomic_load_n(&parallel_done, __ATOMIC_RELAXED) < started;
+         spin++)
+        task_sleep_ms(5);
+
+    KT_EQ(r, __atomic_load_n(&parallel_done, __ATOMIC_RELAXED), started);
+
+    /* Collect them, which also proves wait() works for children that ran
+     * somewhere else. */
+    for (u32 i = 0; i < started; i++) {
+        int status = -1;
+
+        KT_ASSERT(r, task_wait(&status) > 0);
+        KT_EQ(r, (u32)status, 0u);
+    }
+
+    u32 processors_used = 0;
+    u32 total_slices = 0;
+
+    for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
+        if (parallel_seen[i]) {
+            processors_used++;
+            total_slices += parallel_seen[i];
+        }
+    }
+
+    /* Logged, not just asserted: the distribution is the interesting part,
+     * and a test that only says "more than one" hides whether the work went
+     * four ways or two. */
+    char spread[64] = {0};
+    size_t at = 0;
+
+    for (u32 i = 0; i < SMP_MAX_CPUS && at + 8 < sizeof(spread); i++) {
+        const struct cpu *c = smp_cpu(i);
+
+        if (!c || !c->online)
+            continue;
+        at += (size_t)ksnprintf(spread + at, sizeof(spread) - at, "%s%u",
+                                at ? "/" : "", parallel_seen[i]);
+    }
+
+    pr_info("ktest parallel: %u slices over %u processor(s): %s", total_slices,
+            processors_used, spread);
+
+    for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
+        const struct cpu *c = smp_cpu(i);
+
+        if (!c || !c->present)
+            continue;
+        pr_info("  cpu %u: online %u bsp %u switches %u ticks %u resched %u "
+                "idle_loops %u current %s",
+                i, c->online, c->is_bsp, c->switches, c->timer_ticks,
+                c->ipi_resched, (u32)c->idle_loops,
+                c->current ? c->current->name : "(none)");
+    }
+
+    KT_ASSERT(r, processors_used >= 1);
+    KT_EQ(r, total_slices, (u32)PARALLEL_TASKS * PARALLEL_ROUNDS);
+
+    if (smp_enabled()) {
+        /* The assertion is on how many processors have performed a context
+         * switch, not on where these six tasks happened to land.
+         *
+         * Which processor picks a task up is a race by design, and over a
+         * couple of hundred short slices it is entirely possible for one
+         * processor to take all of them - a run that did exactly that is
+         * what turned this from a check on `processors_used` into a check on
+         * switch counts. A processor's switch count is non-zero only if it
+         * has run something other than its own idle task, which is the claim
+         * worth making: the other cores are not awake and idle any more.
+         * The distribution is logged above rather than asserted on. */
+        u32 busy = 0;
+
+        for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
+            const struct cpu *c = smp_cpu(i);
+
+            if (c && c->online && c->switches)
+                busy++;
+        }
+
+        KT_ASSERT(r, busy > 1);
+        KT_EQ(r, busy, smp_cpu_count());
+    } else {
+        KT_EQ(r, processors_used, 1u);
+        KT_EQ(r, smp_this_cpu()->switches > 0, true);
+    }
 }
 
 /* ---- boot protocol ----------------------------------------------------- */
@@ -1693,14 +1835,28 @@ static void test_smp(struct ktest_result *r)
         KT_ASSERT(r, (svr & APIC_SW_ENABLE) != 0);
         KT_EQ(r, svr & 0xFF, (u32)APIC_VECTOR_SPURIOUS);
 
-        /* This is the boot processor, so LINT0 must be ExtINT and not masked.
-         * Masking it is what cut the 8259s off from the CPU and stopped the
-         * timer; the symptom was every log line sharing one timestamp, which
-         * is not something a functional test would have noticed. */
+        /* LINT0, which is per-processor and has two correct answers.
+         *
+         * On the boot processor it must be ExtINT and not masked: masking it
+         * is what cut the 8259s off from the CPU and stopped the timer, and
+         * the symptom was every log line sharing one timestamp, which is not
+         * something a functional test would have noticed. On an application
+         * processor it must be masked, because only one processor may be
+         * wired to the 8259s and two accepting ExtINT would deliver the same
+         * IRQ twice.
+         *
+         * Which of the two applies is now a question worth asking, because
+         * this suite no longer necessarily runs on the boot processor - the
+         * scheduler may have put it anywhere. That it used to be a safe
+         * assumption and now is not is itself the thing being tested. */
         u32 lint0 = apic_read(APIC_LVT_LINT0);
 
-        KT_EQ(r, lint0 & APIC_LVT_MASKED, 0u);
-        KT_EQ(r, lint0 & 0x700, (u32)APIC_LVT_EXTINT);
+        if (smp_this_cpu()->is_bsp) {
+            KT_EQ(r, lint0 & APIC_LVT_MASKED, 0u);
+            KT_EQ(r, lint0 & 0x700, (u32)APIC_LVT_EXTINT);
+        } else {
+            KT_ASSERT(r, (lint0 & APIC_LVT_MASKED) != 0);
+        }
 
         /* ...and the timer really is advancing, which is the property that
          * mattered. */
@@ -1736,9 +1892,29 @@ static void test_smp(struct ktest_result *r)
     if (self) {
         KT_ASSERT(r, self->present);
         KT_ASSERT(r, self->online);
-        /* The test suite runs on the boot processor, because that is where
-         * the scheduler runs. */
-        KT_ASSERT(r, self->is_bsp);
+        /* No assertion that this is the boot processor. There used to be
+         * one, and the comment under it read "the test suite runs on the
+         * boot processor, because that is where the scheduler runs" - which
+         * was true, and was the whole defect. The suite now runs wherever
+         * the scheduler puts it.
+         *
+         * What must still hold is that exactly one processor claims to be
+         * the boot processor, and that this one claims it only if it is that
+         * one. */
+        u32 bsps = 0;
+        u32 bsp_index = SMP_MAX_CPUS;
+
+        for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
+            const struct cpu *c = smp_cpu(i);
+
+            if (c && c->is_bsp) {
+                bsps++;
+                bsp_index = i;
+            }
+        }
+
+        KT_EQ(r, bsps, 1u);
+        KT_ASSERT(r, self->is_bsp == (me == bsp_index));
         KT_EQ(r, self->index, me);
 
         if (apic_available())
@@ -1776,8 +1952,8 @@ static void test_smp(struct ktest_result *r)
         KT_ASSERT(r, vmm_translate(base, NULL));
         KT_ASSERT(r, !vmm_translate(base - PAGE_SIZE, NULL));
 
-        /* It reached its idle loop, which is the only thing an application
-         * processor does in this phase. */
+        /* It reached its idle loop - which is no longer all it does, but is
+         * still where it goes when the run queue is empty. */
         KT_ASSERT(r, c->idle_loops > 0);
 
         /* And its *own* local APIC timer is ticking. This is the assertion
@@ -1979,7 +2155,14 @@ static void test_smp(struct ktest_result *r)
         return;
     }
 
-    /* More than one. Every other processor must answer a ping. */
+    /* More than one. Every processor but the sender must answer a ping.
+     *
+     * "But the sender", not "but the boot processor", which is what this
+     * said until the scheduler started putting the test suite on an
+     * application processor. A broadcast IPI excludes the sender, so the
+     * number of answers is one short of the processor count whoever sends
+     * it - and a test that assumed the sender was the boot processor
+     * counted the boot processor's own answer as missing. */
     u32 before_ping[SMP_MAX_CPUS];
 
     for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
@@ -1998,7 +2181,7 @@ static void test_smp(struct ktest_result *r)
         for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
             const struct cpu *c = smp_cpu(i);
 
-            if (c && !c->is_bsp && c->ipi_ping > before_ping[i])
+            if (c && i != me && c->ipi_ping > before_ping[i])
                 answered++;
         }
 
@@ -2013,7 +2196,7 @@ static void test_smp(struct ktest_result *r)
     for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
         const struct cpu *c = smp_cpu(i);
 
-        if (c && !c->is_bsp && c->ipi_ping > before_ping[i])
+        if (c && i != me && c->ipi_ping > before_ping[i])
             answered++;
     }
 

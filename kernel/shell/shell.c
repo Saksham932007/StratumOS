@@ -1118,8 +1118,9 @@ static int cmd_cpus(int argc, char **argv)
 
     kprintf("Processors (%u online of %u reported)\n", smp_cpu_count(),
             smp_cpus_present());
-    kprintf("  %4s %5s %5s %-9s %10s %8s %8s %10s %12s\n", "CPU", "APIC",
-            "ROLE", "STATE", "STACK", "PINGS", "TLB", "TICKS", "IDLE LOOPS");
+    kprintf("  %4s %5s %5s %-8s %8s %8s %9s %10s %-12s\n", "CPU", "APIC",
+            "ROLE", "STATE", "TICKS", "SWITCHES", "RESCHED", "IDLE LOOPS",
+            "RUNNING");
 
     for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
         const struct cpu *c = smp_cpu(i);
@@ -1127,26 +1128,34 @@ static int cmd_cpus(int argc, char **argv)
         if (!c)
             continue;
 
-        kprintf("  %4u %5u %5s %-9s %10p %8u %8u %10u %12llu%s\n", c->index,
+        /* The task each processor is running, read without the scheduler's
+         * lock. It may be stale by the time it is printed - which is the
+         * honest answer to "what is every processor doing", because there is
+         * no instant at which all four are standing still. */
+        const struct task *on = c->current;
+
+        kprintf("  %4u %5u %5s %-8s %8u %8u %9u %10llu %-12s%s\n", c->index,
                 c->apic_id, c->is_bsp ? "bsp" : "ap",
-                c->online ? "online" : "OFFLINE", (void *)c->stack_top,
-                c->ipi_ping, c->ipi_tlb, c->timer_ticks, c->idle_loops,
+                c->online ? "online" : "OFFLINE", c->timer_ticks, c->switches,
+                c->ipi_resched, c->idle_loops, on ? on->name : "-",
                 c->index == smp_cpu_index() ? "  <- this one" : "");
     }
 
-    kprintf("  IPIs      : %u ping(s) sent, %u shootdown(s) sent, "
-            "%u served, %u start failure(s)\n",
-            ss.pings_sent, ss.shootdowns_sent, ss.shootdowns_served,
-            ss.start_failures);
+    kprintf("  IPIs      : %u ping(s), %u reschedule(s), %u shootdown(s) "
+            "sent, %u served, %u start failure(s)\n",
+            ss.pings_sent, ss.reschedules_sent, ss.shootdowns_sent,
+            ss.shootdowns_served, ss.start_failures);
 
     if (!smp_enabled())
         kprintf("  (one processor: the scheduler, the locks and the IPI "
                 "paths all still work, there is just nobody to talk to)\n");
     else
-        kprintf("  Every processor has its own timer and preempts itself, "
-                "but the run queue is\n"
-                "  still cpu 0's: the others service interrupts and idle. "
-                "See docs/SMP.md.\n");
+        kprintf("  Every processor runs the scheduler, from one shared run "
+                "queue, with its own\n"
+                "  idle task and its own timer. A non-zero SWITCHES column "
+                "is the evidence:\n"
+                "  a processor only switches if it has run something other "
+                "than idle.\n");
 
     return 0;
 }

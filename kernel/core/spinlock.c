@@ -95,7 +95,7 @@ bool spin_trylock(spinlock_t *lock)
                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
         u32 self = smp_cpu_index();
 
-        lock->holder = self;
+        __atomic_store_n(&lock->holder, self, __ATOMIC_RELAXED);
         lock->saved_if = was_enabled;
         __atomic_add_fetch(&lock->acquisitions, 1, __ATOMIC_RELAXED);
         level_enter(lock, self);
@@ -120,7 +120,7 @@ void spin_lock(spinlock_t *lock)
 
     if (__atomic_compare_exchange_n(&lock->locked, &expected, 1, false,
                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-        lock->holder = self;
+        __atomic_store_n(&lock->holder, self, __ATOMIC_RELAXED);
         lock->saved_if = was_enabled;
         __atomic_add_fetch(&lock->acquisitions, 1, __ATOMIC_RELAXED);
         level_enter(lock, self);
@@ -152,7 +152,7 @@ void spin_lock(spinlock_t *lock)
             if (__atomic_compare_exchange_n(&lock->locked, &expected, 1, false,
                                             __ATOMIC_ACQUIRE,
                                             __ATOMIC_RELAXED)) {
-                lock->holder = self;
+                __atomic_store_n(&lock->holder, self, __ATOMIC_RELAXED);
                 lock->saved_if = was_enabled;
                 __atomic_add_fetch(&lock->acquisitions, 1, __ATOMIC_RELAXED);
                 level_enter(lock, self);
@@ -182,7 +182,7 @@ void spin_unlock(spinlock_t *lock)
 
     u32 self = smp_cpu_index();
 
-    if (lock->holder != self)
+    if (__atomic_load_n(&lock->holder, __ATOMIC_RELAXED) != self)
         panic("cpu %u released lock '%s', which cpu %u holds", self,
               lock->name ? lock->name : "(unnamed)", lock->holder);
 
@@ -190,6 +190,11 @@ void spin_unlock(spinlock_t *lock)
 
     lock->saved_if = false;
     level_leave(lock, self);
+
+    /* Before the lock word, not after: once `locked` is clear another
+     * processor may win the exchange, and a stale holder written over its
+     * fresh one would make this lock look like ours again. */
+    __atomic_store_n(&lock->holder, SPIN_NO_HOLDER, __ATOMIC_RELAXED);
 
     /* The release has to be the last thing. Once the word is clear another
      * processor may enter the critical section, so every write inside it must

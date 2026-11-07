@@ -718,17 +718,223 @@ zero and stay zero.
 
 ---
 
+## Scheduling on every processor
+
+The run queue used to be the boot processor's. Every other processor came up,
+loaded its descriptor tables, started its timer, serviced IPIs — and idled,
+because `current` and `idle` were two file-scope variables in `sched.c`, and a
+machine with one of each can run one task at a time.
+
+They are fields of `struct cpu` now, along with `need_resched`, a switch
+count, and one more that turns out to be the whole design: `prev`.
+
+### One queue, not one per processor
+
+"Per-CPU run queues" is the usual phrase and this is not that, deliberately.
+
+A queue per processor buys two things: no contention on a shared lock, and
+cache locality from a task tending to return to the processor whose cache
+holds its data. It costs a balancer — code that moves tasks between queues,
+decides when to, and is where every scheduler that has one keeps its hardest
+bugs.
+
+This kernel has 32 task slots and at most 8 processors. Selection under the
+lock is a walk of a short list, and the contention a shared queue would have
+to show before a balancer earned its complexity is not reachable at this
+size. So: one ring threaded through `task->next`, one global round-robin
+cursor, one lock, and no affinity. The processor a task last ran on is
+recorded in `task->cpu` and reported by `ps`, not respected.
+
+The cursor is global rather than per-processor on purpose. Two processors
+picking at the same instant advance the same cursor and get different tasks,
+rather than both starting at the head of the queue and one of them losing.
+
+Idle tasks are not in the ring at all. An idle task belongs to exactly one
+processor — it owns that processor's stack and cannot run anywhere else — so
+it is the explicit fallback rather than a last entry that must never be
+chosen. Each occupies the `tasks[]` slot with its processor's index, which
+makes the processor-to-idle-task mapping impossible to get wrong, and each is
+pid 0, because pid 0 is how the rest of the kernel asks "is this a real
+task".
+
+An application processor builds nothing itself. It waits in `ap_main()` for
+`sched_ready_for_aps()`, which `sched_init()` sets with a release after it has
+built an idle task for every processor already online; the acquire on the
+other side is what guarantees the processor can see the task that was made for
+it. Then it calls `sched_start()` — which is to say, it *is* its idle task,
+standing on the stack it has been standing on since the trampoline.
+
+### The lock cannot be held across the switch
+
+This is the part that took the care, and it is not obvious.
+
+A `spinlock_t` records the interrupt state it found in the lock. A context
+switch hands control to a task that will eventually release that lock from a
+different stack, with a different interrupt state, having arrived there from a
+different place. Holding the scheduler's lock across `context_switch()` means
+the release happens somewhere the acquisition cannot reason about.
+
+So `do_switch()` lets go first. In order:
+
+1. `next` is marked RUNNING **inside** the lock, so no other processor can
+   pick it between here and the stack swap.
+2. `prev` is left marked RUNNING and recorded as this processor's `prev`. It
+   is therefore unpickable too.
+3. The lock is released. Interrupts stay masked, because every acquisition of
+   this lock is wrapped in an explicit `irq_save()` and the release of a lock
+   taken with interrupts already off is a no-op for the interrupt flag.
+4. The stacks are swapped.
+5. Whoever resumes calls `sched_handoff()`, which marks the processor's `prev`
+   READY — now that its stack pointer has actually been written.
+
+**Step 2 is the step that is easy to miss.** Marking `prev` READY before the
+switch is the obvious thing to write, and it is a memory-corruption bug on a
+machine with two processors: the other one picks the task up and begins
+restoring a context this one has not finished saving. The symptom is a task
+resuming with a stack pointer from the middle of a switch, which is to say no
+symptom you could read.
+
+`sched_handoff()` is also why both assembly trampolines changed.
+`thread_trampoline` and `fork_trampoline` are where a brand-new task and a
+forked child arrive, and neither arrives through `do_switch()`, so each has to
+discharge the obligation itself. Both now have `IF` clear in the EFLAGS word
+their stack was built with — `0x002`, not `0x202` — call `sched_handoff()`
+first, and only then let interrupts in.
+
+The same reasoning fixed a second-order bug that predated SMP.
+`task_sleep_ms()` and `task_block()` used to set the state and then call
+`sched_yield()`, two critical sections with a gap between them. In that gap
+the task is marked SLEEPING and still running, and another processor's
+`wake_sleepers()` can set it READY and run it — in two places at once. Both
+now go through `sched_switch_away(state, deadline)`, which parks the task and
+switches under one acquisition.
+
+### Four bugs that only a second processor could find
+
+Three of these were already in the kernel. The scheduler change did not cause
+them; it made them reachable.
+
+**The lock's own recursion check was broken.** `spin_unlock()` never cleared
+`holder`, and the "nobody holds it" value was `0` — a perfectly good processor
+index. So an untaken lock looked like a lock held by processor 0, and, worse,
+between a processor winning the exchange and recording itself as the holder,
+whichever processor had held the lock last would see its own index there and
+panic with "recursively acquired". The window is a handful of instructions.
+Finding it needs a contended lock and a second processor, which is exactly
+what the scheduler's lock became:
+
+```
+cpu 3 recursively acquired lock 'sched'
+  [1] sched_switch_away+0x29
+  [2] demo_worker+0xab
+  [3] thread_trampoline+0x10
+```
+
+The sentinel is `SPIN_NO_HOLDER` now, and the holder is cleared before the
+lock word rather than left stale.
+
+**`sched_preempt()` was only called for vectors 32–47.** The interrupt
+dispatcher called it at the tail of the hardware-IRQ path — the 8259s' range —
+and returned straight out of the `handlers[]` path, which is where a local
+APIC interrupt goes. The APIC timer is vector `0xF3`. So an application
+processor set `need_resched` a hundred times a second and nothing ever read
+it, and every task ran on the boot processor: the exact bug the per-CPU run
+queue was meant to fix, hiding one layer further down. Exceptions still never
+preempt — a fault is not a scheduling opportunity.
+
+**SMEP, SMAP and CR0.WP are per-processor bits** and only the boot processor
+ever set them. Harmless while the other processors idled. The moment they ran
+tasks, the hardening suite — which reads CR4 on whichever processor it happens
+to be running on — started failing on three cores out of four. `harden_init_ap()`
+now sets them on each processor and the kernel panics if one cannot match what
+the boot processor reported: W^X enforced on one processor out of four is not
+W^X enforced.
+
+**Three tests had encoded "the suite runs on the boot processor."** One
+asserted `self->is_bsp`, with a comment reading "the test suite runs on the
+boot processor, because that is where the scheduler runs" — true when it was
+written, and the whole defect. One asserted LINT0 was unmasked ExtINT, which
+is correct for the boot processor and wrong for every other. One counted IPI
+ping answers as `count - 1` while filtering out the boot processor rather than
+the *sender*. All three now assert the per-processor truth, which is a better
+test than the one that passed.
+
+### What the evidence looks like
+
+A summed switch count is satisfied by one busy processor, so the `sched` suite
+starts six tasks — more than there are processors — has each record which
+processor it is on, and logs the distribution:
+
+```
+ktest parallel: 240 slices over 3 processor(s): 120/80/0/40
+  cpu 0: online 1 bsp 1 switches 49  ticks 70 resched 1  current autotest
+  cpu 1: online 1 bsp 0 switches 28  ticks 69 resched 15 current idle
+  cpu 2: online 1 bsp 0 switches 140 ticks 69 resched 14 current idle
+  cpu 3: online 1 bsp 0 switches 127 ticks 69 resched 15 current idle
+```
+
+The assertion is on the switch counts, not on where those six tasks landed.
+Which processor picks a task up is a race by design, and a later run put all
+240 slices on one processor — which is legitimate, and is what turned this
+from a check on the spread into a check on switch counts. A processor's switch
+count is non-zero only if it has run something other than its own idle task,
+and that is the claim worth making.
+
+`cpus` prints the same columns from the shell.
+
+### The reschedule IPI
+
+A processor that makes a task runnable and is busy with something else has to
+tell the others, because an idle processor is sitting in `HLT` and will
+otherwise find out at its next tick. On a machine with three idle processors
+and a 100 Hz tick, a task woken by an arriving network segment would wait up
+to 10 ms to start running, which is absurd.
+
+`APIC_VECTOR_IPI_RESCHED` is a broadcast sent by `task_create()`,
+`task_fork()` and `task_unblock()`. The handler sets `need_resched` and
+acknowledges; it does not schedule. The switch happens at the tail of the
+interrupt path like every other preemption, which is the one place in the
+kernel where the stack is known to be in a state a switch can survive.
+
+The idle loop is `sti; hlt` with nothing between the two instructions, because
+the processor guarantees that an interrupt pending at the `STI` is taken after
+the `HLT` is entered. Written the other way round, a task made runnable in the
+gap would wait for the next tick.
+
+### What this did to user space
+
+Two processes now genuinely run at the same instant, and the first thing that
+noticed was the ring-3 `fork` demo, whose output came back spliced:
+
+```
+[child] fork() returned 0 here; my pid is   [ring3] fork() returned 77, my parent is  here
+```
+
+Not a kernel bug. The child built that line out of five `write()` calls and
+the parent interleaved at a syscall boundary, which is what sharing a
+descriptor means. A program that wants a whole line has to write a whole line,
+so `user/syscall.h` grew `u_line_*`: build the line in your own memory, spend
+one `write()` on it. The kernel has done the same thing inside `kprintf()`
+since the console got a lock.
+
+---
+
 ## What is missing
 
-- **Per-CPU run queues.** Every processor now has its own timer and preempts
-  itself — see below — but the run queue is still the boot processor's, so
-  the others service interrupts and idle. The gate on this was that no
-  subsystem was lock-protected: two processors running tasks concurrently
-  would have corrupted the heap non-deterministically on the first
-  `kmalloc`. The memory stack, the console and the checked hierarchy above
-  are now in place, which leaves the scheduler change itself — a run queue
-  per processor, `current` and the idle task becoming per-CPU state in
-  `struct cpu`, a reschedule IPI, and task-to-processor ownership.
+- **Affinity and a balancer.** The run queue is shared and there is no
+  affinity: a task goes to whichever processor asks next, so it loses its
+  cache every time it moves. The fix is a queue per processor and a balancer,
+  and the reason it is not here is in "One queue, not one per processor"
+  above — at 32 task slots and 8 processors the contention a balancer would
+  relieve is not reachable. The number to watch is the `sched` lock's
+  contention count, which `locks` prints.
+- **Priorities.** Round robin with one quantum for everything. A task that
+  wakes from a 1 ms sleep waits behind whatever was already runnable, and
+  there is no way to say that one of two tasks matters more.
+- **Interrupt-driven ATA.** The disk driver busy-polls, so a read holds the
+  filesystem lock with interrupts masked for its duration. Correct, and not
+  kind: on four processors it is the one lock that can be held for
+  milliseconds.
 - **The I/O APIC.** The MADT is parsed and its I/O APIC entries and interrupt
   source overrides are read — including that IRQ 0 arrives as GSI 2 on QEMU,
   which a kernel that assumed otherwise would lose its timer to. Nothing is

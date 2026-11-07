@@ -90,48 +90,66 @@ static void demo_fork_cow(void)
         return;
     }
 
+    /* From here on the lines go out one write() at a time, assembled first.
+     *
+     * The parent and the child are two processes, and on a machine with more
+     * than one processor they run at the same instant on different ones - so
+     * a line built out of several write() calls gets spliced into the other
+     * process's. That is not a bug in either of them; it is what sharing a
+     * descriptor means. A program that wants a whole line writes a whole
+     * line. See u_line_* in syscall.h. */
+    struct u_line l;
+
     if (pid == 0) {
         /* The child. Same code, same addresses, different process. */
-        u_puts("    [child] fork() returned 0 here; my pid is ");
-        u_putu((u32)sys_getpid());
-        u_puts(", my parent is ");
-        u_putu((u32)sys_getppid());
-        u_puts("\n");
+        u_line_begin(&l);
+        u_line_str(&l, "    [child] fork() returned 0 here; my pid is ");
+        u_line_u(&l, (u32)sys_getpid());
+        u_line_str(&l, ", my parent is ");
+        u_line_u(&l, (u32)sys_getppid());
+        u_line_end(&l);
 
-        u_puts("    [child] I inherited ");
-        u_puthex(inherited);
-        u_puts(" and am about to write over it\n");
+        u_line_begin(&l);
+        u_line_str(&l, "    [child] I inherited ");
+        u_line_hex(&l, inherited);
+        u_line_str(&l, " and am about to write over it");
+        u_line_end(&l);
 
         /* The copy-on-write fault happens on this line. */
         inherited = CHILD_WROTE;
 
-        u_puts("    [child] my copy now reads ");
-        u_puthex(inherited);
+        u_line_begin(&l);
+        u_line_str(&l, "    [child] my copy now reads ");
+        u_line_hex(&l, inherited);
         if (inherited != CHILD_WROTE)
-            u_puts(" - WARNING: the write did not take!");
-        u_puts("\n");
+            u_line_str(&l, " - WARNING: the write did not take!");
+        u_line_end(&l);
 
-        u_puts("    [child] exiting with ");
-        u_putu(CHILD_EXIT);
-        u_puts("\n");
+        u_line_begin(&l);
+        u_line_str(&l, "    [child] exiting with ");
+        u_line_u(&l, CHILD_EXIT);
+        u_line_end(&l);
         sys_exit(CHILD_EXIT);
     }
 
     /* The parent. */
-    u_puts("  [ring3] fork() returned ");
-    u_putu((u32)pid);
-    u_puts(" here - one call, two return values\n");
+    u_line_begin(&l);
+    u_line_str(&l, "  [ring3] fork() returned ");
+    u_line_u(&l, (u32)pid);
+    u_line_str(&l, " here - one call, two return values");
+    u_line_end(&l);
 
     int status = -1;
     i32 reaped = sys_wait(&status);
 
-    u_puts("  [ring3] wait() collected pid ");
-    u_putu((u32)reaped);
-    u_puts(" with exit code ");
-    u_putu((u32)status);
+    u_line_begin(&l);
+    u_line_str(&l, "  [ring3] wait() collected pid ");
+    u_line_u(&l, (u32)reaped);
+    u_line_str(&l, " with exit code ");
+    u_line_u(&l, (u32)status);
     if (reaped != pid || status != CHILD_EXIT)
-        u_puts(" - WARNING: that is not the child we forked!");
-    u_puts("\n");
+        u_line_str(&l, " - WARNING: that is not the child we forked!");
+    u_line_end(&l);
 
     /* The point of the whole exercise. */
     if (inherited == 0x5A5A5A5Au)

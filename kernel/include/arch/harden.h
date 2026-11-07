@@ -43,6 +43,13 @@
  * code that had not been written for it. */
 void harden_init(void);
 
+/* The same bits, for an application processor. CR0 and CR4 are per
+ * processor, so each one has to set them for itself or the kernel's claim to
+ * enforce W^X and SMAP is true only of the processor that booted. Returns
+ * false if this processor did not end up matching what the boot processor
+ * reported - which is a reason to stop, not to continue quietly. */
+bool harden_init_ap(void);
+
 struct harden_state {
     bool smep_available, smep_enabled;
     bool smap_available, smap_enabled;

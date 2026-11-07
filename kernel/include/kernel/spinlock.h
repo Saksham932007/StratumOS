@@ -72,7 +72,19 @@ typedef struct {
     u8 level;
     u8 prev_level;
     /* Which processor holds it, for the recursion check and for diagnosing a
-     * deadlock. Only meaningful while `locked` is set. */
+     * deadlock, or SPIN_NO_HOLDER.
+     *
+     * It is cleared on release rather than merely left stale, and the
+     * sentinel is not zero, because both of those were bugs. Zero is a
+     * perfectly good processor index, so a lock that had never been taken
+     * looked like a lock held by processor 0 - and a lock released without
+     * clearing this looked, to the processor that had just released it, like
+     * a lock it still held. The second one is the sharper of the two: it
+     * turns the gap between winning the exchange and recording the holder
+     * into a false "recursively acquired" panic on whichever processor held
+     * the lock last. That gap is a handful of instructions wide, so it needs
+     * a contended lock and a second processor to find - which is exactly
+     * what the scheduler's lock became. */
     volatile u32 holder;
     const char *name;
     /* Contention, in acquisitions that had to wait. A lock that is never
@@ -82,11 +94,15 @@ typedef struct {
     volatile u32 contended;
 } spinlock_t;
 
+/* No processor holds it. Not zero: see `holder` above. */
+#define SPIN_NO_HOLDER 0xFFFFFFFFu
+
 /* A lock outside the hierarchy: nothing else is ever held across it. */
-#define SPINLOCK_INIT(nm)        {0, false, LOCK_LEVEL_NONE, 0, 0, (nm), 0, 0}
+#define SPINLOCK_INIT(nm) \
+    {0, false, LOCK_LEVEL_NONE, 0, SPIN_NO_HOLDER, (nm), 0, 0}
 
 /* A lock inside it. `lv` is one of LOCK_LEVEL_*. */
-#define SPINLOCK_INIT_AT(nm, lv) {0, false, (lv), 0, 0, (nm), 0, 0}
+#define SPINLOCK_INIT_AT(nm, lv) {0, false, (lv), 0, SPIN_NO_HOLDER, (nm), 0, 0}
 
 void spin_lock(spinlock_t *lock);
 void spin_unlock(spinlock_t *lock);

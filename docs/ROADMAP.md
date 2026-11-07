@@ -399,44 +399,26 @@ scheduler itself.
 
 ## Next
 
-### 1. Per-CPU run queues
+### 1. Affinity, priorities and interrupt-driven ATA
 
-Every processor is brought up, runs kernel code, holds real spinlocks,
-services IPIs and - since the local APIC timer landed - preempts itself. The
-run queue is still the boot processor's, so the others idle.
+The scheduler runs on every processor now, from one shared run queue, and
+[docs/SMP.md](SMP.md#scheduling-on-every-processor) has the design and the
+four bugs only a second processor could find. What is left are the three
+things that one shared queue and one quantum do not give:
 
-The subsystem locks that gated this are done. Six of the eight have landed,
-each at a level the machine checks: `pmm` (6), `vmm` (5), `heap` (4),
-`console` (7), `fs` (2, covering the descriptor tables, the VFS, FAT and the
-block layer) and `net` (3). The hierarchy, what the check caught, and the
-three places that now drop a lock around a sleep are all in
-[docs/SMP.md](SMP.md).
-
-What is left is the scheduler's own lock, and it is deliberately last because
-it is not separable from the change it enables. The run queue, the task
-table and `current` need protecting, but a scheduler lock cannot simply wrap
-`schedule()`: the context switch happens *inside* the critical section, so
-the lock is released by whichever task resumes rather than by the one that
-took it. `context_switch()` saves and restores EFLAGS with the task, so the
-interrupt flag travels with the task while `spinlock_t` keeps its saved flag
-in the lock - and those two facts have to be reconciled before a second
-processor can be let into the run queue at all.
-
-So the remaining work is one piece, not two:
-
-- a `sched` lock at level 1, with the saved interrupt flag moved out of the
-  lock and into per-processor state so it survives a switch;
-- a run queue per processor, with `current` and the idle task becoming
-  per-CPU fields of `struct cpu`;
-- an idle task per processor rather than the adopted boot context;
-- a reschedule IPI, so a processor that makes a task runnable can prod the
-  processor that should run it;
-- task-to-processor ownership, and the balancing policy that follows from it.
-
-One hazard is already known and not yet addressed: the ATA driver busy-polls
-rather than yielding, so a disk read holds the filesystem lock with
-interrupts masked for the duration. That is correct but it is not kind, and
-interrupt-driven ATA is the fix rather than a lock change.
+- **Affinity and a balancer.** A task goes to whichever processor asks next,
+  so it loses its cache whenever it moves. A queue per processor would fix
+  that and would need code to move work between the queues - which is where
+  every scheduler that has one keeps its hardest bugs. The number that would
+  justify it is the `sched` lock's contention count, and at 32 task slots and
+  8 processors it is not close.
+- **Priorities.** Round robin with one quantum for everything. A task that
+  wakes from a 1 ms sleep waits behind whatever was already runnable.
+- **Interrupt-driven ATA.** The disk driver busy-polls, so a read holds the
+  filesystem lock with interrupts masked for its duration. On one processor
+  that cost a timeslice; on four it is the one lock that can be held for
+  milliseconds while three processors wait on it. This is now the most
+  valuable of the three.
 
 ### 2. Interrupt-driven serial transmit
 

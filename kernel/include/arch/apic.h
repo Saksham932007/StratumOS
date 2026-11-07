@@ -78,10 +78,11 @@
 /* Vectors this kernel uses above the 8259 range (32-47). */
 #define APIC_VECTOR_SPURIOUS 0xFF
 #define APIC_VECTOR_ERROR    0xFE
-#define APIC_VECTOR_IPI_PING 0xF0 /* "are you there", for the tests      */
-#define APIC_VECTOR_IPI_TLB  0xF1 /* TLB shootdown                       */
-#define APIC_VECTOR_IPI_HALT 0xF2 /* stop, for panic                     */
-#define APIC_VECTOR_TIMER    0xF3 /* this CPU's own periodic tick         */
+#define APIC_VECTOR_IPI_PING 0xF0    /* "are you there", for the tests      */
+#define APIC_VECTOR_IPI_TLB  0xF1    /* TLB shootdown                       */
+#define APIC_VECTOR_IPI_HALT 0xF2    /* stop, for panic                     */
+#define APIC_VECTOR_TIMER    0xF3    /* this CPU's own periodic tick         */
+#define APIC_VECTOR_IPI_RESCHED 0xF4 /* "something is runnable, look again"  */
 
 /* Map and enable this CPU's local APIC. Called once on the boot processor,
  * which maps the registers, and then once on each application processor,

@@ -14,9 +14,17 @@
  * ever send that EOI and the timer would stop for good. That failure mode
  * takes a long evening to find, so it is worth the comment.
  *
- * The boot context becomes the idle task rather than being abandoned, which
- * means there is always exactly one runnable task and pick_next() never has
- * to answer "what if nothing can run".
+ * Each processor's boot context becomes that processor's idle task rather
+ * than being abandoned - the boot context for the processor that booted, and
+ * the context ap_main() is standing in for every other. So every processor
+ * always has something to be, and pick_next_locked() never has to answer
+ * "what if nothing can run".
+ *
+ * The scheduler runs on all of them, from one shared run queue, under one
+ * lock at the bottom of the kernel's lock hierarchy. The part of that which
+ * is not obvious is that the lock cannot be held across the context switch:
+ * see the comment on sched_lock, do_switch() and sched_handoff(), in that
+ * order, and docs/SMP.md for the four bugs the change surfaced.
  */
 #define LOG_TAG "sched"
 
@@ -28,6 +36,8 @@
 #include <kernel/log.h>
 #include <kernel/panic.h>
 #include <kernel/sched.h>
+#include <kernel/smp.h>
+#include <kernel/spinlock.h>
 #include <kernel/string.h>
 
 #include <mm/heap.h>
@@ -41,12 +51,36 @@ extern void thread_trampoline(void);
 extern u8 stack_top[];
 
 static struct task tasks[TASK_MAX];
-static struct task *current;
-static struct task *idle;
 static u32 next_pid;
 static u32 switch_count;
-static volatile bool need_resched;
 static bool sched_ready;
+static bool aps_may_join;
+
+/* The scheduler's lock. Level 1, the bottom of the hierarchy, which is the
+ * right place for it: a task is created while holding the filesystem's lock
+ * (a descriptor table), it is woken while holding the network's (a segment
+ * arrived), and it is killed while holding none - so every other subsystem
+ * has to be allowed to reach this one and none of them may be reached from
+ * under it. See kernel/spinlock.h.
+ *
+ * It protects `tasks[]`, the run-queue ring threaded through `->next`, the
+ * pid counter, and every processor's `current`, `idle` and `prev`.
+ *
+ * What it must never be held across is the context switch itself. Not
+ * because of deadlock - because of what the lock *is*: a spinlock holds its
+ * saved interrupt flag in the lock, and a context switch hands control to a
+ * task that will eventually release the lock from a different stack with a
+ * different interrupt state. do_switch() therefore releases it before
+ * swapping stacks, having first arranged that there is nothing left to
+ * protect; see the comment there, and sched_handoff(). Every acquisition is
+ * wrapped in an explicit irq_save()/irq_restore() so that the release
+ * cannot re-enable interrupts in the middle of a switch. */
+static spinlock_t sched_lock = SPINLOCK_INIT_AT("sched", LOCK_LEVEL_SCHED);
+
+/* The round-robin cursor. One for the whole machine rather than one per
+ * processor, because the run queue is one queue: see the note on
+ * pick_next_locked(). */
+static struct task *rr_cursor;
 
 static const char *const state_names[] = {
     "unused", "ready", "running", "sleeping", "blocked", "zombie",
@@ -61,43 +95,113 @@ const char *task_state_name(enum task_state s)
 
 struct task *task_current(void)
 {
-    return current;
+    /* Before sched_init() there is no task, which is what the NULL means and
+     * what every caller of this already tests for. Asking smp_this_cpu()
+     * first would be asking the task register what it is before the GDT has
+     * one. */
+    return sched_ready ? smp_this_cpu()->current : NULL;
 }
 
 u32 sched_switch_count(void)
 {
-    return switch_count;
+    return __atomic_load_n(&switch_count, __ATOMIC_RELAXED);
+}
+
+bool sched_ready_for_aps(void)
+{
+    return __atomic_load_n(&aps_may_join, __ATOMIC_ACQUIRE);
+}
+
+/* Build the idle task for one processor.
+ *
+ * An idle task is not allocated and never freed: it adopts the stack the
+ * processor is already standing on - the boot stack for the bootstrap
+ * processor, the stack smp_init() handed it for an application processor -
+ * and it occupies the slot in tasks[] with that processor's index, so the
+ * mapping from processor to idle task needs no lookup and cannot drift.
+ *
+ * Every idle task is pid 0. That is not laziness: pid 0 is how the rest of
+ * the kernel asks "is this a real task", and the profiler, the reaper and
+ * pick_next_locked() all want the same answer for all of them. */
+/* Defined further down with the run queue, but needed by the task lifecycle
+ * above it. */
+static void runqueue_insert_locked(struct task *t);
+static bool running_somewhere_locked(const struct task *t);
+static void reap_zombies(void);
+
+static struct task *idle_init(struct cpu *cpu, u32 esp0)
+{
+    struct task *t = &tasks[cpu->index];
+
+    t->pid = 0;
+    strlcpy(t->name, "idle", sizeof(t->name));
+    t->state = TASK_RUNNING;
+    t->quantum_left = SCHED_QUANTUM;
+    t->stack_base = NULL; /* not heap-allocated; never freed */
+    t->stack_size = 0;
+    t->kernel_esp0 = esp0;
+    t->parent_pid = 0;
+    t->cpu = cpu->index;
+    /* Kernel threads all run in the kernel's address space. Only a forked
+     * process gets its own. */
+    t->page_dir = vmm_kernel_root_phys();
+    t->next = NULL; /* idle tasks are not in the run queue; see pick_next */
+
+    cpu->idle = t;
+    cpu->current = t;
+    cpu->prev = NULL;
+    cpu->need_resched = false;
+
+    return t;
 }
 
 void sched_init(void)
 {
     memset(tasks, 0, sizeof(tasks));
 
-    /* Adopt the context we are already running in as task 0. It owns the
-     * boot stack, so there is nothing to allocate and nothing to switch to
-     * in order to get started. */
-    idle = &tasks[0];
-    idle->pid = 0;
-    strlcpy(idle->name, "idle", sizeof(idle->name));
-    idle->state = TASK_RUNNING;
-    idle->quantum_left = SCHED_QUANTUM;
-    idle->stack_base = NULL; /* not heap-allocated; never freed */
-    idle->stack_size = 0;
-    idle->kernel_esp0 = (u32)stack_top;
-    idle->parent_pid = 0;
-    /* Kernel threads all run in the kernel's address space. Only a forked
-     * process gets its own. */
-    idle->page_dir = vmm_kernel_root_phys();
-    idle->next = idle;
-
-    current = idle;
     next_pid = 1;
     switch_count = 0;
-    need_resched = false;
-    sched_ready = true;
 
-    tss_set_kernel_stack(idle->kernel_esp0);
-    pr_info("scheduler ready; boot context adopted as pid 0 (idle)");
+    /* Adopt the context we are already running in as this processor's idle
+     * task. It owns the boot stack, so there is nothing to allocate and
+     * nothing to switch to in order to get started. */
+    struct cpu *self = smp_this_cpu();
+    struct task *mine = idle_init(self, (u32)stack_top);
+
+    rr_cursor = NULL;
+    sched_ready = true;
+    tss_set_kernel_stack(mine->kernel_esp0);
+
+    /* And one for every other processor that is already online. They are
+     * sitting in ap_main() waiting for exactly this; building their idle
+     * tasks here rather than letting each build its own keeps every write to
+     * tasks[] on one processor until the moment the ring opens. */
+    u32 joined = 0;
+
+    for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
+        const struct cpu *c = smp_cpu(i);
+
+        if (!c || !c->online || c->index == self->index)
+            continue;
+
+        idle_init(smp_cpu_slot(i), c->stack_top);
+        joined++;
+    }
+
+    _Static_assert(SMP_MAX_CPUS < TASK_MAX,
+                   "every processor needs a tasks[] slot for its idle task, "
+                   "and there must be room left over for real tasks");
+
+    /* The release pairs with the acquire in sched_ready_for_aps(): an
+     * application processor must not see the permission to join before it
+     * can see the idle task that was built for it. */
+    __atomic_store_n(&aps_may_join, true, __ATOMIC_RELEASE);
+
+    if (joined)
+        pr_info("scheduler ready; %u processors, each with its own idle task",
+                joined + 1);
+    else
+        pr_info("scheduler ready; boot context adopted as pid 0 (idle)");
 }
 
 /* ---- kernel stacks, with guard pages -----------------------------------
@@ -191,9 +295,36 @@ u32 sched_canary_failures(void)
     return canary_failures;
 }
 
-static struct task *alloc_slot(void)
+/* Take the scheduler's lock with interrupts masked, and give them back
+ * exactly as they were.
+ *
+ * Every acquisition goes through these. The explicit mask matters: a
+ * spinlock release restores the interrupt state the *lock* recorded, and the
+ * switch path releases the lock and then swaps stacks. Masking first means
+ * the release is a no-op for the interrupt flag and the switch cannot be
+ * interrupted halfway through. */
+static bool sched_enter(void)
 {
-    for (size_t i = 1; i < TASK_MAX; i++)
+    bool irqs = irq_save();
+
+    spin_lock(&sched_lock);
+    return irqs;
+}
+
+static void sched_leave(bool irqs)
+{
+    spin_unlock(&sched_lock);
+    irq_restore(irqs);
+}
+
+/* The first SMP_MAX_CPUS slots are reserved for idle tasks, one per
+ * processor, whether or not that processor exists. Reserving them
+ * unconditionally rather than only for the processors that turned up keeps
+ * the slot index equal to the processor index, which is the thing that makes
+ * the mapping impossible to get wrong. */
+static struct task *alloc_slot_locked(void)
+{
+    for (size_t i = SMP_MAX_CPUS; i < TASK_MAX; i++)
         if (tasks[i].state == TASK_UNUSED)
             return &tasks[i];
     return NULL;
@@ -204,11 +335,11 @@ struct task *task_create(const char *name, task_entry_t entry, void *arg)
     if (!sched_ready)
         panic("task_create(\"%s\") before sched_init()", name);
 
-    bool irqs = irq_save();
-    struct task *t = alloc_slot();
+    bool irqs = sched_enter();
+    struct task *t = alloc_slot_locked();
 
     if (!t) {
-        irq_restore(irqs);
+        sched_leave(irqs);
         pr_err("cannot create \"%s\": all %u task slots in use", name,
                (unsigned)TASK_MAX);
         return NULL;
@@ -217,7 +348,10 @@ struct task *task_create(const char *name, task_entry_t entry, void *arg)
     /* Claim the slot before dropping the lock so a concurrent create cannot
      * hand out the same one. */
     t->state = TASK_BLOCKED;
-    irq_restore(irqs);
+
+    struct task *parent = smp_this_cpu()->current;
+
+    sched_leave(irqs);
 
     u32 esp0 = kstack_alloc((size_t)(t - tasks));
     if (!esp0) {
@@ -241,7 +375,7 @@ struct task *task_create(const char *name, task_entry_t entry, void *arg)
     t->exit_code = 0;
     t->user = false;
     t->resources_freed = false;
-    t->parent_pid = current ? current->pid : 0;
+    t->parent_pid = parent ? parent->pid : 0;
     /* An empty table and a working directory of "/". A kernel thread does not
      * get descriptors 0-2 opened for it: it has kprintf, and giving it a
      * console descriptor it never uses would hold an open-file slot for the
@@ -257,7 +391,7 @@ struct task *task_create(const char *name, task_entry_t entry, void *arg)
      * and `arg` sitting where a normal cdecl call would have left them.
      *
      *   sp[0..3] ebp edi esi ebx   (popped)
-     *   sp[4]    eflags            (popfd; IF set so the task is preemptible)
+     *   sp[4]    eflags            (popfd; IF *clear* - see below)
      *   sp[5]    return address -> thread_trampoline
      *   sp[6]    trampoline's own unused return slot
      *   sp[7]    entry
@@ -269,7 +403,12 @@ struct task *task_create(const char *name, task_entry_t entry, void *arg)
     *--sp = (u32)entry;
     *--sp = 0;
     *--sp = (u32)thread_trampoline;
-    *--sp = 0x202; /* IF | reserved bit 1 */
+    /* Interrupts off, not on. A new task arrives through
+     * thread_trampoline(), whose first job is sched_handoff() - releasing the
+     * task this processor just left - and that has to happen before anything
+     * can interrupt and switch again. The trampoline sets IF itself,
+     * immediately afterwards. */
+    *--sp = 0x002; /* reserved bit 1; IF clear */
     *--sp = 0;     /* ebx */
     *--sp = 0;     /* esi */
     *--sp = 0;     /* edi */
@@ -277,13 +416,16 @@ struct task *task_create(const char *name, task_entry_t entry, void *arg)
 
     t->saved_esp = (u32)sp;
 
-    irqs = irq_save();
+    irqs = sched_enter();
     t->pid = next_pid++;
-    /* Splice into the circular run queue just after the current task. */
-    t->next = current->next;
-    current->next = t;
+    t->cpu = smp_cpu_index();
+    runqueue_insert_locked(t);
     t->state = TASK_READY;
-    irq_restore(irqs);
+    sched_leave(irqs);
+
+    /* Somebody may be idle. Telling them is cheaper than waiting for their
+     * next tick to notice. */
+    smp_reschedule_others();
 
     pr_debug("created pid %u \"%s\", stack %p-%p", t->pid, t->name, stack,
              (void *)((u8 *)stack + TASK_STACK_SIZE));
@@ -306,20 +448,31 @@ struct task *task_create(const char *name, task_entry_t entry, void *arg)
  */
 static void release_task_resources(struct task *t)
 {
-    bool irqs = irq_save();
+    bool irqs = sched_enter();
 
-    if (t->resources_freed || t == current) {
-        irq_restore(irqs);
+    /* The claim and the check are in the same acquisition, which is what
+     * makes two idle processors reaping at once harmless: the second one
+     * finds the flag already set and returns. */
+    if (t->resources_freed || running_somewhere_locked(t)) {
+        sched_leave(irqs);
         return;
     }
 
-    /* Unlink from the run queue so pick_next() stops walking through it. The
-     * walk starts at `current`, which is by definition still in the list. */
-    struct task *p = current;
-    while (p->next != t && p->next != current)
-        p = p->next;
-    if (p->next == t)
-        p->next = t->next;
+    /* Unlink from the ring so pick_next_locked() stops walking through it.
+     * The cursor may *be* this task, in which case it has to move first - a
+     * cursor pointing at freed memory is a walk into nothing on the next
+     * selection. */
+    if (rr_cursor == t)
+        rr_cursor = (t->next == t) ? NULL : t->next;
+
+    if (rr_cursor) {
+        struct task *p = rr_cursor;
+
+        while (p->next != t && p->next != rr_cursor)
+            p = p->next;
+        if (p->next == t)
+            p->next = t->next;
+    }
 
     bool had_stack = t->stack_base != NULL;
     size_t slot = (size_t)(t - tasks);
@@ -331,7 +484,8 @@ static void release_task_resources(struct task *t)
     t->resources_freed = true;
     /* Keep page_dir readable for diagnostics but make clear it is gone. */
     t->page_dir = 0;
-    irq_restore(irqs);
+
+    sched_leave(irqs);
 
     if (had_stack)
         kstack_free(slot);
@@ -347,56 +501,176 @@ static void release_task_resources(struct task *t)
 /* Sweep every zombie that nobody has collected yet. Called from the idle
  * task, so a process whose parent never calls wait() still has its memory
  * returned - only the slot lingers. */
-static void reap_zombies(void)
+/* ---- the run queue ------------------------------------------------------
+ *
+ * One queue for the whole machine, not one per processor.
+ *
+ * That is a choice and it is worth being explicit about, because "per-CPU run
+ * queues" is the usual phrase. A queue per processor buys two things: no
+ * contention on a shared lock, and cache locality from a task tending to
+ * return to the processor whose cache holds its data. It costs a balancer -
+ * code that moves tasks between queues, decides when to, and is where every
+ * scheduler that has one keeps its hardest bugs.
+ *
+ * This kernel has thirty-two task slots and at most eight processors, and a
+ * selection under the lock is a walk of a short list. The contention a shared
+ * queue would have to show before a balancer earned its complexity is not
+ * reachable at this size. So: one queue, one lock, no affinity, and the
+ * processor a task last ran on recorded and reported rather than respected.
+ * docs/SMP.md says when that stops being the right answer.
+ *
+ * Idle tasks are not in the ring at all. They are not alternatives to a real
+ * task - each belongs to exactly one processor - so the fallback is explicit
+ * rather than a last entry that must never be chosen.
+ */
+
+/* Splice a task into the ring. Called with the lock held. */
+static void runqueue_insert_locked(struct task *t)
 {
-    for (size_t i = 1; i < TASK_MAX; i++) {
+    if (!rr_cursor) {
+        t->next = t;
+        rr_cursor = t;
+        return;
+    }
+
+    t->next = rr_cursor->next;
+    rr_cursor->next = t;
+}
+
+/* True if any processor is currently running this task. Called with the lock
+ * held, which is what makes the answer mean anything: a task that is RUNNING
+ * is somebody's `current` or somebody's `prev` whose stack pointer is still
+ * being written. */
+static bool running_somewhere_locked(const struct task *t)
+{
+    for (u32 i = 0; i < SMP_MAX_CPUS; i++) {
+        const struct cpu *c = smp_cpu(i);
+
+        if (!c || !c->online)
+            continue;
+        if (c->current == t || c->prev == t)
+            return true;
+    }
+
+    return false;
+}
+
+/* Find a zombie whose resources can be released, and claim it. Called with
+ * the lock held; the freeing itself happens outside, because it unmaps pages
+ * and frees frames and there is no reason to hold up the whole machine's
+ * scheduling while it does. */
+static struct task *claim_zombie_locked(void)
+{
+    for (size_t i = SMP_MAX_CPUS; i < TASK_MAX; i++) {
         struct task *t = &tasks[i];
 
-        if (t->state != TASK_ZOMBIE || t == current || t->resources_freed)
+        if (t->state != TASK_ZOMBIE || t->resources_freed)
             continue;
+        if (running_somewhere_locked(t))
+            continue;
+
+        /* A candidate, not a claim. release_task_resources() takes the lock
+         * again and does the claiming there, so two idle processors that
+         * both pick this task end with one of them doing the work. */
+        return t;
+    }
+
+    return NULL;
+}
+
+static void reap_zombies(void)
+{
+    /* Bounded by the table size rather than "until none are left": a zombie
+     * that is still some processor's `prev` cannot be freed yet and would
+     * otherwise be picked again on every pass. It will be gone next time
+     * round the idle loop. */
+    for (size_t pass = SMP_MAX_CPUS; pass < TASK_MAX; pass++) {
+        bool irqs = sched_enter();
+        struct task *t = claim_zombie_locked();
+
+        sched_leave(irqs);
+
+        if (!t)
+            return;
 
         release_task_resources(t);
     }
 }
 
-/* Move sleepers whose deadline has passed back to READY. */
-static void wake_sleepers(void)
+/* Move sleepers whose deadline has passed back to READY. Called with the
+ * lock held. */
+static void wake_sleepers_locked(void)
 {
     u64 now = timer_ticks();
 
-    for (size_t i = 0; i < TASK_MAX; i++)
+    for (size_t i = SMP_MAX_CPUS; i < TASK_MAX; i++)
         if (tasks[i].state == TASK_SLEEPING && now >= tasks[i].wake_at)
             tasks[i].state = TASK_READY;
 }
 
-/* Round robin: walk the circular queue from just after the current task and
- * take the first thing that can run. Idle is the fallback, never a choice. */
-static struct task *pick_next(void)
+/* Round robin: walk the ring from wherever the cursor left off and take the
+ * first thing that can run. Called with the lock held.
+ *
+ * The cursor is global, so two processors picking at the same instant get
+ * different tasks rather than fighting over the head of the queue - and a
+ * task is marked RUNNING here, inside the lock, which is what stops the
+ * second processor choosing what the first has just taken.
+ *
+ * This processor's idle task is the fallback, never a choice.
+ */
+static struct task *pick_next_locked(struct cpu *cpu)
 {
-    struct task *t = current->next;
+    struct task *start = rr_cursor;
 
-    for (size_t guard = 0; guard < TASK_MAX + 1; guard++) {
-        if (!t)
-            break;
-        if (t != idle && t->state == TASK_READY)
-            return t;
-        t = t->next;
-        if (t == current->next)
-            break;
+    if (start) {
+        struct task *t = start;
+
+        do {
+            t = t->next;
+            if (t->state == TASK_READY) {
+                rr_cursor = t;
+                return t;
+            }
+        } while (t != start);
     }
 
-    if (current != idle && current->state == TASK_RUNNING)
-        return current; /* nobody else wants the CPU */
+    /* Nobody else wants the processor. Carry on with what it was doing, if
+     * that is still a runnable thing to do. */
+    if (cpu->current != cpu->idle && cpu->current->state == TASK_RUNNING)
+        return cpu->current;
 
-    return idle;
+    return cpu->idle;
 }
 
-static void switch_to(struct task *next)
+/* Perform a switch. Called with the lock held and interrupts masked; returns
+ * with the lock released, and - for the task that resumes here later - after
+ * sched_handoff() has tidied up behind it.
+ *
+ * The ordering is the whole of the design:
+ *
+ *   1. `next` is marked RUNNING *inside* the lock, so no other processor can
+ *      pick it between here and the stack swap.
+ *   2. `prev` is left marked RUNNING, and recorded as this processor's
+ *      `prev`. It is therefore unpickable too - which it has to be, because
+ *      its saved stack pointer has not been written yet.
+ *   3. The lock is released. Interrupts stay masked, because the caller
+ *      masked them before taking it.
+ *   4. The stacks are swapped.
+ *   5. Whoever resumes calls sched_handoff(), which marks the processor's
+ *      `prev` READY now that its context is safely stored.
+ *
+ * Step 2 is the step that is easy to miss. Marking `prev` READY before the
+ * switch is the obvious thing to write and it is a corruption bug on a
+ * machine with two processors: the other one picks the task up and starts
+ * restoring a context that this one has not finished saving.
+ */
+static void do_switch(struct cpu *cpu, struct task *next)
 {
-    struct task *prev = current;
+    struct task *prev = cpu->current;
 
     if (next == prev) {
         prev->quantum_left = SCHED_QUANTUM;
+        spin_unlock(&sched_lock);
         return;
     }
 
@@ -405,13 +679,14 @@ static void switch_to(struct task *next)
      * overrun. Checking here means the panic names the culprit. */
     kstack_check(prev);
 
-    if (prev->state == TASK_RUNNING)
-        prev->state = TASK_READY;
-
     next->state = TASK_RUNNING;
     next->quantum_left = SCHED_QUANTUM;
     next->switches++;
-    current = next;
+    next->cpu = cpu->index;
+
+    cpu->current = next;
+    cpu->prev = prev;
+    cpu->switches++;
     switch_count++;
 
     /* Tell the CPU which stack to land on if an interrupt arrives while this
@@ -420,13 +695,74 @@ static void switch_to(struct task *next)
     tss_set_kernel_stack(next->kernel_esp0);
 
     /* Switch address spaces. Safe to do before the stack swap because every
-     * task's kernel stack lives in the kernel heap, which is mapped
-     * identically in every address space - that identity is the whole reason
-     * vmm_create_address_space() copies the kernel's page directory half. */
+     * task's kernel stack lives in the kernel's gigabyte, which is one
+     * shared page directory in every address space - that sharing is the
+     * whole reason vmm_create_address_space() points at the kernel's
+     * directory instead of copying it. */
     if (next->page_dir && next->page_dir != prev->page_dir)
         vmm_switch_address_space(next->page_dir);
 
+    spin_unlock(&sched_lock);
+
     context_switch(&prev->saved_esp, next->saved_esp);
+
+    /* Resumed - possibly on a different processor than the one that parked
+     * us, which is why sched_handoff() asks who it is running on now. */
+    sched_handoff();
+}
+
+void sched_handoff(void)
+{
+    struct cpu *cpu = smp_this_cpu();
+    struct task *prev = cpu->prev;
+
+    if (!prev)
+        return;
+
+    /* Interrupts are masked here - do_switch()'s caller masked them, and the
+     * two trampolines arrive with IF clear for exactly this reason - so
+     * nothing can preempt between the read and the clear. */
+    cpu->prev = NULL;
+
+    spin_lock(&sched_lock);
+    /* Still RUNNING means it was merely preempted and is runnable again.
+     * SLEEPING, BLOCKED or ZOMBIE means it parked itself deliberately and
+     * the state it chose is the one that must survive. */
+    if (prev->state == TASK_RUNNING)
+        prev->state = TASK_READY;
+    spin_unlock(&sched_lock);
+}
+
+/* Give up the processor.
+ *
+ * `park` is the state to leave the calling task in: TASK_RUNNING means "just
+ * yield, you are still runnable", and anything else means the task is parking
+ * itself and must not be picked up again until something changes it back.
+ *
+ * Setting that state and switching away have to happen under one acquisition
+ * of the lock. Doing it in two - as this did when there was one processor -
+ * leaves a window in which the task is marked SLEEPING while it is still
+ * running, and another processor's wake_sleepers_locked() can make it READY
+ * and run it on two processors at once.
+ */
+static void sched_switch_away(enum task_state park, u64 wake_at)
+{
+    bool irqs = irq_save();
+    struct cpu *cpu = smp_this_cpu();
+
+    spin_lock(&sched_lock);
+
+    if (park != TASK_RUNNING) {
+        cpu->current->state = park;
+        cpu->current->wake_at = wake_at;
+    }
+
+    cpu->need_resched = false;
+    wake_sleepers_locked();
+
+    do_switch(cpu, pick_next_locked(cpu)); /* releases the lock */
+
+    irq_restore(irqs);
 }
 
 void sched_tick(void)
@@ -434,28 +770,44 @@ void sched_tick(void)
     if (!sched_ready)
         return;
 
-    current->ticks_total++;
-    wake_sleepers();
+    struct cpu *cpu = smp_this_cpu();
+    struct task *cur = cpu->current;
 
-    if (current->quantum_left > 0)
-        current->quantum_left--;
+    if (!cur)
+        return;
 
-    /* Idle gives up the CPU the instant anything else is runnable; a real
-     * task keeps it until its quantum expires. */
-    if (current->quantum_left == 0 || current == idle)
-        need_resched = true;
+    cur->ticks_total++;
+
+    if (cur->quantum_left > 0)
+        cur->quantum_left--;
+
+    /* Idle gives up the processor the instant anything else is runnable; a
+     * real task keeps it until its quantum expires.
+     *
+     * Waking sleepers is *not* done here, although it used to be. It mutates
+     * tasks[] and so needs the lock, and taking a lock in the timer handler
+     * on every tick on every processor to do work that only matters if a
+     * switch follows is the wrong trade. It happens in
+     * sched_switch_away() instead, under the acquisition that is already
+     * being made. An idle processor sets need_resched every tick, so as long
+     * as one processor is idle a sleeper wakes within a tick; if every
+     * processor is busy it waits out a quantum, which is the same answer a
+     * busy machine gives to everything else. */
+    if (cur->quantum_left == 0 || cur == cpu->idle)
+        cpu->need_resched = true;
 }
 
 void sched_preempt(void)
 {
-    if (!sched_ready || !need_resched)
+    if (!sched_ready)
         return;
 
-    need_resched = false;
+    struct cpu *cpu = smp_this_cpu();
 
-    struct task *next = pick_next();
-    if (next != current)
-        switch_to(next);
+    if (!cpu->need_resched)
+        return;
+
+    sched_switch_away(TASK_RUNNING, 0);
 }
 
 void sched_yield(void)
@@ -467,18 +819,7 @@ void sched_yield(void)
         return;
     }
 
-    bool irqs = irq_save();
-
-    wake_sleepers();
-    need_resched = false;
-    struct task *next = pick_next();
-    if (next != current)
-        switch_to(next);
-
-    /* On the way back in, our saved EFLAGS had IF clear because of the
-     * irq_save() above, so the caller's interrupt state is restored here
-     * rather than inherited from whoever resumed us. */
-    irq_restore(irqs);
+    sched_switch_away(TASK_RUNNING, 0);
 }
 
 void task_sleep_ms(u32 ms)
@@ -492,15 +833,11 @@ void task_sleep_ms(u32 ms)
 
     /* Round up: a 1 ms sleep at 100 Hz must wait a tick, not zero. */
     u64 ticks_to_wait = ((u64)ms * hz + 999) / 1000;
+
     if (ticks_to_wait == 0)
         ticks_to_wait = 1;
 
-    bool irqs = irq_save();
-    current->wake_at = timer_ticks() + ticks_to_wait;
-    current->state = TASK_SLEEPING;
-    irq_restore(irqs);
-
-    sched_yield();
+    sched_switch_away(TASK_SLEEPING, timer_ticks() + ticks_to_wait);
 }
 
 void task_block(void)
@@ -508,11 +845,7 @@ void task_block(void)
     if (!sched_ready)
         return;
 
-    bool irqs = irq_save();
-    current->state = TASK_BLOCKED;
-    irq_restore(irqs);
-
-    sched_yield();
+    sched_switch_away(TASK_BLOCKED, 0);
 }
 
 void task_unblock(struct task *t)
@@ -520,52 +853,71 @@ void task_unblock(struct task *t)
     if (!t)
         return;
 
-    bool irqs = irq_save();
-    if (t->state == TASK_BLOCKED)
+    bool irqs = sched_enter();
+    bool woke = t->state == TASK_BLOCKED;
+
+    if (woke)
         t->state = TASK_READY;
-    irq_restore(irqs);
+
+    sched_leave(irqs);
+
+    /* A task has become runnable and this processor is busy with something
+     * else. Prod the others: one of them may be idle, and an idle processor
+     * that is not told waits for its own next tick to find out. */
+    if (woke)
+        smp_reschedule_others();
 }
 
 NORETURN void task_exit(int code)
 {
-    if (!sched_ready || current == idle)
+    struct cpu *cpu = smp_this_cpu();
+
+    if (!sched_ready || cpu->current == cpu->idle)
         panic("task_exit(%d) called from the idle task", code);
 
-    pr_debug("pid %u \"%s\" exited with %d", current->pid, current->name, code);
+    struct task *me = cpu->current;
+
+    pr_debug("pid %u \"%s\" exited with %d", me->pid, me->name, code);
 
     /* Descriptors go first, and they go here rather than in the reaper.
      * Closing one can run backend code - freeing a FAT handle, sending a FIN
      * on a socket - and that code is entitled to assume it is running as the
-     * process that owns the descriptor. The reaper runs as the idle task, in
+     * process that owns the descriptor. The reaper runs as an idle task, in
      * a different address space, so a close from there would be doing that
      * work on behalf of a process that no longer exists.
      *
-     * Interrupts are still on at this point, deliberately: a close may need
-     * to take a lock or touch a device, and doing it inside the IRQ-off
-     * window below would extend that window by however long a flush takes. */
-    fd_table_close_all(&current->files);
+     * Interrupts are still on at this point, deliberately: a close takes the
+     * filesystem's lock and may touch a device, and doing it inside the
+     * IRQ-off window below would extend that window by however long a flush
+     * takes. It is also why the page-fault handler drops the VMM lock before
+     * it reaches here - closing a descriptor must be free to take locks of
+     * its own. */
+    fd_table_close_all(&me->files);
 
     bool irqs = irq_save();
-    current->exit_code = code;
-    current->state = TASK_ZOMBIE;
-    need_resched = false;
+
+    spin_lock(&sched_lock);
+
+    me->exit_code = code;
+    me->state = TASK_ZOMBIE;
+    cpu->need_resched = false;
 
     /* If the parent is blocked in wait(), it is waiting for exactly this. */
-    for (size_t i = 0; i < TASK_MAX; i++) {
-        if (tasks[i].pid == current->parent_pid &&
-            tasks[i].state == TASK_BLOCKED) {
+    for (size_t i = SMP_MAX_CPUS; i < TASK_MAX; i++) {
+        if (tasks[i].pid == me->parent_pid && tasks[i].state == TASK_BLOCKED) {
             tasks[i].state = TASK_READY;
             break;
         }
     }
 
-    struct task *next = pick_next();
-    /* pick_next() will not return a zombie, so this always moves us off the
-     * dying task. Its stack stays allocated until someone else reaps it. */
-    switch_to(next);
+    /* pick_next_locked() will not return a zombie, so this always moves us
+     * off the dying task. Its stack stays allocated until an idle processor
+     * reaps it. */
+    do_switch(cpu, pick_next_locked(cpu)); /* releases the lock */
+
     irq_restore(irqs);
 
-    panic("a zombie task was scheduled again (pid %u)", current->pid);
+    panic("a zombie task was scheduled again (pid %u)", me->pid);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -577,17 +929,20 @@ int task_fork(const struct regs *parent_frame)
     if (!sched_ready || !parent_frame)
         return -1;
 
-    bool irqs = irq_save();
-    struct task *child = alloc_slot();
+    bool irqs = sched_enter();
+    struct task *child = alloc_slot_locked();
 
     if (!child) {
-        irq_restore(irqs);
+        sched_leave(irqs);
         pr_err("fork: all %u task slots are in use", (unsigned)TASK_MAX);
         return -1;
     }
 
     child->state = TASK_BLOCKED; /* claim the slot before unlocking */
-    irq_restore(irqs);
+
+    struct task *parent = smp_this_cpu()->current;
+
+    sched_leave(irqs);
 
     u32 esp0 = kstack_alloc((size_t)(child - tasks));
     if (!esp0) {
@@ -607,8 +962,6 @@ int task_fork(const struct regs *parent_frame)
         pr_err("fork: could not clone the address space");
         return -1;
     }
-
-    struct task *parent = current;
 
     memset(child->name, 0, sizeof(child->name));
     strlcpy(child->name, parent->name, sizeof(child->name));
@@ -658,7 +1011,10 @@ int task_fork(const struct regs *parent_frame)
     u32 *sp = (u32 *)frame;
     *--sp = (u32)frame;
     *--sp = (u32)fork_trampoline;
-    *--sp = 0x202; /* IF | reserved bit 1 */
+    /* IF clear: fork_trampoline() calls sched_handoff() before it restores
+     * the child's trap frame, and the iret out of that frame sets IF from
+     * the frame's own EFLAGS - which is the parent's, with interrupts on. */
+    *--sp = 0x002; /* reserved bit 1; IF clear */
     *--sp = 0;     /* ebx */
     *--sp = 0;     /* esi */
     *--sp = 0;     /* edi */
@@ -666,12 +1022,14 @@ int task_fork(const struct regs *parent_frame)
 
     child->saved_esp = (u32)sp;
 
-    irqs = irq_save();
+    irqs = sched_enter();
     child->pid = next_pid++;
-    child->next = current->next;
-    current->next = child;
+    child->cpu = smp_cpu_index();
+    runqueue_insert_locked(child);
     child->state = TASK_READY;
-    irq_restore(irqs);
+    sched_leave(irqs);
+
+    smp_reschedule_others();
 
     pr_info("fork: pid %u -> pid %u, address space %p", parent->pid, child->pid,
             (void *)child_pd);
@@ -685,50 +1043,63 @@ int task_wait(int *status_out)
         return -1;
 
     for (;;) {
-        bool irqs = irq_save();
+        bool irqs = sched_enter();
         bool have_children = false;
+        struct task *dead = NULL;
+        int pid = -1;
+        struct task *me = smp_this_cpu()->current;
 
-        for (size_t i = 1; i < TASK_MAX; i++) {
+        for (size_t i = SMP_MAX_CPUS; i < TASK_MAX; i++) {
             struct task *t = &tasks[i];
 
-            if (t->state == TASK_UNUSED || t->parent_pid != current->pid)
+            if (t->state == TASK_UNUSED || t->parent_pid != me->pid)
                 continue;
 
             if (t->state == TASK_ZOMBIE) {
-                int pid = (int)t->pid;
+                pid = (int)t->pid;
 
                 if (status_out)
                     *status_out = t->exit_code;
 
-                irq_restore(irqs);
-
-                /* The reaper may not have got to this child yet, and the slot
-                 * must not go back into circulation while it is still in the
-                 * run queue holding a stack and a page directory. Releasing
-                 * here rather than waiting for idle is also what makes
-                 * wait() the point at which a child's memory is definitely
-                 * gone. Idempotent, so racing the reaper is harmless. */
-                release_task_resources(t);
-
-                /* Collecting the exit code is what finally frees the slot. */
-                irqs = irq_save();
+                /* Collecting the exit code is what finally frees the slot,
+                 * and doing it here, inside the lock, is what stops two
+                 * parents - or a parent and the reaper - claiming the same
+                 * child. The *resources* are released outside, because that
+                 * unmaps pages. */
+                dead = t;
                 t->state = TASK_UNUSED;
                 t->parent_pid = 0;
-                irq_restore(irqs);
-                return pid;
+                break;
             }
 
             have_children = true;
         }
 
+        if (dead) {
+            sched_leave(irqs);
+
+            /* The reaper may not have got to this child yet, and the slot
+             * must not go back into circulation while it still holds a stack
+             * and a page directory. Releasing here rather than waiting for
+             * idle is also what makes wait() the point at which a child's
+             * memory is definitely gone. Idempotent, so racing the reaper is
+             * harmless. */
+            release_task_resources(dead);
+            return pid;
+        }
+
         if (!have_children) {
-            irq_restore(irqs);
+            sched_leave(irqs);
             return -1;
         }
 
-        /* Block rather than spin. task_exit() moves us back to READY. */
-        current->state = TASK_BLOCKED;
+        /* Block rather than spin. task_exit() moves us back to READY. The
+         * state change and the switch happen under one acquisition, which is
+         * why this cannot simply set BLOCKED and call sched_yield(). */
+        me->state = TASK_BLOCKED;
+        spin_unlock(&sched_lock);
         irq_restore(irqs);
+
         sched_yield();
     }
 }
@@ -736,26 +1107,49 @@ int task_wait(int *status_out)
 u32 task_count(void)
 {
     u32 n = 0;
+    bool irqs = sched_enter();
 
     for (size_t i = 0; i < TASK_MAX; i++)
         if (tasks[i].state != TASK_UNUSED)
             n++;
+
+    sched_leave(irqs);
     return n;
 }
 
 NORETURN void sched_start(void)
 {
-    /* This is the idle task's body. Reaping happens here because it is the
-     * one context guaranteed not to be standing on the stack it frees. */
+    /* This is an idle task's body, and every processor runs its own copy of
+     * it. Reaping happens here because an idle task is the one context
+     * guaranteed not to be standing on the stack it frees - and because an
+     * idle processor is by definition the one with time to do it. */
+    struct cpu *cpu = smp_this_cpu();
+
     for (;;) {
+        cpu->idle_loops++;
         reap_zombies();
+
+        /* STI then HLT, in that order and with nothing between them: the
+         * processor guarantees that an interrupt pending at the STI is taken
+         * after the HLT is entered, so a wakeup cannot be lost in the gap.
+         * Written the other way round, a task made runnable between the two
+         * instructions would wait for the next tick. */
         __asm__ volatile("sti; hlt");
     }
 }
 
 void sched_foreach(void (*fn)(const struct task *t, void *ctx), void *ctx)
 {
+    /* The callback runs under the scheduler's lock, so that a `ps` cannot
+     * print half a task table that another processor is changing underneath
+     * it. That means the callback must not block or take a lock below level
+     * 1 - which is every lock - so in practice it may only read and print.
+     * Printing is fine: the console is level 7. */
+    bool irqs = sched_enter();
+
     for (size_t i = 0; i < TASK_MAX; i++)
         if (tasks[i].state != TASK_UNUSED)
             fn(&tasks[i], ctx);
+
+    sched_leave(irqs);
 }

@@ -13,13 +13,13 @@ It also reaches 64-bit long mode and back, and the portable half of it runs
 on RISC-V 64.
 
 [![CI](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml/badge.svg)](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml)
-![language](https://img.shields.io/badge/C11%20%2B%20asm-49.1k%20lines-blue)
+![language](https://img.shields.io/badge/C11%20%2B%20asm-50.0k%20lines-blue)
 ![arch](https://img.shields.io/badge/arch-i686%20%2B%20riscv64-lightgrey)
-![tests](https://img.shields.io/badge/tests-1225%20assertions%2C%2015%20boot%20scenarios-brightgreen)
+![tests](https://img.shields.io/badge/tests-1243%20assertions%2C%2015%20boot%20scenarios-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 The same kernel binary boots two ways — through a bootloader written for this
-project, and through GRUB via Multiboot2 — and every push runs **1225
+project, and through GRUB via Multiboot2 — and every push runs **1243
 assertions across 92 host unit tests, 24 in-kernel suites and 15 QEMU boot
 scenarios**, plus four libFuzzer targets over the real kernel sources and the
 same kernel built and booted for a second architecture.
@@ -677,7 +677,7 @@ Everything marked ✅ is implemented and covered by a test.
 
 | | |
 | --- | --- |
-| ✅ | **24 in-kernel suites, 1225 assertions**, run against real hardware state |
+| ✅ | **24 in-kernel suites, 1243 assertions**, run against real hardware state |
 | ✅ | **15 QEMU boot scenarios** — both boot paths, four processors, SMEP/SMAP, a CPU with no NX bit, x86-64, an e1000, no e1000, a real HTTP server on the host, and three that must panic |
 | ✅ | **Four libFuzzer targets over the real kernel sources** under AddressSanitizer, plus a ring-3 syscall fuzzer |
 | ✅ | 20 pre-boot validation checks on every link, before an image is ever booted |
@@ -1156,7 +1156,7 @@ QEMU.
 | **Host unit tests** | the kernel's real `printf`/`string`/`div64` sources, compiled for the host, diffed against glibc | 92 checks |
 | **Pre-boot validation** | Multiboot2 header and checksum, ELF type, entry point inside a load segment, load address, `.bss` alignment, the higher-half split, every embedded ring-3 program, absence of SSE | 20 failure conditions, every link |
 | **Image validation** | the boot signature, stage 1 not overlapping its own partition table, the stage 2 header pointing at a real ELF, every partition inside the image, the FAT geometry, and every file in `/BIN` being an i386 ELF with `INIT` among them | every image, every build |
-| **In-kernel suites** | allocator, paging, address spaces, copy-on-write, heap coalescing, interrupts, scheduler, processes, hardening, ATA and partitions, FAT16 reads and writes, path resolution and descriptors, ACPI/APIC/locks/IPIs, the 32→64→32 transition, checksums and the wire, TCP's connection table, DNS name compression, sockets and loopback, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 1225 checks in 24 suites |
+| **In-kernel suites** | allocator, paging, address spaces, copy-on-write, heap coalescing, interrupts, scheduler, processes, hardening, ATA and partitions, FAT16 reads and writes, path resolution and descriptors, ACPI/APIC/locks/IPIs, the 32→64→32 transition, checksums and the wire, TCP's connection table, DNS name compression, sockets and loopback, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 1243 checks in 24 suites |
 | **Boot scenarios** | custom bootloader unattended, **the same image on four processors**, the same image on a CPU with SMEP and SMAP, **the same image on a CPU with no NX bit**, **the same image on a CPU with x86-64**, **the frames it puts on the wire, parsed from a pcap**, the same image with no Ethernet at all, DHCP and HTTP against a real server, GRUB/Multiboot2 unattended, 68 shell commands typed over serial, benchmarks + profile | 12 scenarios |
 | **Deliberate faults** | a write to the kernel's own `.text`, and a write below a task's stack — each must panic, naming the address, the reason and the region, and exit with the panic code | 2 scenarios |
 | **Fuzzing** | four libFuzzer targets over the **real** `elf.c`/`fat16.c`/`heap.c`/`acpi.c` under AddressSanitizer, plus 40,000 malformed system calls issued from ring 3 | 6 bugs found |
@@ -1456,21 +1456,19 @@ Being clear about scope is more useful than a longer feature list.
 - **No DMA and no disk interrupts.** The ATA driver is PIO and polled, which
   burns a timeslice per read on real hardware. The trade-off, and what it
   buys, is in [docs/STORAGE.md](docs/STORAGE.md#ata-by-programmed-io).
-- **The scheduler runs on one processor.** Every processor is brought up,
-  runs kernel code, holds real locks, services IPIs and — since the local
-  APIC timer landed — has its own 100 Hz tick and preempts itself. The run
-  queue is still the boot processor's, so the others idle. The subsystem
-  locks that gated this have landed — six of them, each at a level
-  `spin_lock()` checks on every acquisition, which caught two real order
-  inversions on its first day — so what remains is the scheduler's own lock
-  and the run queues themselves. The lock is last because it cannot wrap
-  `schedule()`: the context switch happens inside the critical section, so
-  the lock would be released by whichever task resumes. See
-  [docs/SMP.md](docs/SMP.md#the-hierarchy-and-why-it-is-checked-rather-than-documented).
+- **No scheduler affinity, and no priorities.** The scheduler runs on every
+  processor now, from one *shared* run queue — which is a choice rather than
+  a shortcut: a queue per processor needs a balancer, and at 32 task slots
+  and 8 processors the contention one would relieve is not reachable. What
+  follows from the shared queue is that a task goes to whichever processor
+  asks next and loses its cache when it moves, and that round robin with one
+  quantum is all there is: no way to say one task matters more than another.
+  See [docs/SMP.md](docs/SMP.md#scheduling-on-every-processor).
 - **The I/O APIC is parsed but not programmed.** Device interrupts still go
   through the 8259s to the boot processor, so there is no interrupt
-  distribution and no affinity. It is also what the per-CPU run queues need
-  first: one 8254 cannot drive four processors.
+  distribution and no affinity. Scheduling no longer needs it — each
+  processor preempts itself from its own local APIC timer — but spreading
+  device work does.
 - **No `argv` and no environment.** `exec` takes a program name and nothing
   else. Descriptors exist — `open`, `read`, `write`, `close`, `dup`, a VFS
   with three backends and sockets on top of the same table — but a program

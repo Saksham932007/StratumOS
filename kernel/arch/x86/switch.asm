@@ -49,10 +49,19 @@ context_switch:
 ; Stack on arrival:  [esp+0] unused return slot
 ;                    [esp+4] entry function
 ;                    [esp+8] argument
+;
+; sched_handoff() is cdecl and touches nothing but the caller-saved registers,
+; so the layout above still holds when it returns.
 ; -----------------------------------------------------------------------------
+; A new task arrives with IF clear (task_create pushes EFLAGS without it), so
+; that sched_handoff can release the task this processor just switched away
+; from before anything can interrupt and switch again. The task is made
+; preemptible immediately afterwards.
                 extern  task_exit
+                extern  sched_handoff
 global thread_trampoline
 thread_trampoline:
+                call    sched_handoff           ; release the outgoing task
                 sti                             ; new tasks run preemptible
                 mov     eax, [esp + 4]
                 push    dword [esp + 8]         ; argument
@@ -81,6 +90,12 @@ thread_trampoline:
                 extern  isr_restore_and_return
 global fork_trampoline
 fork_trampoline:
+                ; Same obligation as thread_trampoline: the processor's
+                ; outgoing task has to be released before anything else
+                ; happens. Arrives with IF clear; the iret below takes its
+                ; flags from the copied trap frame, which has IF set because
+                ; the parent was running in user space with interrupts on.
+                call    sched_handoff
                 pop     eax                     ; -> struct regs
                 mov     esp, eax
                 jmp     isr_restore_and_return

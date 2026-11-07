@@ -64,6 +64,10 @@ struct task {
      * connection, and neither is something to do from another task's stack. */
     struct task_files files;
     struct task *next;
+    /* The processor this task last ran on. Reported rather than used: there
+     * is no affinity policy, and saying so is more useful than implying one
+     * by leaving the number out. */
+    u32 cpu;
 };
 
 void sched_init(void);
@@ -78,8 +82,24 @@ void task_unblock(struct task *t);
 void sched_tick(void);
 /* Called at the tail of the interrupt path: perform a pending switch. */
 void sched_preempt(void);
-/* Hand the CPU over for the first time; never returns. */
+/* Hand the CPU over for the first time; never returns. This is the body of
+ * an idle task, and every processor runs its own copy of it. */
 NORETURN void sched_start(void);
+
+/* True once sched_init() has built an idle task for every online processor.
+ * An application processor waits on this before it joins the scheduler;
+ * before it is true there is nothing to join. */
+bool sched_ready_for_aps(void);
+
+/* Release the task this processor switched away from.
+ *
+ * Called on the *incoming* task's stack, immediately after the switch, and
+ * from the two assembly trampolines that a brand-new task and a forked child
+ * arrive through. It is the second half of every context switch, and the
+ * reason the first half can let go of the scheduler's lock before swapping
+ * stacks: until this runs, the outgoing task is still marked RUNNING and no
+ * other processor will try to run it. */
+void sched_handoff(void);
 
 struct task *task_current(void);
 u32 sched_switch_count(void);
