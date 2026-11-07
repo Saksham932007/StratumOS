@@ -287,6 +287,121 @@ It also counts acquisitions and contentions. A lock that is never contended
 could be something cheaper; one that always is wants splitting. Neither is
 visible without counting.
 
+### The hierarchy, and why it is checked rather than documented
+
+Two locks are enough to deadlock. One processor takes the heap's and wants
+the VMM's; another takes the VMM's and wants the heap's; neither ever
+finishes. Nothing about either acquisition is wrong on its own, which is what
+makes the bug hard: it is a property of the pair, and it only shows up when
+both happen at once, which under emulation may be never and on real hardware
+may be Tuesday.
+
+The standard answer is to fix a global order and acquire only upwards in it.
+This kernel does that, and then checks it, because a documented order that
+nothing enforces is a comment:
+
+| Level | Lock | Protects |
+|---|---|---|
+| 1 | `sched` | the run queues, the task table |
+| 2 | `fs` | descriptor tables, the VFS, FAT, the ATA driver |
+| 3 | `net` | interfaces, sockets, the TCP and ARP tables |
+| 4 | `heap` | the free list and the block headers |
+| 5 | `vmm` | the page tables, the temp slots, the MMIO window |
+| 6 | `pmm` | the frame bitmap and the refcounts |
+| 7 | `console` | the VGA buffer and the UART |
+
+The order is not arbitrary — it is the order the subsystems already call each
+other in. The filesystem allocates buffers, so `fs` is above `heap`. The heap
+grows by mapping pages, so `heap` is above `vmm`. Mapping a page takes a
+frame, so `vmm` is above `pmm`. And anything at all may print, which is why
+the console is last: taking the console lock has to be legal from under every
+other lock, and nothing the console calls takes a lock of its own.
+
+Each `spinlock_t` carries its level, each processor records the highest level
+it currently holds, and `spin_lock()` panics if the new level is not strictly
+above it:
+
+```
+cpu 2 tried to acquire lock 'heap' at level 4 while already holding level 5;
+that inverts the lock hierarchy and would deadlock against a processor doing
+it the other way round
+```
+
+That panic fires on the *first* processor to do it, alone, in a test run that
+would otherwise pass — rather than as a hang on a customer's machine when a
+second processor finally does the mirror image. Locks declared with
+`SPINLOCK_INIT` instead of `SPINLOCK_INIT_AT` have level 0 and are exempt,
+which is right for a lock that nests under nothing, like the TLB shootdown's.
+
+The panic releases the lock before printing, because printing takes the
+console lock.
+
+### What the wrappers are for
+
+Putting a subsystem behind one lock means every public entry point has to take
+it, and the entry points call each other. `kzalloc()` is `kmalloc()` plus a
+`memset`; `pmm_free_frames()` is a loop over `pmm_free_frame()`. If those
+inner calls go through the public function they take the lock a second time,
+and this lock answers that with a panic.
+
+So each subsystem's bodies are `static` and named `_locked`, the public names
+are thin wrappers that take the lock and call them, and the bodies call each
+other's `_locked` form directly. It is more lines than a recursive lock would
+be, and it is the right trade: a recursive lock would make all of this
+compile and hide exactly the nesting the hierarchy check exists to find.
+
+Two callers are deliberately not wrappers:
+
+- **The page-fault handler** takes the VMM lock itself, around the
+  copy-on-write break only, and releases it before the path that can reach
+  `task_exit()`. Killing a task takes the scheduler's lock, which is *below*
+  the VMM's — holding both in that order is what the check forbids, and
+  `task_exit()` never returns, so the lock would also never be released.
+- **The console** takes its lock only if this processor does not already hold
+  it. A panic prints, and the panicking processor is quite likely to be
+  holding the console lock already; spinning on itself there would replace a
+  readable panic with a silent hang. `spin_held_by_self()` exists for this one
+  caller and should not acquire a second.
+
+`kprintf()` brackets its whole format with one acquisition rather than letting
+the per-character sink take it 80 times, because per-character atomicity lets
+two processors interleave a line character by character, which is worse than
+useless.
+
+### What locking did to the profiler
+
+Every acquisition masks interrupts and every release restores them. A timer
+tick that arrives while a lock is held is not delivered where it happened: it
+waits for the `sti` in the release path, and the processor takes it with EIP
+pointing at that instruction.
+
+Once the heap, the page tables and the frame allocator each took a lock, the
+sampling profiler reported this:
+
+```
+  SAMPLES   SHARE  FUNCTION
+       53   75.7%  spin_unlock
+       16   22.8%  emit_number
+        1    1.4%  kfree
+```
+
+Three quarters of the kernel's time in `spin_unlock`, which is a dozen
+instructions. The measurement was wrong, not the kernel: every deferred tick
+in the system was landing on the same instruction. The profiler now follows
+the frame-pointer chain up out of the interrupt window — `spin_lock`,
+`spin_unlock`, `irq_save`, `irq_restore` — and charges the sample to the
+caller, which gives the honest answer:
+
+```
+  SAMPLES   SHARE  FUNCTION
+       28   40.0%  autobench_task
+       22   31.4%  kmalloc
+       20   28.5%  emit_number
+```
+
+Samples whose chain cannot be followed are counted as `deferred` and reported
+separately, rather than attributed to a guess.
+
 ---
 
 ## TLB shootdown
@@ -526,17 +641,13 @@ zero and stay zero.
 
 - **Per-CPU run queues.** Every processor now has its own timer and preempts
   itself — see below — but the run queue is still the boot processor's, so
-  the others service interrupts and idle. This is the large remaining piece,
-  and the scheduler is the smaller half of it: a run queue per processor,
-  `current` becoming per-CPU and a reschedule IPI are bounded work. What
-  gates it is that **no subsystem in this kernel is lock-protected**. The
-  heap, the VMM, the frame allocator, the VFS, FAT, the network stack and the
-  console all assume a single thread of kernel execution and exclude only
-  interrupts, by masking them. Two processors running tasks concurrently
-  would corrupt the heap non-deterministically on the first `kmalloc`. So the
-  order of work is a lock per subsystem with a documented hierarchy first,
-  and the scheduler change second — not the other way round, however much
-  the scheduler looks like the feature.
+  the others service interrupts and idle. The gate on this was that no
+  subsystem was lock-protected: two processors running tasks concurrently
+  would have corrupted the heap non-deterministically on the first
+  `kmalloc`. The memory stack, the console and the checked hierarchy above
+  are now in place, which leaves the scheduler change itself — a run queue
+  per processor, `current` and the idle task becoming per-CPU state in
+  `struct cpu`, a reschedule IPI, and task-to-processor ownership.
 - **The I/O APIC.** The MADT is parsed and its I/O APIC entries and interrupt
   source overrides are read — including that IRQ 0 arrives as GSI 2 on QEMU,
   which a kernel that assumed otherwise would lose its timer to. Nothing is
@@ -544,8 +655,5 @@ zero and stay zero.
   processor, so there is no interrupt distribution and no affinity.
 - **x2APIC.** The id is read as 8 bits, which caps this at 255 processors —
   academic next to the `SMP_MAX_CPUS` of 8.
-- **Lock ordering.** There is no lock hierarchy and nothing checks for one, so
-  a future deadlock between two locks taken in opposite orders would be caught
-  by the spin bound rather than prevented.
 - **Processor hot-plug.** Processors ACPI marks online-capable-but-disabled are
   reported and left alone.

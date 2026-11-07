@@ -331,7 +331,15 @@ static int format(struct sink *s, const char *fmt, va_list ap)
 int kvprintf(const char *fmt, va_list ap)
 {
     struct sink s = {NULL, 0, 0};
-    return format(&s, fmt, ap);
+
+    /* The whole format under one acquisition of the console. The sink writes
+     * a character at a time, so without this two processors printing at once
+     * would produce one interleaved line rather than two. */
+    bool owned = console_begin();
+    int n = format(&s, fmt, ap);
+
+    console_end(owned);
+    return n;
 }
 
 int kprintf(const char *fmt, ...)

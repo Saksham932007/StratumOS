@@ -24,6 +24,7 @@
 #include <kernel/irqflags.h>
 #include <kernel/log.h>
 #include <kernel/panic.h>
+#include <kernel/spinlock.h>
 #include <kernel/string.h>
 
 #include <mm/heap.h>
@@ -157,7 +158,7 @@ static bool heap_grow(u32 bytes)
     return true;
 }
 
-void heap_init(void)
+static void heap_init_locked(void)
 {
     ASSERT(vmm_is_enabled());
     ASSERT(!heap_ready);
@@ -253,7 +254,7 @@ static void *alloc_from_list(u32 size)
  * stacks, drivers allocate buffers), so every entry point runs with interrupts
  * masked. On a uniprocessor that is the whole of the required mutual
  * exclusion; the critical sections are short and bounded. */
-void *kmalloc(size_t size)
+static void *kmalloc_locked(size_t size)
 {
     void *p;
 
@@ -292,16 +293,16 @@ void *kmalloc(size_t size)
     return p;
 }
 
-void *kzalloc(size_t size)
+static void *kzalloc_locked(size_t size)
 {
-    void *p = kmalloc(size);
+    void *p = kmalloc_locked(size);
 
     if (p)
         memset(p, 0, size);
     return p;
 }
 
-void *kcalloc(size_t n, size_t size)
+static void *kcalloc_locked(size_t n, size_t size)
 {
     /* Reject an overflowing product rather than allocating a tiny buffer the
      * caller believes is huge - a classic path to a heap overflow. */
@@ -309,13 +310,13 @@ void *kcalloc(size_t n, size_t size)
         pr_err("kcalloc(%u, %u) would overflow", (unsigned)n, (unsigned)size);
         return NULL;
     }
-    return kzalloc(n * size);
+    return kzalloc_locked(n * size);
 }
 
-void *kmalloc_aligned(size_t size, size_t align)
+static void *kmalloc_aligned_locked(size_t size, size_t align)
 {
     if (align <= HEAP_ALIGN)
-        return kmalloc(size);
+        return kmalloc_locked(size);
 
     if ((align & (align - 1)) != 0)
         panic("kmalloc_aligned: alignment %u is not a power of two",
@@ -410,7 +411,7 @@ static void coalesce_forward(struct block *b)
     write_guards(b);
 }
 
-void kfree(void *ptr)
+static void kfree_locked(void *ptr)
 {
     if (!ptr)
         return; /* free(NULL) is a no-op, as it should be */
@@ -441,13 +442,13 @@ void kfree(void *ptr)
     irq_restore(irqs);
 }
 
-void *krealloc(void *ptr, size_t size)
+static void *krealloc_locked(void *ptr, size_t size)
 {
     if (!ptr)
-        return kmalloc(size);
+        return kmalloc_locked(size);
 
     if (size == 0) {
-        kfree(ptr);
+        kfree_locked(ptr);
         return NULL;
     }
 
@@ -463,16 +464,16 @@ void *krealloc(void *ptr, size_t size)
         return ptr;
     }
 
-    void *fresh = kmalloc(size);
+    void *fresh = kmalloc_locked(size);
     if (!fresh)
         return NULL; /* the original is left intact, as realloc requires */
 
     memcpy(fresh, ptr, b->size);
-    kfree(ptr);
+    kfree_locked(ptr);
     return fresh;
 }
 
-void heap_get_stats(struct heap_stats *out)
+static void heap_get_stats_locked(struct heap_stats *out)
 {
     if (!out)
         return;
@@ -498,7 +499,7 @@ void heap_get_stats(struct heap_stats *out)
     irq_restore(irqs);
 }
 
-unsigned heap_check(void)
+static unsigned heap_check_locked(void)
 {
     unsigned problems = 0;
     struct block *prev = NULL;
@@ -544,5 +545,95 @@ unsigned heap_check(void)
         }
     }
 
+    return problems;
+}
+
+/* The lock that makes the free list, the block headers and the heap counters
+ * safe for more than one processor.
+ *
+ * It sits *above* the VMM's lock in the hierarchy, because heap_grow() maps
+ * fresh pages: taking the heap lock and then the VMM's is the one legal
+ * order. Nothing in the VMM or the PMM calls back into the heap, which is
+ * what makes that order safe to fix.
+ *
+ * As in the PMM, each public entry point is a wrapper and the bodies call
+ * each other's `_locked` form directly. kzalloc through krealloc are
+ * deliberately *not* compositions of the public functions any more: going
+ * back out through a wrapper would take the lock a second time, which this
+ * lock answers with a panic rather than a deadlock. */
+static spinlock_t heap_lock = SPINLOCK_INIT_AT("heap", LOCK_LEVEL_HEAP);
+
+void heap_init(void)
+{
+    spin_lock(&heap_lock);
+    heap_init_locked();
+    spin_unlock(&heap_lock);
+}
+
+void *kmalloc(size_t size)
+{
+    spin_lock(&heap_lock);
+    void *p = kmalloc_locked(size);
+
+    spin_unlock(&heap_lock);
+    return p;
+}
+
+void *kzalloc(size_t size)
+{
+    spin_lock(&heap_lock);
+    void *p = kzalloc_locked(size);
+
+    spin_unlock(&heap_lock);
+    return p;
+}
+
+void *kcalloc(size_t n, size_t size)
+{
+    spin_lock(&heap_lock);
+    void *p = kcalloc_locked(n, size);
+
+    spin_unlock(&heap_lock);
+    return p;
+}
+
+void *kmalloc_aligned(size_t size, size_t align)
+{
+    spin_lock(&heap_lock);
+    void *p = kmalloc_aligned_locked(size, align);
+
+    spin_unlock(&heap_lock);
+    return p;
+}
+
+void kfree(void *ptr)
+{
+    spin_lock(&heap_lock);
+    kfree_locked(ptr);
+    spin_unlock(&heap_lock);
+}
+
+void *krealloc(void *ptr, size_t size)
+{
+    spin_lock(&heap_lock);
+    void *p = krealloc_locked(ptr, size);
+
+    spin_unlock(&heap_lock);
+    return p;
+}
+
+void heap_get_stats(struct heap_stats *out)
+{
+    spin_lock(&heap_lock);
+    heap_get_stats_locked(out);
+    spin_unlock(&heap_lock);
+}
+
+unsigned heap_check(void)
+{
+    spin_lock(&heap_lock);
+    unsigned problems = heap_check_locked();
+
+    spin_unlock(&heap_lock);
     return problems;
 }

@@ -22,6 +22,7 @@
 #include <kernel/kernel.h>
 #include <kernel/log.h>
 #include <kernel/panic.h>
+#include <kernel/spinlock.h>
 #include <kernel/string.h>
 
 #include <mm/pmm.h>
@@ -72,7 +73,7 @@ static void mark_range_free(paddr_t start, paddr_t end)
     }
 }
 
-void pmm_reserve_range(paddr_t start, paddr_t end)
+static void pmm_reserve_range_locked(paddr_t start, paddr_t end)
 {
     /* Round outward: a partially covered frame must be treated as reserved,
      * because handing out the rest of it would hand out part of something
@@ -89,7 +90,7 @@ void pmm_reserve_range(paddr_t start, paddr_t end)
     }
 }
 
-void pmm_init(const struct boot_params *bp)
+static void pmm_init_locked(const struct boot_params *bp)
 {
     u32 bitmap_bytes;
     paddr_t bitmap_phys;
@@ -151,18 +152,20 @@ void pmm_init(const struct boot_params *bp)
      * holds the interrupt vector table, the BIOS data area, the EBDA, the
      * VGA framebuffer and our own stage-2 structures. The ~600 KiB it costs
      * is not worth the class of bug it prevents. */
-    pmm_reserve_range(0, 1 * MIB);
+    pmm_reserve_range_locked(0, 1 * MIB);
 
     /* The kernel image, by physical address. */
-    pmm_reserve_range((paddr_t)__kernel_phys_start, (paddr_t)__kernel_phys_end);
+    pmm_reserve_range_locked((paddr_t)__kernel_phys_start,
+                             (paddr_t)__kernel_phys_end);
 
     /* The bitmap and the reference counts - allocating over either would be
      * memorable. */
-    pmm_reserve_range(bitmap_phys, bitmap_phys + bitmap_bytes + total_frames);
+    pmm_reserve_range_locked(bitmap_phys,
+                             bitmap_phys + bitmap_bytes + total_frames);
 
     /* Whatever the bootloader asked us to leave alone (its info block). */
     if (bp->reserved_hi > bp->reserved_lo)
-        pmm_reserve_range(bp->reserved_lo, bp->reserved_hi);
+        pmm_reserve_range_locked(bp->reserved_lo, bp->reserved_hi);
 
     search_hint = PFN(1 * MIB);
     alloc_calls = free_calls = 0;
@@ -180,7 +183,7 @@ void pmm_init(const struct boot_params *bp)
             (bitmap_bytes + total_frames) / KIB, (void *)bitmap_phys);
 }
 
-paddr_t pmm_alloc_frame(void)
+static paddr_t pmm_alloc_frame_locked(void)
 {
     alloc_calls++;
 
@@ -221,7 +224,7 @@ paddr_t pmm_alloc_frame(void)
     return PMM_NO_FRAME;
 }
 
-paddr_t pmm_alloc_frame_above(paddr_t floor)
+static paddr_t pmm_alloc_frame_above_locked(paddr_t floor)
 {
     /* A frame from above a given physical address.
      *
@@ -267,12 +270,12 @@ paddr_t pmm_alloc_frame_above(paddr_t floor)
     return PMM_NO_FRAME;
 }
 
-paddr_t pmm_alloc_frames(size_t count)
+static paddr_t pmm_alloc_frames_locked(size_t count)
 {
     if (count == 0)
         return PMM_NO_FRAME;
     if (count == 1)
-        return pmm_alloc_frame();
+        return pmm_alloc_frame_locked();
 
     /* Linear search for a run of `count` clear bits. Contiguous allocation is
      * rare (it exists for DMA-style buffers), so a simple scan is the right
@@ -303,7 +306,7 @@ paddr_t pmm_alloc_frames(size_t count)
     return PMM_NO_FRAME;
 }
 
-void pmm_free_frame(paddr_t frame)
+static void pmm_free_frame_locked(paddr_t frame)
 {
     u32 pfn = PFN(frame);
 
@@ -342,7 +345,7 @@ void pmm_free_frame(paddr_t frame)
         search_hint = pfn;
 }
 
-void pmm_frame_ref(paddr_t frame)
+static void pmm_frame_ref_locked(paddr_t frame)
 {
     u32 pfn = PFN(frame);
 
@@ -359,7 +362,7 @@ void pmm_frame_ref(paddr_t frame)
         refcounts[pfn]++;
 }
 
-u8 pmm_frame_refs(paddr_t frame)
+static u8 pmm_frame_refs_locked(paddr_t frame)
 {
     u32 pfn = PFN(frame);
 
@@ -368,13 +371,13 @@ u8 pmm_frame_refs(paddr_t frame)
     return refcounts[pfn];
 }
 
-void pmm_free_frames(paddr_t frame, size_t count)
+static void pmm_free_frames_locked(paddr_t frame, size_t count)
 {
     for (size_t i = 0; i < count; i++)
-        pmm_free_frame(frame + i * PAGE_SIZE);
+        pmm_free_frame_locked(frame + i * PAGE_SIZE);
 }
 
-void pmm_get_stats(struct pmm_stats *out)
+static void pmm_get_stats_locked(struct pmm_stats *out)
 {
     if (!out)
         return;
@@ -391,4 +394,96 @@ void pmm_get_stats(struct pmm_stats *out)
     for (u32 pfn = 0; pfn < total_frames; pfn++)
         if (refcounts[pfn] > 1)
             out->shared_frames++;
+}
+
+/* The lock that makes the bitmap, the refcounts and the counters above safe
+ * for more than one processor.
+ *
+ * It is the innermost lock in the kernel's hierarchy save the console's: the
+ * heap grows through the VMM, which takes frames from here, and nothing here
+ * calls back out except to print. See kernel/spinlock.h.
+ *
+ * Every public entry point below is a wrapper that takes the lock and calls
+ * the `_locked` body. The bodies call each other directly, never through the
+ * wrappers, because this lock is not recursive - and should not be: a
+ * recursive lock would hide exactly the nesting the hierarchy check exists to
+ * find. */
+static spinlock_t pmm_lock = SPINLOCK_INIT_AT("pmm", LOCK_LEVEL_PMM);
+
+void pmm_reserve_range(paddr_t start, paddr_t end)
+{
+    spin_lock(&pmm_lock);
+    pmm_reserve_range_locked(start, end);
+    spin_unlock(&pmm_lock);
+}
+
+void pmm_init(const struct boot_params *bp)
+{
+    spin_lock(&pmm_lock);
+    pmm_init_locked(bp);
+    spin_unlock(&pmm_lock);
+}
+
+paddr_t pmm_alloc_frame(void)
+{
+    spin_lock(&pmm_lock);
+    paddr_t frame = pmm_alloc_frame_locked();
+
+    spin_unlock(&pmm_lock);
+    return frame;
+}
+
+paddr_t pmm_alloc_frame_above(paddr_t floor)
+{
+    spin_lock(&pmm_lock);
+    paddr_t frame = pmm_alloc_frame_above_locked(floor);
+
+    spin_unlock(&pmm_lock);
+    return frame;
+}
+
+paddr_t pmm_alloc_frames(size_t count)
+{
+    spin_lock(&pmm_lock);
+    paddr_t frame = pmm_alloc_frames_locked(count);
+
+    spin_unlock(&pmm_lock);
+    return frame;
+}
+
+void pmm_free_frame(paddr_t frame)
+{
+    spin_lock(&pmm_lock);
+    pmm_free_frame_locked(frame);
+    spin_unlock(&pmm_lock);
+}
+
+void pmm_free_frames(paddr_t frame, size_t count)
+{
+    spin_lock(&pmm_lock);
+    pmm_free_frames_locked(frame, count);
+    spin_unlock(&pmm_lock);
+}
+
+void pmm_frame_ref(paddr_t frame)
+{
+    spin_lock(&pmm_lock);
+    pmm_frame_ref_locked(frame);
+    spin_unlock(&pmm_lock);
+}
+
+u8 pmm_frame_refs(paddr_t frame)
+{
+    spin_lock(&pmm_lock);
+    u8 refs = pmm_frame_refs_locked(frame);
+
+    spin_unlock(&pmm_lock);
+    return refs;
+}
+
+void pmm_get_stats(struct pmm_stats *out)
+{
+    spin_lock(&pmm_lock);
+    pmm_get_stats_locked(out);
+    spin_unlock(&pmm_lock);
 }

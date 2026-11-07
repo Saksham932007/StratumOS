@@ -40,6 +40,7 @@ struct profile_stats {
     u32 unknown;      /* in .text but no symbol, or outside  */
     u32 user_samples; /* taken while the CPU was in ring 3   */
     u32 idle_samples; /* taken in the idle task              */
+    u32 deferred;     /* held pending by a lock, chain lost  */
 };
 void profile_get_stats(struct profile_stats *out);
 

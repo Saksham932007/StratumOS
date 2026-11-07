@@ -1239,21 +1239,31 @@ BENCH_EXPECTED = [
     ("profile produced", r"Sampling profile"),
     ("profile attributed samples", r"kernel samples: [1-9]\d* attributed"),
     # The workload is allocator traffic plus integer formatting, so a
-    # profiler that discriminates has to find exactly those three functions.
-    # This asserts the profiler is useful, not merely that it runs.
-    ("profile found kmalloc", r"\d+\s+\d+\.\d%\s+kmalloc"),
-    ("profile found kfree", r"\d+\s+\d+\.\d%\s+kfree"),
+    # profiler that discriminates has to find the heap path and the digit
+    # loop. This asserts the profiler is useful, not merely that it runs.
+    #
+    # The heap entry is named loosely because the allocator's public
+    # functions are now lock wrappers: a tick that arrives while the heap
+    # lock is held is delivered at the `sti` in spin_unlock and charged back
+    # to the caller, so the time shows up under kmalloc or kfree rather than
+    # under kmalloc_locked. Which of the two leads depends on the sample
+    # that landed, so either satisfies this.
+    ("profile found the heap path", r"\d+\s+\d+\.\d%\s+k(malloc|free)"),
     ("profile separated the formatter's digit loop",
      r"\d+\s+\d+\.\d%\s+emit_number"),
-    # The leader is whichever of the three the scheduler happened to sample
-    # most, and it moves between runs - 29/23/18 one time, 32/24/14 the next.
-    # So the positional check is that the top entry is one of the three
-    # rather than some unrelated function: that is the part that would break
-    # if attribution regressed, and naming a specific winner would be
-    # asserting host scheduling noise.
+    # The spinlock release path must NOT be on top. Before the profiler
+    # followed the frame pointer out of the interrupt window it was, with
+    # 75% of samples, which said nothing about where the time went.
+    ("the lock release path is not blamed",
+     r"SHARE\s+FUNCTION\s*\n\s*\d+\s+\d+\.\d%\s+"
+     r"(?!spin_unlock|spin_lock|irq_restore)"),
+    # The leader moves between runs - 29/23/18 one time, 32/24/14 the next -
+    # so the positional check is that the top entry is one of the functions
+    # the workload actually runs rather than some unrelated one. Naming a
+    # specific winner would be asserting host scheduling noise.
     ("nothing unrelated is on top",
      r"SHARE\s+FUNCTION\s*\n\s*\d+\s+\d+\.\d%\s+"
-     r"(kmalloc|kfree|emit_number)\b"),
+     r"(kmalloc|kfree|emit_number|autobench_task)\b"),
     ("autobench finished", r"stratum: autobench complete"),
 ]
 

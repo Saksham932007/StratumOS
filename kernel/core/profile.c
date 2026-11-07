@@ -70,6 +70,43 @@ void profile_reset(void)
     irq_restore(irqs);
 }
 
+/* The instructions that re-enable interrupts, and why a sample must not be
+ * charged to them.
+ *
+ * Every spinlock acquisition masks interrupts and every release restores
+ * them. A timer tick that arrives while a lock is held is therefore not
+ * delivered where it happened: it is held pending until the `sti` inside the
+ * release path, and the processor then takes it with EIP pointing at that
+ * instruction. Once the hot paths of the kernel - the heap, the page tables,
+ * the frame allocator - each take a lock, *every* deferred tick lands in the
+ * same two or three functions, and the profile reports the lock release as
+ * the hottest code in the kernel while saying nothing at all about the work
+ * that actually ran with the lock held.
+ *
+ * The fix is to charge such a sample to the caller instead, by following the
+ * frame-pointer chain up until the address names something that is not part
+ * of the interrupt window. The result is slightly conservative - the caller
+ * gets credit for the release it was about to finish - and vastly more
+ * honest than the alternative. Samples whose chain cannot be followed are
+ * counted separately rather than attributed to a guess. */
+static bool in_interrupt_window(u32 eip)
+{
+    u32 offset;
+    const char *name = ksym_lookup(eip, &offset);
+
+    if (!name)
+        return false;
+
+    return !strcmp(name, "spin_unlock") || !strcmp(name, "spin_lock") ||
+           !strcmp(name, "spin_trylock") || !strcmp(name, "irq_restore") ||
+           !strcmp(name, "irq_save");
+}
+
+/* How many frames to follow before giving up. A lock release nests at most a
+ * frame or two deep inside a wrapper, so a small bound is enough and keeps a
+ * corrupt chain from costing a whole tick. */
+#define WINDOW_HOPS 4
+
 void profile_tick(const struct regs *r)
 {
     if (!active || !buckets)
@@ -91,7 +128,31 @@ void profile_tick(const struct regs *r)
         return;
     }
 
-    int idx = ksym_index(r->eip);
+    u32 eip = r->eip;
+    u32 ebp = r->ebp;
+
+    for (unsigned hop = 0; hop < WINDOW_HOPS && in_interrupt_window(eip);
+         hop++) {
+        /* The same plausibility test the backtrace uses: stop rather than
+         * follow a bad pointer into a fault from inside the timer tick. */
+        if (ebp == 0 || (ebp & 3) != 0 || ebp < 0x1000)
+            break;
+
+        const u32 *frame = (const u32 *)ebp;
+        u32 next = frame[0];
+
+        eip = frame[1];
+        if (next <= ebp)
+            break; /* must move up the stack */
+        ebp = next;
+    }
+
+    if (in_interrupt_window(eip)) {
+        stats.deferred++;
+        return;
+    }
+
+    int idx = ksym_index(eip);
     if (idx < 0) {
         stats.unknown++;
         return;
@@ -129,6 +190,11 @@ void profile_report(u32 top)
             stats.unknown);
     kprintf("  ring 3        : %u\n", stats.user_samples);
     kprintf("  idle          : %u\n", stats.idle_samples);
+    if (stats.deferred)
+        kprintf(
+            "  deferred      : %u (a tick a lock held pending, whose caller\n"
+            "                  could not be identified)\n",
+            stats.deferred);
 
     if (total == 0) {
         kprintf(

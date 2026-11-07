@@ -24,4 +24,11 @@ void console_putc(char c);
 void console_write(const char *s, size_t n);
 void console_puts(const char *s);
 
+/* Hold the console for the duration of a multi-call write, so that one
+ * processor's line cannot be interleaved with another's. console_begin()
+ * returns whether it acquired - it does not if this processor already holds
+ * the console - and that value is what console_end() takes back. */
+bool console_begin(void);
+void console_end(bool owned);
+
 #endif /* _KERNEL_CONSOLE_H */

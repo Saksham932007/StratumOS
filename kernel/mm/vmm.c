@@ -41,6 +41,7 @@
 #include <kernel/log.h>
 #include <kernel/panic.h>
 #include <kernel/sched.h>
+#include <kernel/spinlock.h>
 #include <kernel/string.h>
 
 #include <mm/pmm.h>
@@ -86,6 +87,27 @@ static inline volatile pte_t *pt_entries(u32 pdpti, u32 pdi)
 {
     return (volatile pte_t *)(PT_WINDOW(pdpti) + ((u32)pdi << PAGE_SHIFT));
 }
+
+/* The lock that makes the page tables, the temporary mapping slots and the
+ * MMIO window safe for more than one processor.
+ *
+ * It sits between the heap's lock and the PMM's, which is the order the three
+ * are actually used in: the heap grows by mapping pages, and mapping a page
+ * takes a frame. Nothing here calls back up into the heap, which is what
+ * makes that order safe to fix. See kernel/spinlock.h.
+ *
+ * What it does *not* cover is CR3. vmm_switch_address_space() writes a
+ * per-processor register and reads no shared state, so it stays lock-free -
+ * as do the handful of accessors that return a value fixed at boot.
+ *
+ * The page-fault handler is the one caller that takes this lock itself,
+ * around the copy-on-write break only, and releases it before it can reach
+ * task_exit(): killing a task takes the scheduler's lock, which is *below*
+ * this one, and holding both in that order is exactly what the hierarchy
+ * check forbids. It is also the only lock in the kernel taken from an
+ * exception handler, which is why every acquisition of it masks interrupts.
+ */
+static spinlock_t vmm_lock = SPINLOCK_INIT_AT("vmm", LOCK_LEVEL_VMM);
 
 paddr_t vmm_kernel_root_phys(void)
 {
@@ -283,7 +305,7 @@ static bool ensure_table(u32 pdpti, u32 pdi, u32 flags)
     return true;
 }
 
-bool vmm_map(vaddr_t va, paddr_t pa, u32 flags)
+static bool vmm_map_locked(vaddr_t va, paddr_t pa, u32 flags)
 {
     u32 pdpti = PDPT_INDEX(va);
     u32 pdi = PDE_INDEX(va);
@@ -316,7 +338,7 @@ bool vmm_map(vaddr_t va, paddr_t pa, u32 flags)
     return true;
 }
 
-bool vmm_alloc_at(vaddr_t va, u32 flags)
+static bool vmm_alloc_at_locked(vaddr_t va, u32 flags)
 {
     paddr_t frame = pmm_alloc_frame();
 
@@ -327,7 +349,7 @@ bool vmm_alloc_at(vaddr_t va, u32 flags)
      * vmm_unmap() knows it is responsible for returning it. Without the
      * distinction, unmapping either leaks every frame or frees frames it does
      * not own - the VGA framebuffer being the memorable example. */
-    if (!vmm_map(va, frame, flags | PTE_OWNED)) {
+    if (!vmm_map_locked(va, frame, flags | PTE_OWNED)) {
         pmm_free_frame(frame);
         return false;
     }
@@ -335,7 +357,7 @@ bool vmm_alloc_at(vaddr_t va, u32 flags)
     return true;
 }
 
-bool vmm_protect(vaddr_t va, u32 flags)
+static bool vmm_protect_locked(vaddr_t va, u32 flags)
 {
     u32 pdpti = PDPT_INDEX(va);
     u32 pdi = PDE_INDEX(va);
@@ -364,17 +386,17 @@ bool vmm_protect(vaddr_t va, u32 flags)
     return true;
 }
 
-bool vmm_protect_range(vaddr_t va, size_t bytes, u32 flags)
+static bool vmm_protect_range_locked(vaddr_t va, size_t bytes, u32 flags)
 {
     size_t pages = PAGE_ALIGN(bytes) / PAGE_SIZE;
 
     for (size_t i = 0; i < pages; i++)
-        if (!vmm_protect(va + i * PAGE_SIZE, flags))
+        if (!vmm_protect_locked(va + i * PAGE_SIZE, flags))
             return false;
     return true;
 }
 
-void vmm_unmap(vaddr_t va)
+static void vmm_unmap_locked(vaddr_t va)
 {
     u32 pdpti = PDPT_INDEX(va);
     u32 pdi = PDE_INDEX(va);
@@ -399,38 +421,39 @@ void vmm_unmap(vaddr_t va)
     invlpg(va);
 }
 
-bool vmm_map_range(vaddr_t va, paddr_t pa, size_t bytes, u32 flags)
+static bool vmm_map_range_locked(vaddr_t va, paddr_t pa, size_t bytes,
+                                 u32 flags)
 {
     size_t pages = PAGE_ALIGN(bytes) / PAGE_SIZE;
 
     for (size_t i = 0; i < pages; i++) {
-        if (!vmm_map(va + i * PAGE_SIZE, pa + i * PAGE_SIZE, flags)) {
+        if (!vmm_map_locked(va + i * PAGE_SIZE, pa + i * PAGE_SIZE, flags)) {
             /* Roll back, so a partial failure does not leave a half-mapped
              * range behind for someone else to trip over. */
             for (size_t j = 0; j < i; j++)
-                vmm_unmap(va + j * PAGE_SIZE);
+                vmm_unmap_locked(va + j * PAGE_SIZE);
             return false;
         }
     }
     return true;
 }
 
-void vmm_unmap_range(vaddr_t va, size_t bytes)
+static void vmm_unmap_range_locked(vaddr_t va, size_t bytes)
 {
     size_t pages = PAGE_ALIGN(bytes) / PAGE_SIZE;
 
     for (size_t i = 0; i < pages; i++)
-        vmm_unmap(va + i * PAGE_SIZE);
+        vmm_unmap_locked(va + i * PAGE_SIZE);
 }
 
-pte_t vmm_pde_raw(u32 pdpti, u32 pdi)
+static pte_t vmm_pde_raw_locked(u32 pdpti, u32 pdi)
 {
     if (pdpti >= PDPT_ENTRIES || pdi >= PD_ENTRIES)
         return 0;
     return pd_entries(pdpti)[pdi];
 }
 
-bool vmm_inspect_entry(paddr_t table_phys, u32 index, pte_t *out)
+static bool vmm_inspect_entry_locked(paddr_t table_phys, u32 index, pte_t *out)
 {
     if (!table_phys || index >= PAGE_SIZE / sizeof(pte_t) || !out)
         return false;
@@ -446,7 +469,7 @@ bool vmm_inspect_entry(paddr_t table_phys, u32 index, pte_t *out)
     return true;
 }
 
-pte_t vmm_pte(vaddr_t va)
+static pte_t vmm_pte_locked(vaddr_t va)
 {
     u32 pdpti = PDPT_INDEX(va);
     u32 pdi = PDE_INDEX(va);
@@ -458,9 +481,9 @@ pte_t vmm_pte(vaddr_t va)
     return pt_entries(pdpti, pdi)[PTE_INDEX(va)];
 }
 
-bool vmm_translate(vaddr_t va, paddr_t *out)
+static bool vmm_translate_locked(vaddr_t va, paddr_t *out)
 {
-    pte_t entry = vmm_pte(va);
+    pte_t entry = vmm_pte_locked(va);
 
     if (!(entry & PTE_PRESENT))
         return false;
@@ -512,7 +535,7 @@ static void init_directory(void *dir, paddr_t dir_phys)
  * set here, and permissions are entirely a matter for the two levels below. */
 #define PDPTE(phys) ((pte_t)(phys) | PTE_PRESENT)
 
-paddr_t vmm_create_address_space(void)
+static paddr_t vmm_create_address_space_locked(void)
 {
     paddr_t pdpt = pmm_alloc_frame();
     paddr_t dirs[USER_PDPT_COUNT];
@@ -560,7 +583,7 @@ paddr_t vmm_create_address_space(void)
     return pdpt;
 }
 
-paddr_t vmm_create_bootstrap_pd(void)
+static paddr_t vmm_create_bootstrap_pd_locked(void)
 {
     paddr_t pdpt = pmm_alloc_frame();
     paddr_t dirs[USER_PDPT_COUNT];
@@ -640,7 +663,7 @@ out_of_memory:
     return 0;
 }
 
-void vmm_destroy_bootstrap_pd(paddr_t pdpt_phys)
+static void vmm_destroy_bootstrap_pd_locked(paddr_t pdpt_phys)
 {
     if (!pdpt_phys)
         return;
@@ -681,9 +704,11 @@ void vmm_destroy_bootstrap_pd(paddr_t pdpt_phys)
     pmm_free_frame(pdpt_phys);
 }
 
-paddr_t vmm_clone_current(void)
+static void vmm_destroy_address_space_locked(paddr_t pdpt_phys);
+
+static paddr_t vmm_clone_current_locked(void)
 {
-    paddr_t child_pdpt = vmm_create_address_space();
+    paddr_t child_pdpt = vmm_create_address_space_locked();
 
     if (!child_pdpt)
         return 0;
@@ -712,7 +737,7 @@ paddr_t vmm_clone_current(void)
             if (child_pt_frame == PMM_NO_FRAME) {
                 pr_err("out of memory cloning an address space");
                 irq_restore(irqs);
-                vmm_destroy_address_space(child_pdpt);
+                vmm_destroy_address_space_locked(child_pdpt);
                 return 0;
             }
 
@@ -759,7 +784,7 @@ paddr_t vmm_clone_current(void)
     return child_pdpt;
 }
 
-void vmm_destroy_address_space(paddr_t pdpt_phys)
+static void vmm_destroy_address_space_locked(paddr_t pdpt_phys)
 {
     if (!pdpt_phys)
         return;
@@ -821,7 +846,7 @@ void vmm_destroy_address_space(paddr_t pdpt_phys)
     pmm_free_frame(pdpt_phys);
 }
 
-void vmm_clear_user_space(void)
+static void vmm_clear_user_space_locked(void)
 {
     bool irqs = irq_save();
 
@@ -884,7 +909,7 @@ void vmm_clear_user_space(void)
  * because the linker aligns the following section to 4 KiB: the rounding can
  * only cover padding.
  */
-void vmm_protect_kernel_text(void)
+static void vmm_protect_kernel_text_locked(void)
 {
     vaddr_t text_start = PAGE_TRUNC((vaddr_t)__text_start);
     vaddr_t text_end = PAGE_ALIGN((vaddr_t)__text_end);
@@ -893,7 +918,7 @@ void vmm_protect_kernel_text(void)
     u32 ro = 0, nx = 0;
 
     for (vaddr_t va = text_start; va < text_end; va += PAGE_SIZE) {
-        if (!vmm_protect(va, PTE_PRESENT | PTE_EXEC)) {
+        if (!vmm_protect_locked(va, PTE_PRESENT | PTE_EXEC)) {
             pr_err("kernel .text is not mapped at %p", (void *)va);
             return;
         }
@@ -901,7 +926,7 @@ void vmm_protect_kernel_text(void)
     }
 
     for (vaddr_t va = rodata_start; va < rodata_end; va += PAGE_SIZE) {
-        if (!vmm_protect(va, PTE_PRESENT)) {
+        if (!vmm_protect_locked(va, PTE_PRESENT)) {
             pr_err("kernel .rodata is not mapped at %p", (void *)va);
             return;
         }
@@ -916,7 +941,7 @@ void vmm_protect_kernel_text(void)
          va += PAGE_SIZE) {
         if (va >= text_start && va < rodata_end)
             continue;
-        if (!vmm_protect(va, PTE_PRESENT | PTE_WRITE))
+        if (!vmm_protect_locked(va, PTE_PRESENT | PTE_WRITE))
             continue; /* a hole in the linear map is not this pass's problem */
         nx++;
     }
@@ -944,12 +969,12 @@ void vmm_protect_kernel_text(void)
  */
 static u32 mmio_next;
 
-u32 vmm_mmio_used(void)
+static u32 vmm_mmio_used_locked(void)
 {
     return mmio_next;
 }
 
-void *vmm_map_mmio(paddr_t phys, size_t bytes, bool uncached)
+static void *vmm_map_mmio_locked(paddr_t phys, size_t bytes, bool uncached)
 {
     if (bytes == 0)
         return NULL;
@@ -967,7 +992,7 @@ void *vmm_map_mmio(paddr_t phys, size_t bytes, bool uncached)
     vaddr_t va = VMM_MMIO_BASE + mmio_next;
     u32 flags = PTE_PRESENT | PTE_WRITE | (uncached ? PTE_PCD : 0);
 
-    if (!vmm_map_range(va, first, span, flags)) {
+    if (!vmm_map_range_locked(va, first, span, flags)) {
         pr_err("cannot map %u KiB of MMIO at phys %p", (unsigned)(span / KIB),
                (void *)first);
         return NULL;
@@ -987,7 +1012,7 @@ void vmm_switch_address_space(paddr_t pdpt_phys)
         write_cr3(pdpt_phys);
 }
 
-u32 vmm_count_user_pages(void)
+static u32 vmm_count_user_pages_locked(void)
 {
     u32 count = 0;
     bool irqs = irq_save();
@@ -1072,7 +1097,7 @@ static bool cow_fault(struct regs *r, u32 addr)
     if (is_kernel_address(addr))
         return false; /* the kernel's own pages are never COW */
 
-    pte_t pte = vmm_pte(addr);
+    pte_t pte = vmm_pte_locked(addr);
 
     if (!(pte & PTE_PRESENT) || !(pte & PTE_COW))
         return false;
@@ -1132,8 +1157,16 @@ static void page_fault_handler(struct regs *r)
 
     stat_page_faults++;
 
-    /* A copy-on-write break is the one fault that is expected. */
-    if (cow_fault(r, addr))
+    /* A copy-on-write break is the one fault that is expected.
+     *
+     * The lock is taken here, around the break alone, and released before
+     * anything below can reach task_exit(). See the comment on vmm_lock. */
+    spin_lock(&vmm_lock);
+    bool handled = cow_fault(r, addr);
+
+    spin_unlock(&vmm_lock);
+
+    if (handled)
         return;
 
     const char *where = fault_region(addr);
@@ -1186,7 +1219,7 @@ static void page_fault_handler(struct regs *r)
     panic_with_regs(r, "page fault at %p in %s", (void *)addr, where);
 }
 
-void vmm_init(void)
+static void vmm_init_locked(void)
 {
     ASSERT(!initialised);
 
@@ -1255,9 +1288,9 @@ void vmm_init(void)
      * tables. Everything the kernel addresses physically must be inside this
      * window. No PTE_EXEC: the kernel's code is in the first 4 MiB, which
      * _start already mapped, and nothing above it is ever executed. */
-    if (!vmm_map_range(KERNEL_VIRT_BASE + VMM_BOOT_MAPPED, VMM_BOOT_MAPPED,
-                       VMM_LINEAR_SIZE - VMM_BOOT_MAPPED,
-                       PTE_PRESENT | PTE_WRITE))
+    if (!vmm_map_range_locked(
+            KERNEL_VIRT_BASE + VMM_BOOT_MAPPED, VMM_BOOT_MAPPED,
+            VMM_LINEAR_SIZE - VMM_BOOT_MAPPED, PTE_PRESENT | PTE_WRITE))
         panic("cannot extend the kernel's linear map to %u MiB",
               (unsigned)(VMM_LINEAR_SIZE / MIB));
 
@@ -1298,7 +1331,7 @@ bool vmm_is_enabled(void)
     return initialised;
 }
 
-void vmm_get_stats(struct vmm_stats *out)
+static void vmm_get_stats_locked(struct vmm_stats *out)
 {
     if (!out)
         return;
@@ -1310,4 +1343,199 @@ void vmm_get_stats(struct vmm_stats *out)
     out->cow_faults = stat_cow_faults;
     out->cow_copies = stat_cow_copies;
     out->address_spaces = stat_address_spaces;
+}
+
+/* The public entry points. Each takes the lock and calls the `_locked` body;
+ * the bodies call each other's `_locked` form directly, because this lock is
+ * not recursive. */
+
+bool vmm_map(vaddr_t va, paddr_t pa, u32 flags)
+{
+    spin_lock(&vmm_lock);
+    bool ok = vmm_map_locked(va, pa, flags);
+
+    spin_unlock(&vmm_lock);
+    return ok;
+}
+
+bool vmm_alloc_at(vaddr_t va, u32 flags)
+{
+    spin_lock(&vmm_lock);
+    bool ok = vmm_alloc_at_locked(va, flags);
+
+    spin_unlock(&vmm_lock);
+    return ok;
+}
+
+bool vmm_protect(vaddr_t va, u32 flags)
+{
+    spin_lock(&vmm_lock);
+    bool ok = vmm_protect_locked(va, flags);
+
+    spin_unlock(&vmm_lock);
+    return ok;
+}
+
+bool vmm_protect_range(vaddr_t va, size_t bytes, u32 flags)
+{
+    spin_lock(&vmm_lock);
+    bool ok = vmm_protect_range_locked(va, bytes, flags);
+
+    spin_unlock(&vmm_lock);
+    return ok;
+}
+
+void vmm_unmap(vaddr_t va)
+{
+    spin_lock(&vmm_lock);
+    vmm_unmap_locked(va);
+    spin_unlock(&vmm_lock);
+}
+
+bool vmm_map_range(vaddr_t va, paddr_t pa, size_t bytes, u32 flags)
+{
+    spin_lock(&vmm_lock);
+    bool ok = vmm_map_range_locked(va, pa, bytes, flags);
+
+    spin_unlock(&vmm_lock);
+    return ok;
+}
+
+void vmm_unmap_range(vaddr_t va, size_t bytes)
+{
+    spin_lock(&vmm_lock);
+    vmm_unmap_range_locked(va, bytes);
+    spin_unlock(&vmm_lock);
+}
+
+pte_t vmm_pde_raw(u32 pdpti, u32 pdi)
+{
+    spin_lock(&vmm_lock);
+    pte_t entry = vmm_pde_raw_locked(pdpti, pdi);
+
+    spin_unlock(&vmm_lock);
+    return entry;
+}
+
+bool vmm_inspect_entry(paddr_t table_phys, u32 index, pte_t *out)
+{
+    spin_lock(&vmm_lock);
+    bool ok = vmm_inspect_entry_locked(table_phys, index, out);
+
+    spin_unlock(&vmm_lock);
+    return ok;
+}
+
+pte_t vmm_pte(vaddr_t va)
+{
+    spin_lock(&vmm_lock);
+    pte_t entry = vmm_pte_locked(va);
+
+    spin_unlock(&vmm_lock);
+    return entry;
+}
+
+bool vmm_translate(vaddr_t va, paddr_t *out)
+{
+    spin_lock(&vmm_lock);
+    bool ok = vmm_translate_locked(va, out);
+
+    spin_unlock(&vmm_lock);
+    return ok;
+}
+
+paddr_t vmm_create_address_space(void)
+{
+    spin_lock(&vmm_lock);
+    paddr_t root = vmm_create_address_space_locked();
+
+    spin_unlock(&vmm_lock);
+    return root;
+}
+
+paddr_t vmm_create_bootstrap_pd(void)
+{
+    spin_lock(&vmm_lock);
+    paddr_t root = vmm_create_bootstrap_pd_locked();
+
+    spin_unlock(&vmm_lock);
+    return root;
+}
+
+void vmm_destroy_bootstrap_pd(paddr_t pdpt_phys)
+{
+    spin_lock(&vmm_lock);
+    vmm_destroy_bootstrap_pd_locked(pdpt_phys);
+    spin_unlock(&vmm_lock);
+}
+
+paddr_t vmm_clone_current(void)
+{
+    spin_lock(&vmm_lock);
+    paddr_t root = vmm_clone_current_locked();
+
+    spin_unlock(&vmm_lock);
+    return root;
+}
+
+void vmm_destroy_address_space(paddr_t pdpt_phys)
+{
+    spin_lock(&vmm_lock);
+    vmm_destroy_address_space_locked(pdpt_phys);
+    spin_unlock(&vmm_lock);
+}
+
+void vmm_clear_user_space(void)
+{
+    spin_lock(&vmm_lock);
+    vmm_clear_user_space_locked();
+    spin_unlock(&vmm_lock);
+}
+
+void vmm_protect_kernel_text(void)
+{
+    spin_lock(&vmm_lock);
+    vmm_protect_kernel_text_locked();
+    spin_unlock(&vmm_lock);
+}
+
+u32 vmm_mmio_used(void)
+{
+    spin_lock(&vmm_lock);
+    u32 used = vmm_mmio_used_locked();
+
+    spin_unlock(&vmm_lock);
+    return used;
+}
+
+void *vmm_map_mmio(paddr_t phys, size_t bytes, bool uncached)
+{
+    spin_lock(&vmm_lock);
+    void *p = vmm_map_mmio_locked(phys, bytes, uncached);
+
+    spin_unlock(&vmm_lock);
+    return p;
+}
+
+u32 vmm_count_user_pages(void)
+{
+    spin_lock(&vmm_lock);
+    u32 pages = vmm_count_user_pages_locked();
+
+    spin_unlock(&vmm_lock);
+    return pages;
+}
+
+void vmm_init(void)
+{
+    spin_lock(&vmm_lock);
+    vmm_init_locked();
+    spin_unlock(&vmm_lock);
+}
+
+void vmm_get_stats(struct vmm_stats *out)
+{
+    spin_lock(&vmm_lock);
+    vmm_get_stats_locked(out);
+    spin_unlock(&vmm_lock);
 }

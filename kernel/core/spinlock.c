@@ -24,9 +24,66 @@
  * with no output, which is the failure mode this project keeps refusing. */
 #define SPIN_LIMIT 200000000u
 
+/* The highest hierarchy level each processor currently holds, so that an
+ * acquisition out of order can be caught at the point it happens. Written
+ * only by the processor it describes, and only with interrupts masked, so it
+ * needs no lock of its own - which it could not have. */
+static u8 held_level[SMP_MAX_CPUS];
+
+/* Record an acquisition and refuse one that would invert the order.
+ *
+ * Called with the lock already won and interrupts already masked, which is
+ * what makes reading and writing held_level[self] safe. Panicking here rather
+ * than returning an error is deliberate: an inverted acquisition is a bug in
+ * the kernel's structure, and the stack trace at the second lock is the whole
+ * diagnosis. */
+static void level_enter(spinlock_t *lock, u32 self)
+{
+    if (lock->level == LOCK_LEVEL_NONE)
+        return;
+
+    u8 current = self < SMP_MAX_CPUS ? held_level[self] : 0;
+
+    if (lock->level <= current) {
+        /* Release first, so the panic path can take the console lock. */
+        __atomic_store_n(&lock->locked, 0, __ATOMIC_RELEASE);
+        panic("cpu %u tried to acquire lock '%s' at level %u while already "
+              "holding level %u; that inverts the lock hierarchy and would "
+              "deadlock against a processor doing it the other way round - "
+              "see kernel/spinlock.h",
+              self, lock->name ? lock->name : "(unnamed)", lock->level,
+              current);
+    }
+
+    lock->prev_level = current;
+    if (self < SMP_MAX_CPUS)
+        held_level[self] = lock->level;
+}
+
+static void level_leave(const spinlock_t *lock, u32 self)
+{
+    if (lock->level == LOCK_LEVEL_NONE)
+        return;
+    if (self < SMP_MAX_CPUS)
+        held_level[self] = lock->prev_level;
+}
+
+u8 spin_level_held(void)
+{
+    u32 self = smp_cpu_index();
+
+    return self < SMP_MAX_CPUS ? held_level[self] : 0;
+}
+
 bool spin_is_locked(const spinlock_t *lock)
 {
     return __atomic_load_n(&lock->locked, __ATOMIC_ACQUIRE) != 0;
+}
+
+bool spin_held_by_self(const spinlock_t *lock)
+{
+    return __atomic_load_n(&lock->locked, __ATOMIC_ACQUIRE) != 0 &&
+           __atomic_load_n(&lock->holder, __ATOMIC_RELAXED) == smp_cpu_index();
 }
 
 bool spin_trylock(spinlock_t *lock)
@@ -36,9 +93,12 @@ bool spin_trylock(spinlock_t *lock)
 
     if (__atomic_compare_exchange_n(&lock->locked, &expected, 1, false,
                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-        lock->holder = smp_cpu_index();
+        u32 self = smp_cpu_index();
+
+        lock->holder = self;
         lock->saved_if = was_enabled;
         __atomic_add_fetch(&lock->acquisitions, 1, __ATOMIC_RELAXED);
+        level_enter(lock, self);
         return true;
     }
 
@@ -63,6 +123,7 @@ void spin_lock(spinlock_t *lock)
         lock->holder = self;
         lock->saved_if = was_enabled;
         __atomic_add_fetch(&lock->acquisitions, 1, __ATOMIC_RELAXED);
+        level_enter(lock, self);
         return;
     }
 
@@ -94,6 +155,7 @@ void spin_lock(spinlock_t *lock)
                 lock->holder = self;
                 lock->saved_if = was_enabled;
                 __atomic_add_fetch(&lock->acquisitions, 1, __ATOMIC_RELAXED);
+                level_enter(lock, self);
                 return;
             }
         }
@@ -127,6 +189,7 @@ void spin_unlock(spinlock_t *lock)
     bool was_enabled = lock->saved_if;
 
     lock->saved_if = false;
+    level_leave(lock, self);
 
     /* The release has to be the last thing. Once the word is clear another
      * processor may enter the critical section, so every write inside it must

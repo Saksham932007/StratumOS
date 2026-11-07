@@ -1846,6 +1846,56 @@ static void test_smp(struct ktest_result *r)
     irq_restore(saved);
     KT_ASSERT(r, irq_enabled());
 
+    /* --- the lock hierarchy ---------------------------------------------- */
+
+    /* A level-0 lock is exempt from the ordering check and must leave the
+     * recorded level alone, so that the locks that predate the hierarchy -
+     * the TLB shootdown's - keep working under one that has a level. */
+    u8 outer = spin_level_held();
+
+    spin_lock(&probe);
+    KT_EQ(r, (u32)spin_level_held(), (u32)outer);
+    spin_unlock(&probe);
+    KT_EQ(r, (u32)spin_level_held(), (u32)outer);
+
+    /* A levelled lock records its level while held and restores exactly what
+     * was there before on release - not zero, which would let a release
+     * inside a nest silently permit any order afterwards. */
+    static spinlock_t low = SPINLOCK_INIT_AT("ktest-low", LOCK_LEVEL_FS);
+    static spinlock_t high = SPINLOCK_INIT_AT("ktest-high", LOCK_LEVEL_PMM);
+
+    spin_lock(&low);
+    KT_EQ(r, (u32)spin_level_held(), (u32)LOCK_LEVEL_FS);
+
+    /* Upwards is legal, and this is the whole point: the nest the kernel
+     * actually performs, fs then pmm, must be allowed. */
+    spin_lock(&high);
+    KT_EQ(r, (u32)spin_level_held(), (u32)LOCK_LEVEL_PMM);
+    spin_unlock(&high);
+    KT_EQ(r, (u32)spin_level_held(), (u32)LOCK_LEVEL_FS);
+    spin_unlock(&low);
+    KT_EQ(r, (u32)spin_level_held(), (u32)outer);
+
+    /* The level-0 lock must still be takeable from inside a levelled one.
+     * The inversion itself cannot be tested from a passing test: taking
+     * `low` while holding `high` panics, which is the intended behaviour and
+     * is exercised by the fault scenarios, not here. */
+    spin_lock(&high);
+    KT_ASSERT(r, spin_trylock(&probe));
+    KT_EQ(r, (u32)spin_level_held(), (u32)LOCK_LEVEL_PMM);
+    spin_unlock(&probe);
+    spin_unlock(&high);
+    KT_EQ(r, (u32)spin_level_held(), (u32)outer);
+
+    /* And `spin_held_by_self`, which the console depends on to print from
+     * inside a panic it took while already holding the console. */
+    KT_ASSERT(r, !spin_held_by_self(&high));
+    spin_lock(&high);
+    KT_ASSERT(r, spin_held_by_self(&high));
+    KT_ASSERT(r, !spin_held_by_self(&low));
+    spin_unlock(&high);
+    KT_ASSERT(r, !spin_held_by_self(&high));
+
     /* --- inter-processor interrupts --------------------------------------- */
     struct smp_stats ss;
 

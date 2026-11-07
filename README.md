@@ -13,13 +13,13 @@ It also reaches 64-bit long mode and back, and the portable half of it runs
 on RISC-V 64.
 
 [![CI](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml/badge.svg)](https://github.com/Saksham932007/StratumOS/actions/workflows/ci.yml)
-![language](https://img.shields.io/badge/C11%20%2B%20asm-46.3k%20lines-blue)
+![language](https://img.shields.io/badge/C11%20%2B%20asm-47.3k%20lines-blue)
 ![arch](https://img.shields.io/badge/arch-i686%20%2B%20riscv64-lightgrey)
-![tests](https://img.shields.io/badge/tests-1183%20assertions%2C%2015%20boot%20scenarios-brightgreen)
+![tests](https://img.shields.io/badge/tests-1202%20assertions%2C%2015%20boot%20scenarios-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 The same kernel binary boots two ways — through a bootloader written for this
-project, and through GRUB via Multiboot2 — and every push runs **1183
+project, and through GRUB via Multiboot2 — and every push runs **1202
 assertions across 92 host unit tests, 24 in-kernel suites and 15 QEMU boot
 scenarios**, plus four libFuzzer targets over the real kernel sources and the
 same kernel built and booted for a second architecture.
@@ -677,7 +677,7 @@ Everything marked ✅ is implemented and covered by a test.
 
 | | |
 | --- | --- |
-| ✅ | **24 in-kernel suites, 1183 assertions**, run against real hardware state |
+| ✅ | **24 in-kernel suites, 1202 assertions**, run against real hardware state |
 | ✅ | **15 QEMU boot scenarios** — both boot paths, four processors, SMEP/SMAP, a CPU with no NX bit, x86-64, an e1000, no e1000, a real HTTP server on the host, and three that must panic |
 | ✅ | **Four libFuzzer targets over the real kernel sources** under AddressSanitizer, plus a ring-3 syscall fuzzer |
 | ✅ | 20 pre-boot validation checks on every link, before an image is ever booted |
@@ -1156,7 +1156,7 @@ QEMU.
 | **Host unit tests** | the kernel's real `printf`/`string`/`div64` sources, compiled for the host, diffed against glibc | 92 checks |
 | **Pre-boot validation** | Multiboot2 header and checksum, ELF type, entry point inside a load segment, load address, `.bss` alignment, the higher-half split, every embedded ring-3 program, absence of SSE | 20 failure conditions, every link |
 | **Image validation** | the boot signature, stage 1 not overlapping its own partition table, the stage 2 header pointing at a real ELF, every partition inside the image, the FAT geometry, and every file in `/BIN` being an i386 ELF with `INIT` among them | every image, every build |
-| **In-kernel suites** | allocator, paging, address spaces, copy-on-write, heap coalescing, interrupts, scheduler, processes, hardening, ATA and partitions, FAT16 reads and writes, path resolution and descriptors, ACPI/APIC/locks/IPIs, the 32→64→32 transition, checksums and the wire, TCP's connection table, DNS name compression, sockets and loopback, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 1183 checks in 24 suites |
+| **In-kernel suites** | allocator, paging, address spaces, copy-on-write, heap coalescing, interrupts, scheduler, processes, hardening, ATA and partitions, FAT16 reads and writes, path resolution and descriptors, ACPI/APIC/locks/IPIs, the 32→64→32 transition, checksums and the wire, TCP's connection table, DNS name compression, sockets and loopback, syscall pointer validation, ELF rejection, symbol lookup, profiler attribution — all against real hardware state | 1202 checks in 24 suites |
 | **Boot scenarios** | custom bootloader unattended, **the same image on four processors**, the same image on a CPU with SMEP and SMAP, **the same image on a CPU with no NX bit**, **the same image on a CPU with x86-64**, **the frames it puts on the wire, parsed from a pcap**, the same image with no Ethernet at all, DHCP and HTTP against a real server, GRUB/Multiboot2 unattended, 68 shell commands typed over serial, benchmarks + profile | 12 scenarios |
 | **Deliberate faults** | a write to the kernel's own `.text`, and a write below a task's stack — each must panic, naming the address, the reason and the region, and exit with the panic code | 2 scenarios |
 | **Fuzzing** | four libFuzzer targets over the **real** `elf.c`/`fat16.c`/`heap.c`/`acpi.c` under AddressSanitizer, plus 40,000 malformed system calls issued from ring 3 | 6 bugs found |
