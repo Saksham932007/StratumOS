@@ -386,13 +386,41 @@ bool vmm_protect_range(vaddr_t va, size_t bytes, u32 flags)
 
 /* ---- block device ------------------------------------------------------ */
 
-static const u8 *disk_data;
+/* A private, writable copy of the fuzzer's input.
+ *
+ * FAT16 is no longer read-only, so the fuzz target reaches blockdev_write()
+ * and the shim has to answer it. It cannot write into the fuzzer's buffer -
+ * that memory belongs to libFuzzer, which reuses and compares it - so the
+ * input is copied once per case and the copy is what the filesystem sees.
+ *
+ * Making the copy writable rather than discarding writes is the point: a
+ * filesystem that reads back what it just wrote exercises its own
+ * bookkeeping, and the interesting crashes are in the second pass over a
+ * structure the first pass built. The buffer is reused between cases and
+ * stays reachable from here, so it is not a leak. */
+static u8 *disk_data;
 static size_t disk_len;
+static size_t disk_cap;
 static struct blockdev shim_dev;
 
 void shim_set_disk(const uint8_t *data, size_t len)
 {
-    disk_data = data;
+    if (len > disk_cap) {
+        u8 *grown = realloc(disk_data, len);
+
+        if (!grown) {
+            disk_len = 0;
+            shim_dev.present = false;
+            return;
+        }
+
+        disk_data = grown;
+        disk_cap = len;
+    }
+
+    if (len)
+        memcpy(disk_data, data, len);
+
     disk_len = len;
 
     memset(&shim_dev, 0, sizeof(shim_dev));
@@ -420,6 +448,28 @@ bool blockdev_read(const struct blockdev *dev, u64 offset, u32 count, void *buf)
         return false;
 
     memcpy(buf, disk_data + offset * BLOCK_SIZE, (size_t)count * BLOCK_SIZE);
+    return true;
+}
+
+bool blockdev_write(const struct blockdev *dev, u64 offset, u32 count,
+                    const void *buf)
+{
+    (void)dev;
+
+    /* The same bounds check as the read path, and for the same reason: a
+     * filesystem that writes past the end of its partition has to be refused
+     * by the block layer, and that refusal is behaviour under test. */
+    if (offset + count > shim_dev.sectors || offset + count < offset)
+        return false;
+
+    memcpy(disk_data + offset * BLOCK_SIZE, buf, (size_t)count * BLOCK_SIZE);
+    return true;
+}
+
+bool blockdev_flush(const struct blockdev *dev)
+{
+    /* Nothing is cached here, so there is nothing to push out. */
+    (void)dev;
     return true;
 }
 
