@@ -61,6 +61,7 @@
 
 #include <net/inet.h>
 #include <net/net.h>
+#include <net/netlock.h>
 
 #define DNS_TYPE_A      1
 #define DNS_TYPE_CNAME  5
@@ -145,17 +146,17 @@ const char *dns_status_name(enum dns_status s)
     return "?";
 }
 
-enum dns_status dns_status(void)
+static enum dns_status dns_status_inner(void)
 {
     return status;
 }
 
-const struct dns_stats *dns_get_stats(void)
+static const struct dns_stats *dns_get_stats_inner(void)
 {
     return &stats;
 }
 
-void dns_set_server(ipv4_addr s)
+static void dns_set_server_inner(ipv4_addr s)
 {
     char b[IPV4_STR_LEN];
 
@@ -163,12 +164,12 @@ void dns_set_server(ipv4_addr s)
     pr_info("resolver is %s", ipv4_str(s, b, sizeof(b)));
 }
 
-ipv4_addr dns_server(void)
+static ipv4_addr dns_server_inner(void)
 {
     return server;
 }
 
-bool dns_result(ipv4_addr *out)
+static bool dns_result_inner(ipv4_addr *out)
 {
     if (status != DNS_RESOLVED)
         return false;
@@ -237,13 +238,13 @@ static void cache_put(const char *name, ipv4_addr addr)
     cache[slot].addr = addr;
 }
 
-u32 dns_cache_count(void)
+static u32 dns_cache_count_inner(void)
 {
     return cache_count;
 }
 
-bool dns_cache_entry(u32 index, char *name_out, size_t name_len,
-                     ipv4_addr *addr_out)
+static bool dns_cache_entry_inner(u32 index, char *name_out, size_t name_len,
+                                  ipv4_addr *addr_out)
 {
     if (index >= cache_count)
         return false;
@@ -253,7 +254,7 @@ bool dns_cache_entry(u32 index, char *name_out, size_t name_len,
     return true;
 }
 
-void dns_cache_clear(void)
+static void dns_cache_clear_inner(void)
 {
     cache_count = 0;
     cache_next = 0;
@@ -468,7 +469,7 @@ static bool send_query(void)
     return true;
 }
 
-bool dns_query(const char *name)
+static bool dns_query_inner(const char *name)
 {
     if (!server) {
         pr_warn("no resolver configured");
@@ -658,7 +659,7 @@ static void handle(const struct udp_dgram *d)
     finish(DNS_NOT_FOUND);
 }
 
-void dns_tick(void)
+static void dns_tick_inner(void)
 {
     if (status != DNS_PENDING || !query.port)
         return;
@@ -704,6 +705,11 @@ void dns_tick(void)
 
 /* ---- the synchronous form ---------------------------------------------- */
 
+/* Not wrapped in the network lock. This polls the stack and watches the
+ * clock, and the clock is a timer interrupt: holding a lock that masks
+ * interrupts across a wait on timer_ms() means the deadline never arrives.
+ * It needs no lock of its own either - every call it makes into the stack
+ * takes one. */
 i32 dns_resolve(const char *name, ipv4_addr *out, u32 timeout_ms)
 {
     if (!name || !*name)
@@ -762,4 +768,100 @@ i32 dns_resolve(const char *name, ipv4_addr *out, u32 timeout_ms)
     default:
         return SYS_EIO;
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * The subsystem boundary.
+ *
+ * Everything above is the stack's internals; each public name below takes the
+ * network lock and calls it. The lock counts its depth, so an internal caller
+ * reaching one of these - socket_send() calling tcp_send() - is correct
+ * without having to know whether it is already inside the stack. See
+ * kernel/include/net/netlock.h for why this subsystem is the one that gets a
+ * recursive lock.
+ * ------------------------------------------------------------------------- */
+
+enum dns_status dns_status(void)
+{
+    net_lock();
+    enum dns_status ret = dns_status_inner();
+
+    net_unlock();
+    return ret;
+}
+
+const struct dns_stats *dns_get_stats(void)
+{
+    net_lock();
+    const struct dns_stats *ret = dns_get_stats_inner();
+
+    net_unlock();
+    return ret;
+}
+
+void dns_set_server(ipv4_addr s)
+{
+    net_lock();
+    dns_set_server_inner(s);
+    net_unlock();
+}
+
+ipv4_addr dns_server(void)
+{
+    net_lock();
+    ipv4_addr ret = dns_server_inner();
+
+    net_unlock();
+    return ret;
+}
+
+bool dns_result(ipv4_addr *out)
+{
+    net_lock();
+    bool ret = dns_result_inner(out);
+
+    net_unlock();
+    return ret;
+}
+
+u32 dns_cache_count(void)
+{
+    net_lock();
+    u32 ret = dns_cache_count_inner();
+
+    net_unlock();
+    return ret;
+}
+
+bool dns_cache_entry(u32 index, char *name_out, size_t name_len,
+                     ipv4_addr *addr_out)
+{
+    net_lock();
+    bool ret = dns_cache_entry_inner(index, name_out, name_len, addr_out);
+
+    net_unlock();
+    return ret;
+}
+
+void dns_cache_clear(void)
+{
+    net_lock();
+    dns_cache_clear_inner();
+    net_unlock();
+}
+
+bool dns_query(const char *name)
+{
+    net_lock();
+    bool ret = dns_query_inner(name);
+
+    net_unlock();
+    return ret;
+}
+
+void dns_tick(void)
+{
+    net_lock();
+    dns_tick_inner();
+    net_unlock();
 }

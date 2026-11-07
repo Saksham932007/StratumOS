@@ -22,6 +22,7 @@
 #include <kernel/sched.h>
 #include <kernel/string.h>
 
+#include <fs/fslock.h>
 #include <fs/vfs.h>
 
 #define VFS_FS_MAX 4
@@ -40,18 +41,22 @@ static u32 call_count;
  * file gets its own table once it has a task. */
 static struct task_files kernel_files;
 
-void vfs_init(void)
+/* Forward declaration: vfs_init() sets up the kernel's own descriptor
+ * table, which lives further down with the rest of the fd machinery. */
+static void fd_table_init_locked(struct task_files *files);
+
+static void vfs_init_locked(void)
 {
     for (u32 i = 0; i < VFS_OPEN_MAX; i++)
         open_files[i].refcount = 0;
 
-    fd_table_init(&kernel_files);
+    fd_table_init_locked(&kernel_files);
 
     pr_info("%u open-file slots, %u descriptors per process", VFS_OPEN_MAX,
             SYS_FDS_MAX);
 }
 
-bool vfs_register(const struct vfs_fs *fs)
+static bool vfs_register_locked(const struct vfs_fs *fs)
 {
     if (!fs || !fs->prefix || !fs->open)
         return false;
@@ -111,7 +116,8 @@ static const struct vfs_fs *fs_for(const char *path)
  * case collisions - so folding here means "/BIN/INIT" and "/bin/init" are one
  * path everywhere, rather than in whichever backends remembered.
  */
-bool vfs_resolve(const char *cwd, const char *path, char *out, size_t outlen)
+static bool vfs_resolve_locked(const char *cwd, const char *path, char *out,
+                               size_t outlen)
 {
     if (!path || !out || outlen < 2)
         return false;
@@ -239,13 +245,13 @@ struct vfs_file *vfs_alloc(const struct vfs_ops *ops, u8 type, u32 flags,
     return f;
 }
 
-void vfs_ref(struct vfs_file *f)
+static void vfs_ref_locked(struct vfs_file *f)
 {
     if (f)
         f->refcount++;
 }
 
-void vfs_put(struct vfs_file *f)
+static void vfs_put_locked(struct vfs_file *f)
 {
     if (!f)
         return;
@@ -272,7 +278,7 @@ void vfs_put(struct vfs_file *f)
         open_now--;
 }
 
-struct vfs_file *vfs_open(const char *path, u32 flags, i32 *err)
+static struct vfs_file *vfs_open_locked(const char *path, u32 flags, i32 *err)
 {
     i32 e = SYS_ENOENT;
 
@@ -362,7 +368,7 @@ static bool may_write(const struct vfs_file *f)
     return acc == O_WRONLY || acc == O_RDWR;
 }
 
-i32 vfs_read(struct vfs_file *f, void *buf, u32 len)
+static i32 vfs_read_locked(struct vfs_file *f, void *buf, u32 len)
 {
     if (!f || !f->ops)
         return SYS_EBADF;
@@ -379,7 +385,7 @@ i32 vfs_read(struct vfs_file *f, void *buf, u32 len)
     return f->ops->read(f, buf, len);
 }
 
-i32 vfs_write(struct vfs_file *f, const void *buf, u32 len)
+static i32 vfs_write_locked(struct vfs_file *f, const void *buf, u32 len)
 {
     if (!f || !f->ops)
         return SYS_EBADF;
@@ -396,7 +402,7 @@ i32 vfs_write(struct vfs_file *f, const void *buf, u32 len)
     return f->ops->write(f, buf, len);
 }
 
-i32 vfs_seek(struct vfs_file *f, i32 offset, int whence)
+static i32 vfs_seek_locked(struct vfs_file *f, i32 offset, int whence)
 {
     if (!f || !f->ops)
         return SYS_EBADF;
@@ -409,7 +415,7 @@ i32 vfs_seek(struct vfs_file *f, i32 offset, int whence)
     return f->ops->seek(f, offset, whence);
 }
 
-i32 vfs_stat_file(struct vfs_file *f, struct sys_stat *out)
+static i32 vfs_stat_file_locked(struct vfs_file *f, struct sys_stat *out)
 {
     if (!f || !f->ops)
         return SYS_EBADF;
@@ -429,7 +435,8 @@ i32 vfs_stat_file(struct vfs_file *f, struct sys_stat *out)
     return 0;
 }
 
-i32 vfs_getdent(struct vfs_file *f, u32 index, struct sys_dirent *out)
+static i32 vfs_getdent_locked(struct vfs_file *f, u32 index,
+                              struct sys_dirent *out)
 {
     if (!f || !f->ops)
         return SYS_EBADF;
@@ -444,7 +451,7 @@ i32 vfs_getdent(struct vfs_file *f, u32 index, struct sys_dirent *out)
     return f->ops->getdent(f, index, out);
 }
 
-i32 vfs_ioctl(struct vfs_file *f, u32 request, u32 arg)
+static i32 vfs_ioctl_locked(struct vfs_file *f, u32 request, u32 arg)
 {
     if (!f || !f->ops)
         return SYS_EBADF;
@@ -455,7 +462,7 @@ i32 vfs_ioctl(struct vfs_file *f, u32 request, u32 arg)
     return f->ops->ioctl(f, request, arg);
 }
 
-i32 vfs_truncate_file(struct vfs_file *f, u32 length)
+static i32 vfs_truncate_file_locked(struct vfs_file *f, u32 length)
 {
     if (!f || !f->ops)
         return SYS_EBADF;
@@ -468,7 +475,7 @@ i32 vfs_truncate_file(struct vfs_file *f, u32 length)
     return f->ops->truncate(f, length);
 }
 
-bool vfs_poll_read(struct vfs_file *f)
+static bool vfs_poll_read_locked(struct vfs_file *f)
 {
     if (!f || !f->ops)
         return false;
@@ -476,7 +483,7 @@ bool vfs_poll_read(struct vfs_file *f)
     return f->ops->poll_read ? f->ops->poll_read(f) : true;
 }
 
-bool vfs_poll_write(struct vfs_file *f)
+static bool vfs_poll_write_locked(struct vfs_file *f)
 {
     if (!f || !f->ops)
         return false;
@@ -486,7 +493,7 @@ bool vfs_poll_write(struct vfs_file *f)
 
 /* ---- by path ----------------------------------------------------------- */
 
-i32 vfs_stat(const char *path, struct sys_stat *out)
+static i32 vfs_stat_locked(const char *path, struct sys_stat *out)
 {
     const struct vfs_fs *fs;
 
@@ -505,7 +512,7 @@ i32 vfs_stat(const char *path, struct sys_stat *out)
     return fs->stat(path, out);
 }
 
-i32 vfs_unlink(const char *path)
+static i32 vfs_unlink_locked(const char *path)
 {
     const struct vfs_fs *fs;
 
@@ -523,7 +530,7 @@ i32 vfs_unlink(const char *path)
     return fs->unlink(path);
 }
 
-i32 vfs_mkdir(const char *path)
+static i32 vfs_mkdir_locked(const char *path)
 {
     const struct vfs_fs *fs;
 
@@ -541,7 +548,7 @@ i32 vfs_mkdir(const char *path)
     return fs->mkdir(path);
 }
 
-i32 vfs_rmdir(const char *path)
+static i32 vfs_rmdir_locked(const char *path)
 {
     const struct vfs_fs *fs;
 
@@ -559,7 +566,7 @@ i32 vfs_rmdir(const char *path)
     return fs->rmdir(path);
 }
 
-i32 vfs_rename(const char *from, const char *to)
+static i32 vfs_rename_locked(const char *from, const char *to)
 {
     const struct vfs_fs *fs;
 
@@ -584,7 +591,7 @@ i32 vfs_rename(const char *from, const char *to)
     return fs->rename(from, to);
 }
 
-i32 vfs_sync(void)
+static i32 vfs_sync_locked(void)
 {
     i32 ret = 0;
 
@@ -610,7 +617,7 @@ static struct task_files *current_files(void)
     return t ? &t->files : &kernel_files;
 }
 
-void fd_table_init(struct task_files *files)
+static void fd_table_init_locked(struct task_files *files)
 {
     if (!files)
         return;
@@ -621,7 +628,8 @@ void fd_table_init(struct task_files *files)
     strlcpy(files->cwd, "/", sizeof(files->cwd));
 }
 
-void fd_table_clone(struct task_files *dst, const struct task_files *src)
+static void fd_table_clone_locked(struct task_files *dst,
+                                  const struct task_files *src)
 {
     if (!dst || !src)
         return;
@@ -631,13 +639,13 @@ void fd_table_clone(struct task_files *dst, const struct task_files *src)
         /* A reference per descriptor, not per open file: the child now holds
          * its own descriptor onto the same object, and the shared offset that
          * follows from that is the behaviour fork() is expected to have. */
-        vfs_ref(dst->fd[i]);
+        vfs_ref_locked(dst->fd[i]);
     }
 
     strlcpy(dst->cwd, src->cwd, sizeof(dst->cwd));
 }
 
-void fd_table_close_all(struct task_files *files)
+static void fd_table_close_all_locked(struct task_files *files)
 {
     if (!files)
         return;
@@ -652,30 +660,30 @@ void fd_table_close_all(struct task_files *files)
         struct vfs_file *f = files->fd[i];
 
         files->fd[i] = NULL;
-        vfs_put(f);
+        vfs_put_locked(f);
     }
 }
 
-bool fd_table_open_std(struct task_files *files)
+static bool fd_table_open_std_locked(struct task_files *files)
 {
     if (!files)
         return false;
 
-    struct vfs_file *in = vfs_open("/DEV/CONSOLE", O_RDONLY, NULL);
-    struct vfs_file *out = vfs_open("/DEV/CONSOLE", O_WRONLY, NULL);
+    struct vfs_file *in = vfs_open_locked("/DEV/CONSOLE", O_RDONLY, NULL);
+    struct vfs_file *out = vfs_open_locked("/DEV/CONSOLE", O_WRONLY, NULL);
 
     if (!in || !out) {
         if (in)
-            vfs_put(in);
+            vfs_put_locked(in);
         if (out)
-            vfs_put(out);
+            vfs_put_locked(out);
         pr_err("cannot open the standard descriptors");
         return false;
     }
 
     /* 1 and 2 are two descriptors onto one open file, which is what makes
      * stderr and stdout interleave in order rather than racing. */
-    vfs_ref(out);
+    vfs_ref_locked(out);
 
     files->fd[STDIN_FD] = in;
     files->fd[STDOUT_FD] = out;
@@ -684,7 +692,7 @@ bool fd_table_open_std(struct task_files *files)
     return true;
 }
 
-struct vfs_file *fd_get(i32 fd)
+static struct vfs_file *fd_get_locked(i32 fd)
 {
     struct task_files *files = current_files();
 
@@ -704,7 +712,7 @@ static i32 fd_lowest_free(struct task_files *files)
     return SYS_EMFILE;
 }
 
-i32 fd_install(struct vfs_file *f)
+static i32 fd_install_locked(struct vfs_file *f)
 {
     struct task_files *files = current_files();
 
@@ -720,21 +728,21 @@ i32 fd_install(struct vfs_file *f)
     return fd;
 }
 
-bool fd_resolve(const char *path, char *out, size_t outlen)
+static bool fd_resolve_locked(const char *path, char *out, size_t outlen)
 {
-    return vfs_resolve(current_files()->cwd, path, out, outlen);
+    return vfs_resolve_locked(current_files()->cwd, path, out, outlen);
 }
 
-const char *fd_cwd(void)
+static const char *fd_cwd_locked(void)
 {
     return current_files()->cwd;
 }
 
-i32 fd_open(const char *path, u32 flags)
+static i32 fd_open_locked(const char *path, u32 flags)
 {
     char abs[VFS_PATH_MAX];
 
-    if (!fd_resolve(path, abs, sizeof(abs)))
+    if (!fd_resolve_locked(path, abs, sizeof(abs)))
         return SYS_ENAMETOOLONG;
 
     /* The descriptor is reserved before the open, so that a successful open
@@ -748,7 +756,7 @@ i32 fd_open(const char *path, u32 flags)
         return fd;
 
     i32 err = 0;
-    struct vfs_file *f = vfs_open(abs, flags, &err);
+    struct vfs_file *f = vfs_open_locked(abs, flags, &err);
 
     if (!f)
         return err ? err : SYS_ENOENT;
@@ -757,7 +765,7 @@ i32 fd_open(const char *path, u32 flags)
     return fd;
 }
 
-i32 fd_close(i32 fd)
+static i32 fd_close_locked(i32 fd)
 {
     struct task_files *files = current_files();
 
@@ -767,44 +775,44 @@ i32 fd_close(i32 fd)
     struct vfs_file *f = files->fd[fd];
 
     files->fd[fd] = NULL;
-    vfs_put(f);
+    vfs_put_locked(f);
 
     return 0;
 }
 
-i32 fd_read(i32 fd, void *buf, u32 len)
+static i32 fd_read_locked(i32 fd, void *buf, u32 len)
 {
-    return vfs_read(fd_get(fd), buf, len);
+    return vfs_read_locked(fd_get_locked(fd), buf, len);
 }
 
-i32 fd_write(i32 fd, const void *buf, u32 len)
+static i32 fd_write_locked(i32 fd, const void *buf, u32 len)
 {
-    return vfs_write(fd_get(fd), buf, len);
+    return vfs_write_locked(fd_get_locked(fd), buf, len);
 }
 
-i32 fd_seek(i32 fd, i32 offset, int whence)
+static i32 fd_seek_locked(i32 fd, i32 offset, int whence)
 {
-    return vfs_seek(fd_get(fd), offset, whence);
+    return vfs_seek_locked(fd_get_locked(fd), offset, whence);
 }
 
-i32 fd_stat(i32 fd, struct sys_stat *out)
+static i32 fd_stat_locked(i32 fd, struct sys_stat *out)
 {
-    return vfs_stat_file(fd_get(fd), out);
+    return vfs_stat_file_locked(fd_get_locked(fd), out);
 }
 
-i32 fd_getdent(i32 fd, u32 index, struct sys_dirent *out)
+static i32 fd_getdent_locked(i32 fd, u32 index, struct sys_dirent *out)
 {
-    return vfs_getdent(fd_get(fd), index, out);
+    return vfs_getdent_locked(fd_get_locked(fd), index, out);
 }
 
-i32 fd_ioctl(i32 fd, u32 request, u32 arg)
+static i32 fd_ioctl_locked(i32 fd, u32 request, u32 arg)
 {
-    return vfs_ioctl(fd_get(fd), request, arg);
+    return vfs_ioctl_locked(fd_get_locked(fd), request, arg);
 }
 
-i32 fd_dup(i32 fd)
+static i32 fd_dup_locked(i32 fd)
 {
-    struct vfs_file *f = fd_get(fd);
+    struct vfs_file *f = fd_get_locked(fd);
 
     if (!f)
         return SYS_EBADF;
@@ -814,16 +822,16 @@ i32 fd_dup(i32 fd)
     if (newfd < 0)
         return newfd;
 
-    vfs_ref(f);
+    vfs_ref_locked(f);
     current_files()->fd[newfd] = f;
 
     return newfd;
 }
 
-i32 fd_dup2(i32 oldfd, i32 newfd)
+static i32 fd_dup2_locked(i32 oldfd, i32 newfd)
 {
     struct task_files *files = current_files();
-    struct vfs_file *f = fd_get(oldfd);
+    struct vfs_file *f = fd_get_locked(oldfd);
 
     if (!f)
         return SYS_EBADF;
@@ -838,28 +846,28 @@ i32 fd_dup2(i32 oldfd, i32 newfd)
 
     /* The reference is taken before the old occupant is dropped, for the same
      * reason: if they were the same open file, closing first could free it. */
-    vfs_ref(f);
+    vfs_ref_locked(f);
 
     if (files->fd[newfd]) {
         struct vfs_file *old = files->fd[newfd];
 
         files->fd[newfd] = NULL;
-        vfs_put(old);
+        vfs_put_locked(old);
     }
 
     files->fd[newfd] = f;
     return newfd;
 }
 
-i32 fd_chdir(const char *path)
+static i32 fd_chdir_locked(const char *path)
 {
     char abs[VFS_PATH_MAX];
     struct sys_stat st;
 
-    if (!fd_resolve(path, abs, sizeof(abs)))
+    if (!fd_resolve_locked(path, abs, sizeof(abs)))
         return SYS_ENAMETOOLONG;
 
-    i32 e = vfs_stat(abs, &st);
+    i32 e = vfs_stat_locked(abs, &st);
 
     if (e < 0)
         return e;
@@ -871,17 +879,401 @@ i32 fd_chdir(const char *path)
     return 0;
 }
 
-u32 vfs_open_count(void)
+static u32 vfs_open_count_locked(void)
 {
     return open_now;
 }
 
-u32 vfs_open_peak(void)
+static u32 vfs_open_peak_locked(void)
 {
     return open_peak;
 }
 
-u32 vfs_call_count(void)
+static u32 vfs_call_count_locked(void)
 {
     return call_count;
+}
+
+/* ---------------------------------------------------------------------------
+ * The subsystem boundary.
+ *
+ * Everything above is the filesystem's internals and runs with the fs lock
+ * held; everything below takes it. The split exists because these entry
+ * points call each other - fd_read() is vfs_read() of fd_get() - and this
+ * lock is not recursive. See kernel/include/fs/fslock.h.
+ * ------------------------------------------------------------------------- */
+
+void vfs_init(void)
+{
+    fs_lock();
+    vfs_init_locked();
+    fs_unlock();
+}
+
+bool vfs_register(const struct vfs_fs *fs)
+{
+    fs_lock();
+    bool ret = vfs_register_locked(fs);
+
+    fs_unlock();
+    return ret;
+}
+
+bool vfs_resolve(const char *cwd, const char *path, char *out, size_t outlen)
+{
+    fs_lock();
+    bool ret = vfs_resolve_locked(cwd, path, out, outlen);
+
+    fs_unlock();
+    return ret;
+}
+
+void vfs_ref(struct vfs_file *f)
+{
+    fs_lock();
+    vfs_ref_locked(f);
+    fs_unlock();
+}
+
+void vfs_put(struct vfs_file *f)
+{
+    fs_lock();
+    vfs_put_locked(f);
+    fs_unlock();
+}
+
+struct vfs_file *vfs_open(const char *path, u32 flags, i32 *err)
+{
+    fs_lock();
+    struct vfs_file *ret = vfs_open_locked(path, flags, err);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 vfs_read(struct vfs_file *f, void *buf, u32 len)
+{
+    fs_lock();
+    i32 ret = vfs_read_locked(f, buf, len);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 vfs_write(struct vfs_file *f, const void *buf, u32 len)
+{
+    fs_lock();
+    i32 ret = vfs_write_locked(f, buf, len);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 vfs_seek(struct vfs_file *f, i32 offset, int whence)
+{
+    fs_lock();
+    i32 ret = vfs_seek_locked(f, offset, whence);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 vfs_stat_file(struct vfs_file *f, struct sys_stat *out)
+{
+    fs_lock();
+    i32 ret = vfs_stat_file_locked(f, out);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 vfs_getdent(struct vfs_file *f, u32 index, struct sys_dirent *out)
+{
+    fs_lock();
+    i32 ret = vfs_getdent_locked(f, index, out);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 vfs_ioctl(struct vfs_file *f, u32 request, u32 arg)
+{
+    fs_lock();
+    i32 ret = vfs_ioctl_locked(f, request, arg);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 vfs_truncate_file(struct vfs_file *f, u32 length)
+{
+    fs_lock();
+    i32 ret = vfs_truncate_file_locked(f, length);
+
+    fs_unlock();
+    return ret;
+}
+
+bool vfs_poll_read(struct vfs_file *f)
+{
+    fs_lock();
+    bool ret = vfs_poll_read_locked(f);
+
+    fs_unlock();
+    return ret;
+}
+
+bool vfs_poll_write(struct vfs_file *f)
+{
+    fs_lock();
+    bool ret = vfs_poll_write_locked(f);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 vfs_stat(const char *path, struct sys_stat *out)
+{
+    fs_lock();
+    i32 ret = vfs_stat_locked(path, out);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 vfs_unlink(const char *path)
+{
+    fs_lock();
+    i32 ret = vfs_unlink_locked(path);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 vfs_mkdir(const char *path)
+{
+    fs_lock();
+    i32 ret = vfs_mkdir_locked(path);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 vfs_rmdir(const char *path)
+{
+    fs_lock();
+    i32 ret = vfs_rmdir_locked(path);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 vfs_rename(const char *from, const char *to)
+{
+    fs_lock();
+    i32 ret = vfs_rename_locked(from, to);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 vfs_sync(void)
+{
+    fs_lock();
+    i32 ret = vfs_sync_locked();
+
+    fs_unlock();
+    return ret;
+}
+
+void fd_table_init(struct task_files *files)
+{
+    fs_lock();
+    fd_table_init_locked(files);
+    fs_unlock();
+}
+
+void fd_table_clone(struct task_files *dst, const struct task_files *src)
+{
+    fs_lock();
+    fd_table_clone_locked(dst, src);
+    fs_unlock();
+}
+
+void fd_table_close_all(struct task_files *files)
+{
+    fs_lock();
+    fd_table_close_all_locked(files);
+    fs_unlock();
+}
+
+bool fd_table_open_std(struct task_files *files)
+{
+    fs_lock();
+    bool ret = fd_table_open_std_locked(files);
+
+    fs_unlock();
+    return ret;
+}
+
+struct vfs_file *fd_get(i32 fd)
+{
+    fs_lock();
+    struct vfs_file *ret = fd_get_locked(fd);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 fd_install(struct vfs_file *f)
+{
+    fs_lock();
+    i32 ret = fd_install_locked(f);
+
+    fs_unlock();
+    return ret;
+}
+
+bool fd_resolve(const char *path, char *out, size_t outlen)
+{
+    fs_lock();
+    bool ret = fd_resolve_locked(path, out, outlen);
+
+    fs_unlock();
+    return ret;
+}
+
+const char *fd_cwd(void)
+{
+    fs_lock();
+    const char *ret = fd_cwd_locked();
+
+    fs_unlock();
+    return ret;
+}
+
+i32 fd_open(const char *path, u32 flags)
+{
+    fs_lock();
+    i32 ret = fd_open_locked(path, flags);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 fd_close(i32 fd)
+{
+    fs_lock();
+    i32 ret = fd_close_locked(fd);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 fd_read(i32 fd, void *buf, u32 len)
+{
+    fs_lock();
+    i32 ret = fd_read_locked(fd, buf, len);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 fd_write(i32 fd, const void *buf, u32 len)
+{
+    fs_lock();
+    i32 ret = fd_write_locked(fd, buf, len);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 fd_seek(i32 fd, i32 offset, int whence)
+{
+    fs_lock();
+    i32 ret = fd_seek_locked(fd, offset, whence);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 fd_stat(i32 fd, struct sys_stat *out)
+{
+    fs_lock();
+    i32 ret = fd_stat_locked(fd, out);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 fd_getdent(i32 fd, u32 index, struct sys_dirent *out)
+{
+    fs_lock();
+    i32 ret = fd_getdent_locked(fd, index, out);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 fd_ioctl(i32 fd, u32 request, u32 arg)
+{
+    fs_lock();
+    i32 ret = fd_ioctl_locked(fd, request, arg);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 fd_dup(i32 fd)
+{
+    fs_lock();
+    i32 ret = fd_dup_locked(fd);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 fd_dup2(i32 oldfd, i32 newfd)
+{
+    fs_lock();
+    i32 ret = fd_dup2_locked(oldfd, newfd);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 fd_chdir(const char *path)
+{
+    fs_lock();
+    i32 ret = fd_chdir_locked(path);
+
+    fs_unlock();
+    return ret;
+}
+
+u32 vfs_open_count(void)
+{
+    fs_lock();
+    u32 ret = vfs_open_count_locked();
+
+    fs_unlock();
+    return ret;
+}
+
+u32 vfs_open_peak(void)
+{
+    fs_lock();
+    u32 ret = vfs_open_peak_locked();
+
+    fs_unlock();
+    return ret;
+}
+
+u32 vfs_call_count(void)
+{
+    fs_lock();
+    u32 ret = vfs_call_count_locked();
+
+    fs_unlock();
+    return ret;
 }

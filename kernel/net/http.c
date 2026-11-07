@@ -67,13 +67,14 @@
 
 #include <net/inet.h>
 #include <net/net.h>
+#include <net/netlock.h>
 
 #define HTTP_HDR_MAX   2048
 #define HTTP_CHUNK_MAX 1024
 
 static struct http_stats stats;
 
-const struct http_stats *http_get_stats(void)
+static const struct http_stats *http_get_stats_inner(void)
 {
     return &stats;
 }
@@ -361,6 +362,11 @@ static void sink(struct body_sink *s, const u8 *data, u32 len)
 
 /* ---- the request -------------------------------------------------------- */
 
+/* Not wrapped in the network lock. This polls the stack and watches the
+ * clock, and the clock is a timer interrupt: holding a lock that masks
+ * interrupts across a wait on timer_ms() means the deadline never arrives.
+ * It needs no lock of its own either - every call it makes into the stack
+ * takes one. */
 i32 http_get(const char *url, void *buf, u32 buflen, struct http_response *resp,
              u32 timeout_ms)
 {
@@ -628,4 +634,24 @@ i32 http_get(const char *url, void *buf, u32 buflen, struct http_response *resp,
 
     stats.responses++;
     return (i32)bs.len;
+}
+
+/* ---------------------------------------------------------------------------
+ * The subsystem boundary.
+ *
+ * Everything above is the stack's internals; each public name below takes the
+ * network lock and calls it. The lock counts its depth, so an internal caller
+ * reaching one of these - socket_send() calling tcp_send() - is correct
+ * without having to know whether it is already inside the stack. See
+ * kernel/include/net/netlock.h for why this subsystem is the one that gets a
+ * recursive lock.
+ * ------------------------------------------------------------------------- */
+
+const struct http_stats *http_get_stats(void)
+{
+    net_lock();
+    const struct http_stats *ret = http_get_stats_inner();
+
+    net_unlock();
+    return ret;
 }

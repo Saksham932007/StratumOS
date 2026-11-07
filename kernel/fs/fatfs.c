@@ -88,7 +88,7 @@ static i32 fatfs_read(struct vfs_file *f, void *buf, u32 len)
     if (len > left)
         len = left;
 
-    i32 got = fat16_read(&o->ent, f->offset, buf, len);
+    i32 got = fat16_read_locked(&o->ent, f->offset, buf, len);
 
     if (got < 0)
         return SYS_EIO;
@@ -208,7 +208,7 @@ static i32 fatfs_getdent(struct vfs_file *f, u32 index, struct sys_dirent *out)
 {
     struct fat_dirent ent;
 
-    if (!fat16_readdir(f->path, index, &ent))
+    if (!fat16_readdir_locked(f->path, index, &ent))
         return 0; /* past the last entry */
 
     strlcpy(out->name, ent.name, sizeof(out->name));
@@ -263,7 +263,7 @@ static i32 fatfs_open(const char *path, u32 flags, struct vfs_file *f)
         ent.attr = FAT_ATTR_DIRECTORY;
         exists = true;
     } else {
-        exists = fat16_stat(path, &ent);
+        exists = fat16_stat_locked(path, &ent);
     }
 
     /* The flag combinations, in the order their refusals are most specific.
@@ -342,7 +342,7 @@ static i32 fatfs_stat_path(const char *path, struct sys_stat *out)
         return 0;
     }
 
-    if (!fat16_stat(path, &ent))
+    if (!fat16_stat_locked(path, &ent))
         return SYS_ENOENT;
 
     out->size = ent.size;
@@ -372,7 +372,7 @@ static i32 fatfs_unlink(const char *path)
      * two reasons applied. fat16_unlink() refuses a directory too, but it can
      * only return false, and "no such file" and "that is a directory" lead a
      * caller to do different things. */
-    if (!fat16_stat(path, &ent))
+    if (!fat16_stat_locked(path, &ent))
         return SYS_ENOENT;
 
     if (ent.is_dir)
@@ -390,7 +390,7 @@ static i32 fatfs_mkdir(const char *path)
     if (!fat16_writable())
         return SYS_EROFS;
 
-    if (fat16_stat(path, &ent))
+    if (fat16_stat_locked(path, &ent))
         return SYS_EEXIST;
 
     return create_error_to_errno(fat16_create_ex(path, true, NULL));
@@ -405,7 +405,7 @@ static i32 fatfs_rmdir(const char *path)
     if (!fat16_writable())
         return SYS_EROFS;
 
-    if (!fat16_stat(path, &ent))
+    if (!fat16_stat_locked(path, &ent))
         return SYS_ENOENT;
 
     if (!ent.is_dir)
@@ -425,10 +425,10 @@ static i32 fatfs_rename(const char *from, const char *to)
     if (!fat16_writable())
         return SYS_EROFS;
 
-    if (!fat16_stat(from, &ent))
+    if (!fat16_stat_locked(from, &ent))
         return SYS_ENOENT;
 
-    if (fat16_stat(to, &ent))
+    if (fat16_stat_locked(to, &ent))
         return SYS_EEXIST;
 
     return fat16_rename(from, to) ? 0 : SYS_EIO;
@@ -439,7 +439,7 @@ static i32 fatfs_sync(void)
     if (!fat16_mounted())
         return 0;
 
-    return fat16_sync() ? 0 : SYS_EIO;
+    return fat16_sync_locked() ? 0 : SYS_EIO;
 }
 
 static const struct vfs_fs fatfs = {

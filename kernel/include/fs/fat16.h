@@ -215,6 +215,17 @@ bool fat16_rename(const char *from, const char *to);
  * finished a batch. */
 bool fat16_sync(void);
 
+/* The same four calls, for callers already inside the filesystem subsystem
+ * and holding its lock - which in practice means fatfs, the VFS adapter that
+ * every path through a descriptor goes down. The public forms above take the
+ * lock, so calling one of those from in here would take it twice and panic.
+ * See kernel/include/fs/fslock.h. */
+bool fat16_stat_locked(const char *path, struct fat_dirent *out);
+i32 fat16_read_locked(const struct fat_dirent *file, u32 offset, void *buf,
+                      u32 len);
+bool fat16_readdir_locked(const char *path, u32 index, struct fat_dirent *out);
+bool fat16_sync_locked(void);
+
 /* How many clusters are free, and how many there are. Counted by scanning
  * the allocation table, so it is a real answer rather than a running total
  * that could drift away from the disk. */

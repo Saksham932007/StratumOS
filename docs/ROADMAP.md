@@ -393,40 +393,50 @@ online processor's is non-zero, and `cpus` prints the column. A summed count
 would be satisfied by one busy processor; four non-zero columns is the
 evidence that preemption is per-processor.
 
-This was the stated blocker for per-CPU run queues. What now gates *that* is
-not the scheduler: it is that no subsystem in this kernel is lock-protected -
-see the note under item 1.
+This was the stated blocker for per-CPU run queues. The locks that were the
+*other* blocker have since landed too - see below - which leaves the
+scheduler itself.
 
 ## Next
 
-### 1. Locks, and then per-CPU run queues
+### 1. Per-CPU run queues
 
 Every processor is brought up, runs kernel code, holds real spinlocks,
 services IPIs and - since the local APIC timer landed - preempts itself. The
 run queue is still the boot processor's, so the others idle.
 
-The scheduler half of this is bounded work: a run queue per processor,
-`current` and the idle task becoming per-CPU state in `struct cpu`, a
-reschedule IPI, and every scheduler invariant re-examined for two processors
-entering it at once.
+The subsystem locks that gated this are done. Six of the eight have landed,
+each at a level the machine checks: `pmm` (6), `vmm` (5), `heap` (4),
+`console` (7), `fs` (2, covering the descriptor tables, the VFS, FAT and the
+block layer) and `net` (3). The hierarchy, what the check caught, and the
+three places that now drop a lock around a sleep are all in
+[docs/SMP.md](SMP.md).
 
-What gates it is the other half, and it is larger. **No subsystem in this
-kernel is lock-protected.** The heap, the frame allocator, the VMM, the VFS,
-FAT, the ATA driver, the network stack and the console all assume a single
-thread of kernel execution and exclude only interrupts, by masking them.
-There are exactly three spinlocks in the kernel today and they guard TLB
-shootdown, a benchmark and a test. Two processors running tasks concurrently
-would corrupt the heap non-deterministically on the first `kmalloc`, and the
-symptom would be a fault somewhere unrelated, minutes later.
+What is left is the scheduler's own lock, and it is deliberately last because
+it is not separable from the change it enables. The run queue, the task
+table and `current` need protecting, but a scheduler lock cannot simply wrap
+`schedule()`: the context switch happens *inside* the critical section, so
+the lock is released by whichever task resumes rather than by the one that
+took it. `context_switch()` saves and restores EFLAGS with the task, so the
+interrupt flag travels with the task while `spinlock_t` keeps its saved flag
+in the lock - and those two facts have to be reconciled before a second
+processor can be let into the run queue at all.
 
-So the order is a lock per subsystem with a documented hierarchy first and
-the scheduler second - not the other way round, however much the scheduler
-looks like the feature. Roughly: `pmm`, `vmm` (with its two temporary mapping
-slots, which are a fixed resource that currently only asserts non-nesting),
-`heap`, `sched`, the descriptor table, `vfs`/`fat`/`ata`, `net`, `console`.
-The hazards are lock ordering, which wants a hierarchy checked rather than
-documented, and holding a lock across anything that can block - the ATA
-driver yields while it polls, and a spinlock is held with interrupts masked.
+So the remaining work is one piece, not two:
+
+- a `sched` lock at level 1, with the saved interrupt flag moved out of the
+  lock and into per-processor state so it survives a switch;
+- a run queue per processor, with `current` and the idle task becoming
+  per-CPU fields of `struct cpu`;
+- an idle task per processor rather than the adopted boot context;
+- a reschedule IPI, so a processor that makes a task runnable can prod the
+  processor that should run it;
+- task-to-processor ownership, and the balancing policy that follows from it.
+
+One hazard is already known and not yet addressed: the ATA driver busy-polls
+rather than yielding, so a disk read holds the filesystem lock with
+interrupts masked for the duration. That is correct but it is not kind, and
+interrupt-driven ATA is the fix rather than a lock change.
 
 ### 2. Interrupt-driven serial transmit
 

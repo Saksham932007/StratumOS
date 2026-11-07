@@ -6,6 +6,7 @@
 #include <kernel/syscall_abi.h>
 
 #include <net/net.h>
+#include <net/netlock.h>
 
 struct udp_hdr {
     be16 src_port;
@@ -48,12 +49,12 @@ static struct udp_binding *binding_for(u16 port)
     return NULL;
 }
 
-bool udp_port_bound(u16 port)
+static bool udp_port_bound_inner(u16 port)
 {
     return binding_for(port) != NULL;
 }
 
-bool udp_bind(u16 port)
+static bool udp_bind_inner(u16 port)
 {
     if (!port)
         return false;
@@ -77,7 +78,7 @@ bool udp_bind(u16 port)
     return false;
 }
 
-void udp_unbind(u16 port)
+static void udp_unbind_inner(u16 port)
 {
     struct udp_binding *b = binding_for(port);
 
@@ -85,7 +86,7 @@ void udp_unbind(u16 port)
         memset(b, 0, sizeof(*b));
 }
 
-u16 udp_bind_ephemeral(void)
+static u16 udp_bind_ephemeral_inner(void)
 {
     for (u32 tries = 0; tries < 16384; tries++) {
         u16 port = next_ephemeral++;
@@ -100,19 +101,19 @@ u16 udp_bind_ephemeral(void)
     return 0;
 }
 
-u32 udp_queued(u16 port)
+static u32 udp_queued_inner(u16 port)
 {
     struct udp_binding *b = binding_for(port);
 
     return b ? b->count : 0;
 }
 
-u32 udp_dropped(void)
+static u32 udp_dropped_inner(void)
 {
     return dropped;
 }
 
-i32 udp_recv(u16 port, struct udp_dgram *out)
+static i32 udp_recv_inner(u16 port, struct udp_dgram *out)
 {
     struct udp_binding *b = binding_for(port);
 
@@ -156,8 +157,8 @@ static bool enqueue(struct udp_binding *b, ipv4_addr src, u16 src_port,
     return true;
 }
 
-bool udp_send(ipv4_addr dst, u16 src_port, u16 dst_port, const void *payload,
-              size_t len)
+static bool udp_send_inner(ipv4_addr dst, u16 src_port, u16 dst_port,
+                           const void *payload, size_t len)
 {
     const struct net_config *cfg = net_get_config();
     struct net_frame f;
@@ -206,7 +207,8 @@ bool udp_send(ipv4_addr dst, u16 src_port, u16 dst_port, const void *payload,
     return true;
 }
 
-void udp_input(ipv4_addr src, ipv4_addr dst, const u8 *packet, size_t len)
+static void udp_input_inner(ipv4_addr src, ipv4_addr dst, const u8 *packet,
+                            size_t len)
 {
     const struct udp_hdr *h = (const struct udp_hdr *)packet;
     struct net_stats *s = net_stats();
@@ -278,7 +280,7 @@ void udp_input(ipv4_addr src, ipv4_addr dst, const u8 *packet, size_t len)
     udp_send(src, dst_port, src_port, payload, payload_len);
 }
 
-void udp_set_echo_port(u16 port)
+static void udp_set_echo_port_inner(u16 port)
 {
     /* A bound port and the echo service cannot share a number - see
      * udp_bind(). The echo port wins, because it is set at boot from the
@@ -288,12 +290,126 @@ void udp_set_echo_port(u16 port)
     echo_port = port;
 }
 
-u16 udp_echo_port(void)
+static u16 udp_echo_port_inner(void)
 {
     return echo_port;
 }
 
-const struct udp_last *udp_last_datagram(void)
+static const struct udp_last *udp_last_datagram_inner(void)
 {
     return &last;
+}
+
+/* ---------------------------------------------------------------------------
+ * The subsystem boundary.
+ *
+ * Everything above is the stack's internals; each public name below takes the
+ * network lock and calls it. The lock counts its depth, so an internal caller
+ * reaching one of these - socket_send() calling tcp_send() - is correct
+ * without having to know whether it is already inside the stack. See
+ * kernel/include/net/netlock.h for why this subsystem is the one that gets a
+ * recursive lock.
+ * ------------------------------------------------------------------------- */
+
+bool udp_port_bound(u16 port)
+{
+    net_lock();
+    bool ret = udp_port_bound_inner(port);
+
+    net_unlock();
+    return ret;
+}
+
+bool udp_bind(u16 port)
+{
+    net_lock();
+    bool ret = udp_bind_inner(port);
+
+    net_unlock();
+    return ret;
+}
+
+void udp_unbind(u16 port)
+{
+    net_lock();
+    udp_unbind_inner(port);
+    net_unlock();
+}
+
+u16 udp_bind_ephemeral(void)
+{
+    net_lock();
+    u16 ret = udp_bind_ephemeral_inner();
+
+    net_unlock();
+    return ret;
+}
+
+u32 udp_queued(u16 port)
+{
+    net_lock();
+    u32 ret = udp_queued_inner(port);
+
+    net_unlock();
+    return ret;
+}
+
+u32 udp_dropped(void)
+{
+    net_lock();
+    u32 ret = udp_dropped_inner();
+
+    net_unlock();
+    return ret;
+}
+
+i32 udp_recv(u16 port, struct udp_dgram *out)
+{
+    net_lock();
+    i32 ret = udp_recv_inner(port, out);
+
+    net_unlock();
+    return ret;
+}
+
+bool udp_send(ipv4_addr dst, u16 src_port, u16 dst_port, const void *payload,
+              size_t len)
+{
+    net_lock();
+    bool ret = udp_send_inner(dst, src_port, dst_port, payload, len);
+
+    net_unlock();
+    return ret;
+}
+
+void udp_input(ipv4_addr src, ipv4_addr dst, const u8 *packet, size_t len)
+{
+    net_lock();
+    udp_input_inner(src, dst, packet, len);
+    net_unlock();
+}
+
+void udp_set_echo_port(u16 port)
+{
+    net_lock();
+    udp_set_echo_port_inner(port);
+    net_unlock();
+}
+
+u16 udp_echo_port(void)
+{
+    net_lock();
+    u16 ret = udp_echo_port_inner();
+
+    net_unlock();
+    return ret;
+}
+
+const struct udp_last *udp_last_datagram(void)
+{
+    net_lock();
+    const struct udp_last *ret = udp_last_datagram_inner();
+
+    net_unlock();
+    return ret;
 }

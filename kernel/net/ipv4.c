@@ -7,6 +7,7 @@
 #include <kernel/string.h>
 
 #include <net/net.h>
+#include <net/netlock.h>
 
 struct ipv4_hdr {
     u8 version_ihl; /* 4 bits each */
@@ -74,17 +75,17 @@ static struct loopback_slot loopback_q[LOOPBACK_QUEUE_MAX];
 static u32 loopback_head, loopback_count;
 static struct loopback_stats loopback_stats;
 
-const struct loopback_stats *loopback_get_stats(void)
+static const struct loopback_stats *loopback_get_stats_inner(void)
 {
     return &loopback_stats;
 }
 
-u32 loopback_queued(void)
+static u32 loopback_queued_inner(void)
 {
     return loopback_count;
 }
 
-bool net_is_loopback(ipv4_addr ip)
+static bool net_is_loopback_inner(ipv4_addr ip)
 {
     const struct net_config *cfg = net_get_config();
 
@@ -123,7 +124,7 @@ static bool loopback_queue(ipv4_addr src, const u8 *packet, u32 len)
     return true;
 }
 
-u32 loopback_drain(void)
+static u32 loopback_drain_inner(void)
 {
     u32 done = 0;
 
@@ -154,7 +155,8 @@ u32 loopback_drain(void)
     return done;
 }
 
-bool ipv4_output_frame(struct net_frame *f, ipv4_addr dst, u8 proto)
+static bool ipv4_output_frame_inner(struct net_frame *f, ipv4_addr dst,
+                                    u8 proto)
 {
     const struct net_config *cfg = net_get_config();
     struct ipv4_hdr *h;
@@ -215,7 +217,8 @@ bool ipv4_output_frame(struct net_frame *f, ipv4_addr dst, u8 proto)
     return true;
 }
 
-bool ipv4_output_broadcast_frame(struct net_frame *f, ipv4_addr src, u8 proto)
+static bool ipv4_output_broadcast_frame_inner(struct net_frame *f,
+                                              ipv4_addr src, u8 proto)
 {
     struct ipv4_hdr *h;
     u32 payload_len = net_frame_len(f);
@@ -246,7 +249,8 @@ bool ipv4_output_broadcast_frame(struct net_frame *f, ipv4_addr src, u8 proto)
     return true;
 }
 
-bool ipv4_output(ipv4_addr dst, u8 proto, const void *payload, size_t len)
+static bool ipv4_output_inner(ipv4_addr dst, u8 proto, const void *payload,
+                              size_t len)
 {
     struct net_frame f;
     u8 *p;
@@ -264,7 +268,8 @@ bool ipv4_output(ipv4_addr dst, u8 proto, const void *payload, size_t len)
     return ipv4_output_frame(&f, dst, proto);
 }
 
-void ipv4_input(const struct mac_addr *from, const u8 *packet, size_t len)
+static void ipv4_input_inner(const struct mac_addr *from, const u8 *packet,
+                             size_t len)
 {
     const struct ipv4_hdr *h = (const struct ipv4_hdr *)packet;
     const struct net_config *cfg = net_get_config();
@@ -364,7 +369,8 @@ struct icmp_hdr {
 
 static struct icmp_reply last_reply;
 
-bool icmp_echo_request(ipv4_addr dst, u16 id, u16 seq, size_t payload_len)
+static bool icmp_echo_request_inner(ipv4_addr dst, u16 id, u16 seq,
+                                    size_t payload_len)
 {
     u8 buf[sizeof(struct icmp_hdr) + 64];
     struct icmp_hdr *h = (struct icmp_hdr *)buf;
@@ -395,7 +401,7 @@ bool icmp_echo_request(ipv4_addr dst, u16 id, u16 seq, size_t payload_len)
     return ipv4_output(dst, IPPROTO_ICMP, buf, total);
 }
 
-void icmp_input(ipv4_addr src, const u8 *packet, size_t len)
+static void icmp_input_inner(ipv4_addr src, const u8 *packet, size_t len)
 {
     const struct icmp_hdr *h = (const struct icmp_hdr *)packet;
     struct net_stats *s = net_stats();
@@ -460,12 +466,125 @@ void icmp_input(ipv4_addr src, const u8 *packet, size_t len)
         s->icmp_echo_replies_sent++;
 }
 
-const struct icmp_reply *icmp_last_reply(void)
+static const struct icmp_reply *icmp_last_reply_inner(void)
 {
     return &last_reply;
 }
 
-void icmp_clear_last_reply(void)
+static void icmp_clear_last_reply_inner(void)
 {
     memset(&last_reply, 0, sizeof(last_reply));
+}
+
+/* ---------------------------------------------------------------------------
+ * The subsystem boundary.
+ *
+ * Everything above is the stack's internals; each public name below takes the
+ * network lock and calls it. The lock counts its depth, so an internal caller
+ * reaching one of these - socket_send() calling tcp_send() - is correct
+ * without having to know whether it is already inside the stack. See
+ * kernel/include/net/netlock.h for why this subsystem is the one that gets a
+ * recursive lock.
+ * ------------------------------------------------------------------------- */
+
+const struct loopback_stats *loopback_get_stats(void)
+{
+    net_lock();
+    const struct loopback_stats *ret = loopback_get_stats_inner();
+
+    net_unlock();
+    return ret;
+}
+
+u32 loopback_queued(void)
+{
+    net_lock();
+    u32 ret = loopback_queued_inner();
+
+    net_unlock();
+    return ret;
+}
+
+bool net_is_loopback(ipv4_addr ip)
+{
+    net_lock();
+    bool ret = net_is_loopback_inner(ip);
+
+    net_unlock();
+    return ret;
+}
+
+u32 loopback_drain(void)
+{
+    net_lock();
+    u32 ret = loopback_drain_inner();
+
+    net_unlock();
+    return ret;
+}
+
+bool ipv4_output_frame(struct net_frame *f, ipv4_addr dst, u8 proto)
+{
+    net_lock();
+    bool ret = ipv4_output_frame_inner(f, dst, proto);
+
+    net_unlock();
+    return ret;
+}
+
+bool ipv4_output_broadcast_frame(struct net_frame *f, ipv4_addr src, u8 proto)
+{
+    net_lock();
+    bool ret = ipv4_output_broadcast_frame_inner(f, src, proto);
+
+    net_unlock();
+    return ret;
+}
+
+bool ipv4_output(ipv4_addr dst, u8 proto, const void *payload, size_t len)
+{
+    net_lock();
+    bool ret = ipv4_output_inner(dst, proto, payload, len);
+
+    net_unlock();
+    return ret;
+}
+
+void ipv4_input(const struct mac_addr *from, const u8 *packet, size_t len)
+{
+    net_lock();
+    ipv4_input_inner(from, packet, len);
+    net_unlock();
+}
+
+bool icmp_echo_request(ipv4_addr dst, u16 id, u16 seq, size_t payload_len)
+{
+    net_lock();
+    bool ret = icmp_echo_request_inner(dst, id, seq, payload_len);
+
+    net_unlock();
+    return ret;
+}
+
+void icmp_input(ipv4_addr src, const u8 *packet, size_t len)
+{
+    net_lock();
+    icmp_input_inner(src, packet, len);
+    net_unlock();
+}
+
+const struct icmp_reply *icmp_last_reply(void)
+{
+    net_lock();
+    const struct icmp_reply *ret = icmp_last_reply_inner();
+
+    net_unlock();
+    return ret;
+}
+
+void icmp_clear_last_reply(void)
+{
+    net_lock();
+    icmp_clear_last_reply_inner();
+    net_unlock();
 }

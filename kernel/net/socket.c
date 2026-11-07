@@ -9,9 +9,11 @@
 #include <kernel/string.h>
 #include <kernel/syscall_abi.h>
 
+#include <fs/fslock.h>
 #include <fs/vfs.h>
 #include <net/inet.h>
 #include <net/net.h>
+#include <net/netlock.h>
 #include <net/socket.h>
 
 /* How long a blocking call waits before giving up, when no timeout has been
@@ -51,8 +53,16 @@ static struct socket_stats stats;
 
 /* ---- the pool ----------------------------------------------------------- */
 
+/* The socket table is the one piece of shared state in this file, so it is
+ * the one place that locks. Everything else here is glue: it resolves a
+ * descriptor through the filesystem and then calls TCP or UDP, each of which
+ * takes the network lock itself. Holding the network lock across the
+ * descriptor calls would invert the hierarchy - the filesystem's lock is
+ * below it - and the check in spin_lock() says so, loudly. */
 static struct socket *sock_alloc(void)
 {
+    net_lock();
+
     for (u32 i = 0; i < SOCKET_MAX; i++) {
         if (!sockets[i].used) {
             memset(&sockets[i], 0, sizeof(sockets[i]));
@@ -60,15 +70,21 @@ static struct socket *sock_alloc(void)
             sockets[i].tcp_handle = -1;
             sockets[i].rcv_timeout_ms = SOCK_DEFAULT_TIMEOUT_MS;
             sockets[i].snd_timeout_ms = SOCK_DEFAULT_TIMEOUT_MS;
+            net_unlock();
             return &sockets[i];
         }
     }
 
+    net_unlock();
     return NULL;
 }
 
 static void sock_release(struct socket *s)
 {
+    /* The protocol teardown first, outside the table lock, because
+     * tcp_close() takes the network lock itself and this one is not
+     * recursive at this level - and because a socket being released is
+     * already unreachable through any descriptor. */
     if (s->type == SOCK_STREAM) {
         if (s->listening && s->local_port)
             tcp_unbind_listener(s->local_port);
@@ -78,11 +94,13 @@ static void sock_release(struct socket *s)
         udp_unbind(s->udp_port);
     }
 
+    net_lock();
     memset(s, 0, sizeof(*s));
     stats.closed++;
+    net_unlock();
 }
 
-u32 socket_count(void)
+static u32 socket_count_inner(void)
 {
     u32 n = 0;
 
@@ -93,7 +111,7 @@ u32 socket_count(void)
     return n;
 }
 
-const struct socket_stats *socket_get_stats(void)
+static const struct socket_stats *socket_get_stats_inner(void)
 {
     return &stats;
 }
@@ -134,7 +152,20 @@ static bool wait_for(bool (*ready)(struct socket *), struct socket *s,
         if (ready(s))
             return true;
 
+        /* The whole lock nest goes down for the sleep, network first and
+         * filesystem second - a release unwinds innermost-first. Sleeping
+         * holding either would be a deadlock dressed as a timeout: the
+         * segment being waited for arrives through this stack, and the
+         * network thread cannot deliver it while this task holds the lock.
+         * `ready` is re-tested after the window because that is precisely
+         * what the window allows to change. */
+        u32 net_depth = net_sleep_begin();
+        bool fs_held = fs_sleep_begin();
+
         task_sleep_ms(SOCK_POLL_MS);
+
+        fs_sleep_end(fs_held);
+        net_sleep_end(net_depth);
     }
 
     return ready(s);
@@ -404,7 +435,7 @@ static const struct vfs_ops socket_ops = {
 
 /* ---- the calls ---------------------------------------------------------- */
 
-void socket_init(void)
+static void socket_init_inner(void)
 {
     memset(sockets, 0, sizeof(sockets));
     memset(&stats, 0, sizeof(stats));
@@ -582,7 +613,15 @@ i32 socket_accept(i32 fd, struct sys_sockaddr *peer)
             h = tcp_accept(s->local_port);
             if (h != SYS_EAGAIN)
                 break;
+            /* As in wait_for(): the nest goes down for the sleep, or
+             * nothing can arrive to accept. */
+            u32 net_depth = net_sleep_begin();
+            bool fs_held = fs_sleep_begin();
+
             task_sleep_ms(SOCK_POLL_MS);
+
+            fs_sleep_end(fs_held);
+            net_sleep_end(net_depth);
         }
     }
 
@@ -893,7 +932,7 @@ i32 socket_getsockopt(i32 fd, int level, int name, u32 *out)
     }
 }
 
-bool socket_describe(u32 index, char *out, size_t outlen)
+static bool socket_describe_inner(u32 index, char *out, size_t outlen)
 {
     u32 seen = 0;
 
@@ -925,4 +964,49 @@ bool socket_describe(u32 index, char *out, size_t outlen)
     }
 
     return false;
+}
+
+/* ---------------------------------------------------------------------------
+ * The subsystem boundary.
+ *
+ * Everything above is the stack's internals; each public name below takes the
+ * network lock and calls it. The lock counts its depth, so an internal caller
+ * reaching one of these - socket_send() calling tcp_send() - is correct
+ * without having to know whether it is already inside the stack. See
+ * kernel/include/net/netlock.h for why this subsystem is the one that gets a
+ * recursive lock.
+ * ------------------------------------------------------------------------- */
+
+u32 socket_count(void)
+{
+    net_lock();
+    u32 ret = socket_count_inner();
+
+    net_unlock();
+    return ret;
+}
+
+const struct socket_stats *socket_get_stats(void)
+{
+    net_lock();
+    const struct socket_stats *ret = socket_get_stats_inner();
+
+    net_unlock();
+    return ret;
+}
+
+void socket_init(void)
+{
+    net_lock();
+    socket_init_inner();
+    net_unlock();
+}
+
+bool socket_describe(u32 index, char *out, size_t outlen)
+{
+    net_lock();
+    bool ret = socket_describe_inner(index, out, outlen);
+
+    net_unlock();
+    return ret;
 }

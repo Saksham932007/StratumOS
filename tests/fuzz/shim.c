@@ -13,6 +13,7 @@
 #include <kernel/layout.h>
 #include <kernel/log.h>
 #include <kernel/panic.h>
+#include <kernel/spinlock.h>
 #include <kernel/types.h>
 
 #include <mm/heap.h>
@@ -67,6 +68,16 @@ void console_write(const char *s, size_t n)
 {
     if (log_wanted())
         fwrite(s, 1, n, stderr);
+}
+
+bool console_begin(void)
+{
+    return false;
+}
+
+void console_end(bool owned)
+{
+    (void)owned;
 }
 
 void console_puts(const char *s)
@@ -410,6 +421,67 @@ bool blockdev_read(const struct blockdev *dev, u64 offset, u32 count, void *buf)
 
     memcpy(buf, disk_data + offset * BLOCK_SIZE, (size_t)count * BLOCK_SIZE);
     return true;
+}
+
+bool blockdev_read_locked(const struct blockdev *dev, u64 offset, u32 count,
+                          void *buf)
+{
+    /* Inside the kernel these differ by whether they take the filesystem
+     * lock. Here there is one thread and no lock, so they are the same
+     * function. */
+    return blockdev_read(dev, offset, count, buf);
+}
+
+/* ---- locks, which have nothing to exclude here -------------------------- */
+
+/* The fuzz targets are single-threaded host processes. The kernel files they
+ * link - the heap, FAT16 - take their subsystem's lock, so the primitives
+ * have to exist; what they must not do is anything, since there is no second
+ * processor and no interrupt to shut out. Making them real would also make
+ * the fuzzer slower for no coverage.
+ *
+ * They are not no-ops *entirely*: the holder bookkeeping is kept, so that a
+ * double release or a lock left held still shows up as a crash rather than
+ * being silently accepted. */
+void spin_lock(spinlock_t *lock)
+{
+    if (lock->locked)
+        panic("fuzz shim: recursive acquisition of '%s'",
+              lock->name ? lock->name : "(unnamed)");
+    lock->locked = 1;
+    lock->acquisitions++;
+}
+
+void spin_unlock(spinlock_t *lock)
+{
+    if (!lock->locked)
+        panic("fuzz shim: release of '%s', which is not held",
+              lock->name ? lock->name : "(unnamed)");
+    lock->locked = 0;
+}
+
+bool spin_trylock(spinlock_t *lock)
+{
+    if (lock->locked)
+        return false;
+    lock->locked = 1;
+    lock->acquisitions++;
+    return true;
+}
+
+bool spin_is_locked(const spinlock_t *lock)
+{
+    return lock->locked != 0;
+}
+
+bool spin_held_by_self(const spinlock_t *lock)
+{
+    return lock->locked != 0;
+}
+
+u8 spin_level_held(void)
+{
+    return 0;
 }
 
 /* ---- physical memory, for the ACPI target ------------------------------ */

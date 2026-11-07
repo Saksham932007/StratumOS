@@ -33,6 +33,7 @@
 #include <kernel/log.h>
 #include <kernel/string.h>
 
+#include <fs/fslock.h>
 #include <fs/vfs.h>
 
 /* Which device an open file is. Stored in ->priv as a small integer rather
@@ -74,7 +75,17 @@ static i32 console_dev_read(struct vfs_file *f, void *buf, u32 len)
          * delivered as its raw value; a program that does not understand one
          * sees a byte it can ignore, which is better than the driver
          * deciding to drop it. */
+        /* The filesystem lock goes down for the wait. Blocking here with it
+         * held would make the whole filesystem unavailable to every other
+         * processor until somebody pressed a key - and yielding takes the
+         * scheduler's lock, which is below this one and would trip the
+         * hierarchy check. Nothing read before the window is relied on
+         * after it; the next thing this does is read the keyboard ring,
+         * which excludes its interrupt by masking. */
+        bool released = fs_sleep_begin();
         int c = keyboard_getchar();
+
+        fs_sleep_end(released);
 
         if (c < 0)
             return 0;

@@ -50,9 +50,11 @@
 
 #include <fs/blockdev.h>
 #include <fs/fat16.h>
+#include <fs/fslock.h>
 #include <fs/vfs.h>
 #include <net/inet.h>
 #include <net/net.h>
+#include <net/netlock.h>
 #include <net/socket.h>
 
 void ktest_check(struct ktest_result *r, bool ok, const char *what)
@@ -1895,6 +1897,66 @@ static void test_smp(struct ktest_result *r)
     KT_ASSERT(r, !spin_held_by_self(&low));
     spin_unlock(&high);
     KT_ASSERT(r, !spin_held_by_self(&high));
+
+    /* --- the two subsystem locks with a shape of their own ---------------- */
+
+    /* The filesystem's lock, then the network's, which is the order a read
+     * from a socket descriptor uses: the VFS takes its lock at the boundary
+     * and the socket's backend then calls TCP. */
+    KT_ASSERT(r, !fs_lock_held());
+    fs_lock();
+    KT_ASSERT(r, fs_lock_held());
+    KT_EQ(r, (u32)spin_level_held(), (u32)LOCK_LEVEL_FS);
+
+    KT_ASSERT(r, !net_lock_held());
+    net_lock();
+    KT_ASSERT(r, net_lock_held());
+    KT_EQ(r, (u32)spin_level_held(), (u32)LOCK_LEVEL_NET);
+
+    /* The network lock is the one that counts its depth - see
+     * kernel/include/net/netlock.h for why it is the exception. A second
+     * acquisition must succeed, must not change the recorded level, and must
+     * leave the lock held after one release. */
+    net_lock();
+    KT_EQ(r, (u32)spin_level_held(), (u32)LOCK_LEVEL_NET);
+    net_unlock();
+    KT_ASSERT(r, net_lock_held());
+
+    /* The sleep window drops the whole nest and puts it back. This is what a
+     * blocking socket receive does, and getting the depth wrong would leave
+     * the stack locked for the rest of the machine's life. */
+    u32 net_depth = net_sleep_begin();
+
+    KT_EQ(r, net_depth, 1u);
+    KT_ASSERT(r, !net_lock_held());
+    KT_ASSERT(r, fs_lock_held());
+
+    bool fs_held = fs_sleep_begin();
+
+    KT_ASSERT(r, fs_held);
+    KT_ASSERT(r, !fs_lock_held());
+    KT_EQ(r, (u32)spin_level_held(), (u32)outer);
+
+    /* Interrupts are on inside the window, which is the whole point of
+     * opening one: this is where a task would sleep. */
+    KT_ASSERT(r, irq_enabled());
+
+    fs_sleep_end(fs_held);
+    net_sleep_end(net_depth);
+    KT_ASSERT(r, fs_lock_held());
+    KT_ASSERT(r, net_lock_held());
+    KT_EQ(r, (u32)spin_level_held(), (u32)LOCK_LEVEL_NET);
+
+    net_unlock();
+    fs_unlock();
+    KT_ASSERT(r, !fs_lock_held());
+    KT_ASSERT(r, !net_lock_held());
+    KT_EQ(r, (u32)spin_level_held(), (u32)outer);
+
+    /* And outside a lock the windows are no-ops rather than a release of
+     * something nobody holds. */
+    KT_EQ(r, net_sleep_begin(), 0u);
+    KT_ASSERT(r, !fs_sleep_begin());
 
     /* --- inter-processor interrupts --------------------------------------- */
     struct smp_stats ss;

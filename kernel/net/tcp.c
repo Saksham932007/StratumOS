@@ -126,6 +126,7 @@
 #include <kernel/syscall_abi.h>
 
 #include <net/net.h>
+#include <net/netlock.h>
 
 #define TCP_FIN         0x01u
 #define TCP_SYN         0x02u
@@ -472,7 +473,7 @@ static bool port_in_use(u16 port)
     return false;
 }
 
-u16 tcp_ephemeral_port(void)
+static u16 tcp_ephemeral_port_inner(void)
 {
     /* A linear sweep of the ephemeral range, starting where the last one
      * left off. Sequential rather than random, which is the easier thing to
@@ -875,7 +876,7 @@ static u32 deliver(struct tcb *t, const u8 *data, u32 len)
     return taken;
 }
 
-void tcp_input(ipv4_addr src, const u8 *packet, size_t len)
+static void tcp_input_inner(ipv4_addr src, const u8 *packet, size_t len)
 {
     const struct tcp_hdr *h = (const struct tcp_hdr *)packet;
     const struct net_config *cfg = net_get_config();
@@ -1274,7 +1275,7 @@ static void tick_one(struct tcb *t, u64 now)
         send_segment(t, t->snd_nxt, TCP_ACK, NULL, 0, false);
 }
 
-void tcp_tick(void)
+static void tcp_tick_inner(void)
 {
     u64 now = timer_ms();
 
@@ -1285,7 +1286,7 @@ void tcp_tick(void)
 
 /* ---- the echo service -------------------------------------------------- */
 
-void tcp_listen(u16 port)
+static void tcp_listen_inner(u16 port)
 {
     listen_port = port;
 
@@ -1300,14 +1301,14 @@ void tcp_listen(u16 port)
         pr_info("listening on port %u; it echoes what it receives", port);
 }
 
-u16 tcp_listen_port(void)
+static u16 tcp_listen_port_inner(void)
 {
     return listen_port;
 }
 
 /* ---- passive opens for the socket layer -------------------------------- */
 
-bool tcp_bind_listener(u16 port)
+static bool tcp_bind_listener_inner(u16 port)
 {
     if (!port)
         return false;
@@ -1324,14 +1325,14 @@ bool tcp_bind_listener(u16 port)
     return false;
 }
 
-void tcp_unbind_listener(u16 port)
+static void tcp_unbind_listener_inner(u16 port)
 {
     for (u32 i = 0; i < TCP_LISTENERS_MAX; i++)
         if (listeners[i] == port)
             listeners[i] = 0;
 }
 
-int tcp_accept(u16 port)
+static int tcp_accept_inner(u16 port)
 {
     for (u32 i = 0; i < TCP_MAX_CONNS; i++) {
         struct tcb *t = &conns[i];
@@ -1350,7 +1351,7 @@ int tcp_accept(u16 port)
 
 /* ---- active opens ------------------------------------------------------- */
 
-int tcp_connect(ipv4_addr dst, u16 port, u16 local_port)
+static int tcp_connect_inner(ipv4_addr dst, u16 port, u16 local_port)
 {
     if (!port)
         return SYS_EINVAL;
@@ -1422,14 +1423,14 @@ int tcp_connect(ipv4_addr dst, u16 port, u16 local_port)
 
 /* ---- the connection API ------------------------------------------------- */
 
-enum tcp_state tcp_handle_state(int handle)
+static enum tcp_state tcp_handle_state_inner(int handle)
 {
     struct tcb *t = tcb_of(handle);
 
     return t ? t->state : TCP_CLOSED;
 }
 
-i32 tcp_send(int handle, const void *buf, u32 len)
+static i32 tcp_send_inner(int handle, const void *buf, u32 len)
 {
     struct tcb *t = tcb_of(handle);
 
@@ -1454,7 +1455,7 @@ i32 tcp_send(int handle, const void *buf, u32 len)
     return (i32)taken;
 }
 
-i32 tcp_recv(int handle, void *buf, u32 len)
+static i32 tcp_recv_inner(int handle, void *buf, u32 len)
 {
     struct tcb *t = tcb_of(handle);
 
@@ -1484,14 +1485,14 @@ i32 tcp_recv(int handle, void *buf, u32 len)
     return (i32)take;
 }
 
-u32 tcp_recv_available(int handle)
+static u32 tcp_recv_available_inner(int handle)
 {
     struct tcb *t = tcb_of(handle);
 
     return t ? t->rcv_len : 0;
 }
 
-bool tcp_recv_eof(int handle)
+static bool tcp_recv_eof_inner(int handle)
 {
     struct tcb *t = tcb_of(handle);
 
@@ -1501,7 +1502,7 @@ bool tcp_recv_eof(int handle)
     return t->rcv_len == 0 && (t->rcv_eof || t->state == TCP_CLOSED);
 }
 
-u32 tcp_send_room(int handle)
+static u32 tcp_send_room_inner(int handle)
 {
     struct tcb *t = tcb_of(handle);
 
@@ -1513,7 +1514,7 @@ u32 tcp_send_room(int handle)
     return TCP_SNDBUF - t->snd_len;
 }
 
-void tcp_shutdown(int handle)
+static void tcp_shutdown_inner(int handle)
 {
     struct tcb *t = tcb_of(handle);
 
@@ -1538,7 +1539,7 @@ void tcp_shutdown(int handle)
     }
 }
 
-void tcp_close(int handle)
+static void tcp_close_inner(int handle)
 {
     struct tcb *t = tcb_of(handle);
 
@@ -1557,7 +1558,7 @@ void tcp_close(int handle)
         tcb_free(t);
 }
 
-void tcp_abort(int handle)
+static void tcp_abort_inner(int handle)
 {
     struct tcb *t = tcb_of(handle);
 
@@ -1603,7 +1604,7 @@ static void fill_status(const struct tcb *t, struct tcp_status *out)
     out->in_recovery = t->in_recovery;
 }
 
-bool tcp_get_status_at(int handle, struct tcp_status *out)
+static bool tcp_get_status_at_inner(int handle, struct tcp_status *out)
 {
     struct tcb *t = tcb_of(handle);
 
@@ -1614,7 +1615,7 @@ bool tcp_get_status_at(int handle, struct tcp_status *out)
     return true;
 }
 
-void tcp_get_status(struct tcp_status *out)
+static void tcp_get_status_inner(struct tcp_status *out)
 {
     /* The first live connection, which is what the shell reports. When there
      * is none, the answer is the listener's: LISTEN on the echo port, or
@@ -1635,4 +1636,179 @@ void tcp_get_status(struct tcp_status *out)
     out->cwnd = TCP_INIT_CWND;
     out->ssthresh = TCP_INIT_SSTHRESH;
     out->rto_ms = TCP_RTO_INITIAL_MS;
+}
+
+/* ---------------------------------------------------------------------------
+ * The subsystem boundary.
+ *
+ * Everything above is the stack's internals; each public name below takes the
+ * network lock and calls it. The lock counts its depth, so an internal caller
+ * reaching one of these - socket_send() calling tcp_send() - is correct
+ * without having to know whether it is already inside the stack. See
+ * kernel/include/net/netlock.h for why this subsystem is the one that gets a
+ * recursive lock.
+ * ------------------------------------------------------------------------- */
+
+u16 tcp_ephemeral_port(void)
+{
+    net_lock();
+    u16 ret = tcp_ephemeral_port_inner();
+
+    net_unlock();
+    return ret;
+}
+
+void tcp_input(ipv4_addr src, const u8 *packet, size_t len)
+{
+    net_lock();
+    tcp_input_inner(src, packet, len);
+    net_unlock();
+}
+
+void tcp_tick(void)
+{
+    net_lock();
+    tcp_tick_inner();
+    net_unlock();
+}
+
+void tcp_listen(u16 port)
+{
+    net_lock();
+    tcp_listen_inner(port);
+    net_unlock();
+}
+
+u16 tcp_listen_port(void)
+{
+    net_lock();
+    u16 ret = tcp_listen_port_inner();
+
+    net_unlock();
+    return ret;
+}
+
+bool tcp_bind_listener(u16 port)
+{
+    net_lock();
+    bool ret = tcp_bind_listener_inner(port);
+
+    net_unlock();
+    return ret;
+}
+
+void tcp_unbind_listener(u16 port)
+{
+    net_lock();
+    tcp_unbind_listener_inner(port);
+    net_unlock();
+}
+
+int tcp_accept(u16 port)
+{
+    net_lock();
+    int ret = tcp_accept_inner(port);
+
+    net_unlock();
+    return ret;
+}
+
+int tcp_connect(ipv4_addr dst, u16 port, u16 local_port)
+{
+    net_lock();
+    int ret = tcp_connect_inner(dst, port, local_port);
+
+    net_unlock();
+    return ret;
+}
+
+enum tcp_state tcp_handle_state(int handle)
+{
+    net_lock();
+    enum tcp_state ret = tcp_handle_state_inner(handle);
+
+    net_unlock();
+    return ret;
+}
+
+i32 tcp_send(int handle, const void *buf, u32 len)
+{
+    net_lock();
+    i32 ret = tcp_send_inner(handle, buf, len);
+
+    net_unlock();
+    return ret;
+}
+
+i32 tcp_recv(int handle, void *buf, u32 len)
+{
+    net_lock();
+    i32 ret = tcp_recv_inner(handle, buf, len);
+
+    net_unlock();
+    return ret;
+}
+
+u32 tcp_recv_available(int handle)
+{
+    net_lock();
+    u32 ret = tcp_recv_available_inner(handle);
+
+    net_unlock();
+    return ret;
+}
+
+bool tcp_recv_eof(int handle)
+{
+    net_lock();
+    bool ret = tcp_recv_eof_inner(handle);
+
+    net_unlock();
+    return ret;
+}
+
+u32 tcp_send_room(int handle)
+{
+    net_lock();
+    u32 ret = tcp_send_room_inner(handle);
+
+    net_unlock();
+    return ret;
+}
+
+void tcp_shutdown(int handle)
+{
+    net_lock();
+    tcp_shutdown_inner(handle);
+    net_unlock();
+}
+
+void tcp_close(int handle)
+{
+    net_lock();
+    tcp_close_inner(handle);
+    net_unlock();
+}
+
+void tcp_abort(int handle)
+{
+    net_lock();
+    tcp_abort_inner(handle);
+    net_unlock();
+}
+
+bool tcp_get_status_at(int handle, struct tcp_status *out)
+{
+    net_lock();
+    bool ret = tcp_get_status_at_inner(handle, out);
+
+    net_unlock();
+    return ret;
+}
+
+void tcp_get_status(struct tcp_status *out)
+{
+    net_lock();
+    tcp_get_status_inner(out);
+    net_unlock();
 }

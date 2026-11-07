@@ -48,6 +48,7 @@
 
 #include <net/inet.h>
 #include <net/net.h>
+#include <net/netlock.h>
 
 #define DHCP_SERVER_PORT 67
 #define DHCP_CLIENT_PORT 68
@@ -150,12 +151,12 @@ const char *dhcp_state_name(enum dhcp_state s)
     return "?";
 }
 
-enum dhcp_state dhcp_state(void)
+static enum dhcp_state dhcp_state_inner(void)
 {
     return state;
 }
 
-const struct dhcp_lease *dhcp_get_lease(void)
+static const struct dhcp_lease *dhcp_get_lease_inner(void)
 {
     return &lease;
 }
@@ -378,7 +379,7 @@ static void fail(const char *why)
     port_bound = false;
 }
 
-bool dhcp_start(void)
+static bool dhcp_start_inner(void)
 {
     if (!net_up()) {
         pr_warn("no link; not starting");
@@ -528,7 +529,7 @@ static void handle(const struct udp_dgram *d)
     }
 }
 
-void dhcp_tick(void)
+static void dhcp_tick_inner(void)
 {
     if (state != DHCP_DISCOVERING && state != DHCP_REQUESTING)
         return;
@@ -562,4 +563,49 @@ void dhcp_tick(void)
         send_msg(DHCPREQUEST, offer.addr, offer.server);
         lease.requests_sent++;
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * The subsystem boundary.
+ *
+ * Everything above is the stack's internals; each public name below takes the
+ * network lock and calls it. The lock counts its depth, so an internal caller
+ * reaching one of these - socket_send() calling tcp_send() - is correct
+ * without having to know whether it is already inside the stack. See
+ * kernel/include/net/netlock.h for why this subsystem is the one that gets a
+ * recursive lock.
+ * ------------------------------------------------------------------------- */
+
+enum dhcp_state dhcp_state(void)
+{
+    net_lock();
+    enum dhcp_state ret = dhcp_state_inner();
+
+    net_unlock();
+    return ret;
+}
+
+const struct dhcp_lease *dhcp_get_lease(void)
+{
+    net_lock();
+    const struct dhcp_lease *ret = dhcp_get_lease_inner();
+
+    net_unlock();
+    return ret;
+}
+
+bool dhcp_start(void)
+{
+    net_lock();
+    bool ret = dhcp_start_inner();
+
+    net_unlock();
+    return ret;
+}
+
+void dhcp_tick(void)
+{
+    net_lock();
+    dhcp_tick_inner();
+    net_unlock();
 }

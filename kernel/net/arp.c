@@ -12,6 +12,7 @@
 #include <kernel/string.h>
 
 #include <net/net.h>
+#include <net/netlock.h>
 
 #define ARP_HTYPE_ETHERNET 1
 #define ARP_OP_REQUEST     1
@@ -125,12 +126,12 @@ static bool send(u16 op, const struct mac_addr *target_mac, ipv4_addr target_ip)
     return true;
 }
 
-bool arp_request(ipv4_addr ip)
+static bool arp_request_inner(ipv4_addr ip)
 {
     return send(ARP_OP_REQUEST, &mac_broadcast, ip);
 }
 
-bool arp_resolve(ipv4_addr ip, struct mac_addr *out)
+static bool arp_resolve_inner(ipv4_addr ip, struct mac_addr *out)
 {
     /* Anything not on our own link is reached through the gateway, so it is
      * the gateway's MAC that has to be resolved. Doing this here rather than
@@ -147,7 +148,8 @@ bool arp_resolve(ipv4_addr ip, struct mac_addr *out)
     return false;
 }
 
-void arp_input(const struct mac_addr *from, const u8 *packet, size_t len)
+static void arp_input_inner(const struct mac_addr *from, const u8 *packet,
+                            size_t len)
 {
     const struct arp_packet *p = (const struct arp_packet *)packet;
     const struct net_config *cfg = net_get_config();
@@ -196,7 +198,7 @@ void arp_input(const struct mac_addr *from, const u8 *packet, size_t len)
     send(ARP_OP_REPLY, &p->sender_mac, p->sender_ip);
 }
 
-u32 arp_cache_count(void)
+static u32 arp_cache_count_inner(void)
 {
     u32 n = 0;
 
@@ -207,7 +209,7 @@ u32 arp_cache_count(void)
     return n;
 }
 
-const struct arp_entry *arp_cache_at(u32 index)
+static const struct arp_entry *arp_cache_at_inner(u32 index)
 {
     u32 n = 0;
 
@@ -221,7 +223,68 @@ const struct arp_entry *arp_cache_at(u32 index)
     return NULL;
 }
 
-void arp_cache_clear(void)
+static void arp_cache_clear_inner(void)
 {
     memset(cache, 0, sizeof(cache));
+}
+
+/* ---------------------------------------------------------------------------
+ * The subsystem boundary.
+ *
+ * Everything above is the stack's internals; each public name below takes the
+ * network lock and calls it. The lock counts its depth, so an internal caller
+ * reaching one of these - socket_send() calling tcp_send() - is correct
+ * without having to know whether it is already inside the stack. See
+ * kernel/include/net/netlock.h for why this subsystem is the one that gets a
+ * recursive lock.
+ * ------------------------------------------------------------------------- */
+
+bool arp_request(ipv4_addr ip)
+{
+    net_lock();
+    bool ret = arp_request_inner(ip);
+
+    net_unlock();
+    return ret;
+}
+
+bool arp_resolve(ipv4_addr ip, struct mac_addr *out)
+{
+    net_lock();
+    bool ret = arp_resolve_inner(ip, out);
+
+    net_unlock();
+    return ret;
+}
+
+void arp_input(const struct mac_addr *from, const u8 *packet, size_t len)
+{
+    net_lock();
+    arp_input_inner(from, packet, len);
+    net_unlock();
+}
+
+u32 arp_cache_count(void)
+{
+    net_lock();
+    u32 ret = arp_cache_count_inner();
+
+    net_unlock();
+    return ret;
+}
+
+const struct arp_entry *arp_cache_at(u32 index)
+{
+    net_lock();
+    const struct arp_entry *ret = arp_cache_at_inner(index);
+
+    net_unlock();
+    return ret;
+}
+
+void arp_cache_clear(void)
+{
+    net_lock();
+    arp_cache_clear_inner();
+    net_unlock();
 }

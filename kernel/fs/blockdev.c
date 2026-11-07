@@ -21,6 +21,7 @@
 #include <kernel/string.h>
 
 #include <fs/blockdev.h>
+#include <fs/fslock.h>
 
 #define MBR_PARTITION_OFFSET 446
 #define MBR_SIGNATURE_OFFSET 510
@@ -80,7 +81,8 @@ const struct blockdev *blockdev_first_fs(void)
     return NULL;
 }
 
-bool blockdev_read(const struct blockdev *dev, u64 offset, u32 count, void *buf)
+bool blockdev_read_locked(const struct blockdev *dev, u64 offset, u32 count,
+                          void *buf)
 {
     if (!dev || !dev->present) {
         pr_err("read from a device that is not present");
@@ -214,7 +216,7 @@ static void scan_drive(u32 index)
     }
 }
 
-void blockdev_init(void)
+static void blockdev_init_locked(void)
 {
     memset(devices, 0, sizeof(devices));
     device_count = 0;
@@ -224,4 +226,27 @@ void blockdev_init(void)
 
     if (device_count == 0)
         pr_info("no block devices");
+}
+
+/* ---------------------------------------------------------------------------
+ * The subsystem boundary. blockdev_read() is called both from inside the
+ * filesystem - FAT16's sector cache - and from outside it, by the shell's
+ * disk commands, so it exists twice. The accessors above read a table built
+ * once by blockdev_init() and never changed, so they need no lock.
+ * ------------------------------------------------------------------------- */
+
+bool blockdev_read(const struct blockdev *dev, u64 offset, u32 count, void *buf)
+{
+    fs_lock();
+    bool ret = blockdev_read_locked(dev, offset, count, buf);
+
+    fs_unlock();
+    return ret;
+}
+
+void blockdev_init(void)
+{
+    fs_lock();
+    blockdev_init_locked();
+    fs_unlock();
 }

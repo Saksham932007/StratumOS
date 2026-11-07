@@ -350,6 +350,18 @@ other's `_locked` form directly. It is more lines than a recursive lock would
 be, and it is the right trade: a recursive lock would make all of this
 compile and hide exactly the nesting the hierarchy check exists to find.
 
+The network stack is the one exception, and it is a considered one. There are
+some ninety entry points into it — the shell drives ARP, ICMP, UDP, TCP, DNS
+and HTTP directly, and the socket layer drives the same functions from a
+system call — and they call each other freely. Ninety duplicated functions
+would be ninety chances to call the wrong one, which is a worse bug than the
+one the discipline prevents. So `net_lock()` counts its depth, and an entry
+point is correct whether it was reached from inside the stack or outside it.
+The ordering guarantee is unaffected: the level is recorded on the outermost
+acquisition only, so the network lock is still required to be taken between
+the filesystem's and the heap's. Nothing else in the kernel gets this, which
+is why it is written down here rather than left to be discovered.
+
 Two callers are deliberately not wrappers:
 
 - **The page-fault handler** takes the VMM lock itself, around the
@@ -367,6 +379,75 @@ Two callers are deliberately not wrappers:
 the per-character sink take it 80 times, because per-character atomicity lets
 two processors interleave a line character by character, which is worse than
 useless.
+
+### What the check found on its first day
+
+The hierarchy was not a formality. Within minutes of the filesystem and the
+network stack going behind locks, the kernel refused to boot:
+
+```
+cpu 0 tried to acquire lock 'fs' at level 2 while already holding level 3;
+that inverts the lock hierarchy and would deadlock against a processor doing
+it the other way round
+
+  [0] level_enter+0x67
+  [1] fs_lock+0x12
+  [2] fd_table_init+0x11
+  [3] task_create+0x163
+  [4] net_start+0x2f
+```
+
+`net_start()` creates the network thread, creating a task allocates a
+descriptor table, and allocating a descriptor table is filesystem work. The
+network lock was being held across it for no reason at all — `net_start()`
+runs once, at boot, before there is a second thread to exclude.
+
+The second finding was structural rather than incidental, and worth more. The
+socket layer looks like part of the network stack and is not: it is glue
+between two subsystems. `socket_create()` allocates a socket, then an open
+file, then a descriptor — net, then fs, then fs. `sock_read()`, the VFS
+operation, runs the other way round: the filesystem took its lock at the
+boundary and now calls TCP. Both orders are natural and together they are a
+cycle, which is exactly the shape of bug a hierarchy exists to make
+impossible.
+
+So the socket layer holds no lock of its own. It resolves a descriptor
+through the filesystem, which locks, and then calls TCP or UDP, which lock;
+the only state that is actually its own is the socket table, and that is
+locked in the three functions that touch it. The cycle disappears because
+nothing holds both locks at once.
+
+Neither of these would have been found by testing. The kernel boots on one
+processor either way, and on four it boots too — the window is a handful of
+instructions wide. They were found because the machine was asked to check an
+invariant rather than a behaviour.
+
+### Sleeping with a lock held, which is to say not doing that
+
+A lock that masks interrupts must not be held across anything that blocks.
+Three paths in this kernel do block, and each is a case where the obvious
+code is wrong:
+
+- A **blocking console read** reaches `keyboard_getchar()` from inside
+  `vfs_read()`, with the filesystem lock held. It would wait for a keystroke
+  with the whole filesystem shut to every other processor — and `sched_yield()`
+  takes the scheduler's lock, which is below the filesystem's, so the check
+  would catch it first.
+- A **blocking socket receive** sleeps waiting for a segment that arrives
+  *through the stack it has locked*. That is not a performance problem, it is
+  a deadlock that presents as a timeout.
+- A **blocking accept** is the same, one layer up.
+
+Each drops its locks around the sleep, innermost first, and takes them again
+in hierarchy order after — `fs_sleep_begin()`/`fs_sleep_end()` and
+`net_sleep_begin()`/`net_sleep_end()`. The network pair returns the *depth*,
+not a flag, because that lock counts; the filesystem pair returns whether it
+actually released, because a caller may not have held it.
+
+What a sleep window costs is the invariant the lock was providing: anything
+read before it must be read again after. In all three cases the code already
+re-tests its condition in a loop, which is why these were the right places
+to open one.
 
 ### What locking did to the profiler
 

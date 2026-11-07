@@ -49,6 +49,13 @@ const struct blockdev *blockdev_find(const char *name);
 bool blockdev_read(const struct blockdev *dev, u64 offset, u32 count,
                    void *buf);
 
+/* The same read, for callers already inside the filesystem subsystem and
+ * holding its lock - FAT16's sector cache, which reaches the disk on behalf
+ * of a vfs_read() that took the lock at the boundary. See
+ * kernel/include/fs/fslock.h. */
+bool blockdev_read_locked(const struct blockdev *dev, u64 offset, u32 count,
+                          void *buf);
+
 /* Write `count` blocks at `offset` within this device, bounds-checked the
  * same way - which matters more on this side, because a write that escapes a
  * partition destroys what is next on the disk rather than merely reading it.

@@ -24,6 +24,7 @@
 
 #include <fs/blockdev.h>
 #include <fs/fat16.h>
+#include <fs/fslock.h>
 
 /* Cluster numbers with a meaning rather than a location. */
 #define FAT_FREE          0x0000
@@ -151,7 +152,7 @@ static bool read_sector(enum cache_slot slot, u64 lba, const u8 **out)
         return true;
     }
 
-    if (!blockdev_read(device, lba, 1, cache[slot])) {
+    if (!blockdev_read_locked(device, lba, 1, cache[slot])) {
         cache_valid[slot] = false;
         return false;
     }
@@ -180,7 +181,7 @@ const char *fat16_device_name(void)
 
 /* ---- mounting ---------------------------------------------------------- */
 
-bool fat16_mount(const struct blockdev *dev)
+static bool fat16_mount_locked(const struct blockdev *dev)
 {
     if (!dev) {
         pr_err("mount: no device");
@@ -194,7 +195,7 @@ bool fat16_mount(const struct blockdev *dev)
 
     u8 sector[BLOCK_SIZE];
 
-    if (!blockdev_read(dev, 0, 1, sector)) {
+    if (!blockdev_read_locked(dev, 0, 1, sector)) {
         pr_err("mount %s: cannot read the boot sector", dev->name);
         return false;
     }
@@ -596,7 +597,7 @@ static bool lookup_in(u16 dir_cluster, const char *name, struct fat_dirent *out)
  * has cluster number 0 rather than a real one - so it gets a synthetic entry
  * here, and everything downstream can treat it like any other directory.
  */
-bool fat16_stat(const char *path, struct fat_dirent *out)
+bool fat16_stat_locked(const char *path, struct fat_dirent *out)
 {
     if (!info.mounted || !path || !out)
         return false;
@@ -652,7 +653,8 @@ bool fat16_stat(const char *path, struct fat_dirent *out)
 
 /* ---- reading ----------------------------------------------------------- */
 
-i32 fat16_read(const struct fat_dirent *file, u32 offset, void *buf, u32 len)
+i32 fat16_read_locked(const struct fat_dirent *file, u32 offset, void *buf,
+                      u32 len)
 {
     if (!info.mounted || !file || !buf)
         return -1;
@@ -747,14 +749,14 @@ i32 fat16_read(const struct fat_dirent *file, u32 offset, void *buf, u32 len)
     return (i32)done;
 }
 
-void *fat16_read_whole(const char *path, u32 max, u32 *size_out)
+static void *fat16_read_whole_locked(const char *path, u32 max, u32 *size_out)
 {
     struct fat_dirent entry;
 
     if (size_out)
         *size_out = 0;
 
-    if (!fat16_stat(path, &entry))
+    if (!fat16_stat_locked(path, &entry))
         return NULL;
 
     if (entry.is_dir) {
@@ -783,7 +785,7 @@ void *fat16_read_whole(const char *path, u32 max, u32 *size_out)
         return NULL;
     }
 
-    i32 got = fat16_read(&entry, 0, buf, entry.size);
+    i32 got = fat16_read_locked(&entry, 0, buf, entry.size);
 
     if (got < 0 || (u32)got != entry.size) {
         pr_err("'%s': read %d of %u bytes", path, got, entry.size);
@@ -799,14 +801,14 @@ void *fat16_read_whole(const char *path, u32 max, u32 *size_out)
     return buf;
 }
 
-bool fat16_readdir(const char *path, u32 index, struct fat_dirent *out)
+bool fat16_readdir_locked(const char *path, u32 index, struct fat_dirent *out)
 {
     struct fat_dirent dir;
 
     if (!info.mounted || !out)
         return false;
 
-    if (!fat16_stat(path, &dir))
+    if (!fat16_stat_locked(path, &dir))
         return false;
 
     if (!dir.is_dir) {
@@ -892,7 +894,7 @@ static bool write_sector(u64 lba, const void *buf)
  * disk. A private copy keeps the cache truthful at all times. */
 static bool read_sector_raw(u64 lba, void *buf)
 {
-    if (!blockdev_read(device, lba, 1, buf))
+    if (!blockdev_read_locked(device, lba, 1, buf))
         return false;
 
     info.reads++;
@@ -1390,7 +1392,7 @@ enum fat_create_error fat16_create_ex(const char *path, bool directory,
         return FAT_CREATE_BAD_NAME;
     }
 
-    if (!fat16_stat(parent, &parent_ent) || !parent_ent.is_dir) {
+    if (!fat16_stat_locked(parent, &parent_ent) || !parent_ent.is_dir) {
         pr_debug("'%s': the parent directory does not exist", path);
         return FAT_CREATE_NO_PARENT;
     }
@@ -1725,7 +1727,7 @@ static bool remove_entry(const char *path, bool want_dir)
         return false;
     }
 
-    if (!fat16_stat(path, &ent))
+    if (!fat16_stat_locked(path, &ent))
         return false;
 
     if (ent.is_dir != want_dir) {
@@ -1794,10 +1796,10 @@ bool fat16_rename(const char *from, const char *to)
         return false;
     }
 
-    if (!fat16_stat(from, &src))
+    if (!fat16_stat_locked(from, &src))
         return false;
 
-    if (!fat16_stat(to_parent, &dst_parent) || !dst_parent.is_dir)
+    if (!fat16_stat_locked(to_parent, &dst_parent) || !dst_parent.is_dir)
         return false;
 
     if (lookup_in(dst_parent.first_cluster, to_leaf, &clash)) {
@@ -1842,7 +1844,7 @@ bool fat16_rename(const char *from, const char *to)
     return dirent_update(src.ent_lba, src.ent_index, edit_delete, NULL);
 }
 
-bool fat16_sync(void)
+bool fat16_sync_locked(void)
 {
     if (!fat16_writable())
         return false;
@@ -1850,7 +1852,7 @@ bool fat16_sync(void)
     return blockdev_flush(device);
 }
 
-bool fat16_space(u32 *free_clusters, u32 *total_clusters)
+static bool fat16_space_locked(u32 *free_clusters, u32 *total_clusters)
 {
     if (!info.mounted)
         return false;
@@ -1891,4 +1893,82 @@ void fat16_write_stats(u32 *writes, u32 *sectors, u32 *allocated, u32 *freed,
         *freed = stat_clusters_freed;
     if (dirents)
         *dirents = stat_dirent_updates;
+}
+
+/* ---------------------------------------------------------------------------
+ * The subsystem boundary.
+ *
+ * Everything above runs with the filesystem lock held. These are the entry
+ * points reached from outside the subsystem - the shell's disk commands, the
+ * mount at boot - so they take it. The ones fatfs also calls are exported in
+ * their `_locked` form rather than duplicated; the mutators (write,
+ * truncate, create, unlink, rmdir, mkdir, rename) are reached only through
+ * the VFS and so have no public form at all.
+ *
+ * The accessors - fat16_mounted(), fat16_get_info(), fat16_writable(),
+ * fat16_device_name() - read state that mount sets once and nothing changes,
+ * so they stay lock-free.
+ * ------------------------------------------------------------------------- */
+
+bool fat16_stat(const char *path, struct fat_dirent *out)
+{
+    fs_lock();
+    bool ret = fat16_stat_locked(path, out);
+
+    fs_unlock();
+    return ret;
+}
+
+i32 fat16_read(const struct fat_dirent *file, u32 offset, void *buf, u32 len)
+{
+    fs_lock();
+    i32 ret = fat16_read_locked(file, offset, buf, len);
+
+    fs_unlock();
+    return ret;
+}
+
+void *fat16_read_whole(const char *path, u32 max, u32 *size_out)
+{
+    fs_lock();
+    void *ret = fat16_read_whole_locked(path, max, size_out);
+
+    fs_unlock();
+    return ret;
+}
+
+bool fat16_readdir(const char *path, u32 index, struct fat_dirent *out)
+{
+    fs_lock();
+    bool ret = fat16_readdir_locked(path, index, out);
+
+    fs_unlock();
+    return ret;
+}
+
+bool fat16_sync(void)
+{
+    fs_lock();
+    bool ret = fat16_sync_locked();
+
+    fs_unlock();
+    return ret;
+}
+
+bool fat16_space(u32 *free_clusters, u32 *total_clusters)
+{
+    fs_lock();
+    bool ret = fat16_space_locked(free_clusters, total_clusters);
+
+    fs_unlock();
+    return ret;
+}
+
+bool fat16_mount(const struct blockdev *dev)
+{
+    fs_lock();
+    bool ret = fat16_mount_locked(dev);
+
+    fs_unlock();
+    return ret;
 }

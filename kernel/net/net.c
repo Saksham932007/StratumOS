@@ -13,6 +13,7 @@
 
 #include <net/inet.h>
 #include <net/net.h>
+#include <net/netlock.h>
 
 const struct mac_addr mac_broadcast = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
 const struct mac_addr mac_zero = {{0, 0, 0, 0, 0, 0}};
@@ -143,22 +144,23 @@ u16 checksum_finish(u32 sum)
 
 /* ---- the device --------------------------------------------------------- */
 
-void net_set_device(const struct net_device *dev)
+static void net_set_device_inner(const struct net_device *dev)
 {
     device = dev;
 }
 
-const struct net_device *net_device(void)
+static const struct net_device *net_device_inner(void)
 {
     return device;
 }
 
-bool net_up(void)
+static bool net_up_inner(void)
 {
     return device != NULL && device->link_up && device->link_up();
 }
 
-void net_configure(ipv4_addr addr, ipv4_addr netmask, ipv4_addr gateway)
+static void net_configure_inner(ipv4_addr addr, ipv4_addr netmask,
+                                ipv4_addr gateway)
 {
     char a[IPV4_STR_LEN], m[IPV4_STR_LEN], g[IPV4_STR_LEN];
 
@@ -170,17 +172,17 @@ void net_configure(ipv4_addr addr, ipv4_addr netmask, ipv4_addr gateway)
             ipv4_str(netmask, m, sizeof(m)), ipv4_str(gateway, g, sizeof(g)));
 }
 
-const struct net_config *net_get_config(void)
+static const struct net_config *net_get_config_inner(void)
 {
     return &config;
 }
 
-bool net_is_local(ipv4_addr ip)
+static bool net_is_local_inner(ipv4_addr ip)
 {
     return (ip & config.netmask) == (config.addr & config.netmask);
 }
 
-ipv4_addr net_next_hop(ipv4_addr ip)
+static ipv4_addr net_next_hop_inner(ipv4_addr ip)
 {
     /* The entirety of this stack's routing: on-link addresses are reached
      * directly, everything else goes to the one gateway. A routing table
@@ -189,19 +191,19 @@ ipv4_addr net_next_hop(ipv4_addr ip)
     return net_is_local(ip) ? ip : config.gateway;
 }
 
-struct net_stats *net_stats(void)
+static struct net_stats *net_stats_inner(void)
 {
     return &stats;
 }
 
-void net_stats_reset(void)
+static void net_stats_reset_inner(void)
 {
     memset(&stats, 0, sizeof(stats));
 }
 
 /* ---- the poll loop ------------------------------------------------------ */
 
-u32 net_poll(u32 max_frames)
+static u32 net_poll_inner(u32 max_frames)
 {
     u32 handled = 0;
 
@@ -251,7 +253,7 @@ static void net_thread(void *arg)
     }
 }
 
-void net_init(void)
+static void net_init_inner(void)
 {
     /* The addresses QEMU's user-mode networking hands out, which is the only
      * configuration this stack can be tested in without a real network.
@@ -277,6 +279,11 @@ void net_init(void)
     dns_set_server(IPV4(10, 0, 2, 3));
 }
 
+/* Not wrapped in the network lock: it creates the network thread, and
+ * task_create() allocates a descriptor table, which takes the filesystem's
+ * lock - below this one in the hierarchy, so holding this one across it
+ * inverts the order. There is nothing to exclude here in any case: this runs
+ * once, at boot, before there is a second thread. */
 void net_start(void)
 {
     /* Separate from net_init() because it needs the scheduler, and the
@@ -304,7 +311,7 @@ struct eth_hdr {
     be16 ethertype;
 } PACKED;
 
-void eth_input(const u8 *frame, size_t len)
+static void eth_input_inner(const u8 *frame, size_t len)
 {
     const struct eth_hdr *eh = (const struct eth_hdr *)frame;
 
@@ -341,8 +348,8 @@ void eth_input(const u8 *frame, size_t len)
     }
 }
 
-bool eth_output_frame(struct net_frame *f, const struct mac_addr *dst,
-                      u16 ethertype)
+static bool eth_output_frame_inner(struct net_frame *f,
+                                   const struct mac_addr *dst, u16 ethertype)
 {
     struct eth_hdr *eh;
 
@@ -364,8 +371,8 @@ bool eth_output_frame(struct net_frame *f, const struct mac_addr *dst,
     return device->transmit(net_frame_data(f), net_frame_len(f));
 }
 
-bool eth_output(const struct mac_addr *dst, u16 ethertype, const void *payload,
-                size_t len)
+static bool eth_output_inner(const struct mac_addr *dst, u16 ethertype,
+                             const void *payload, size_t len)
 {
     /* Built through the frame builder so that the Ethernet header is
      * assembled in exactly one place. The copy this form makes is the price
@@ -385,4 +392,133 @@ bool eth_output(const struct mac_addr *dst, u16 ethertype, const void *payload,
 
     memcpy(p, payload, len);
     return eth_output_frame(&f, dst, ethertype);
+}
+
+/* ---------------------------------------------------------------------------
+ * The subsystem boundary.
+ *
+ * Everything above is the stack's internals; each public name below takes the
+ * network lock and calls it. The lock counts its depth, so an internal caller
+ * reaching one of these - socket_send() calling tcp_send() - is correct
+ * without having to know whether it is already inside the stack. See
+ * kernel/include/net/netlock.h for why this subsystem is the one that gets a
+ * recursive lock.
+ * ------------------------------------------------------------------------- */
+
+void net_set_device(const struct net_device *dev)
+{
+    net_lock();
+    net_set_device_inner(dev);
+    net_unlock();
+}
+
+const struct net_device *net_device(void)
+{
+    net_lock();
+    const struct net_device *ret = net_device_inner();
+
+    net_unlock();
+    return ret;
+}
+
+bool net_up(void)
+{
+    net_lock();
+    bool ret = net_up_inner();
+
+    net_unlock();
+    return ret;
+}
+
+void net_configure(ipv4_addr addr, ipv4_addr netmask, ipv4_addr gateway)
+{
+    net_lock();
+    net_configure_inner(addr, netmask, gateway);
+    net_unlock();
+}
+
+const struct net_config *net_get_config(void)
+{
+    net_lock();
+    const struct net_config *ret = net_get_config_inner();
+
+    net_unlock();
+    return ret;
+}
+
+bool net_is_local(ipv4_addr ip)
+{
+    net_lock();
+    bool ret = net_is_local_inner(ip);
+
+    net_unlock();
+    return ret;
+}
+
+ipv4_addr net_next_hop(ipv4_addr ip)
+{
+    net_lock();
+    ipv4_addr ret = net_next_hop_inner(ip);
+
+    net_unlock();
+    return ret;
+}
+
+struct net_stats *net_stats(void)
+{
+    net_lock();
+    struct net_stats *ret = net_stats_inner();
+
+    net_unlock();
+    return ret;
+}
+
+void net_stats_reset(void)
+{
+    net_lock();
+    net_stats_reset_inner();
+    net_unlock();
+}
+
+u32 net_poll(u32 max_frames)
+{
+    net_lock();
+    u32 ret = net_poll_inner(max_frames);
+
+    net_unlock();
+    return ret;
+}
+
+void net_init(void)
+{
+    net_lock();
+    net_init_inner();
+    net_unlock();
+}
+
+void eth_input(const u8 *frame, size_t len)
+{
+    net_lock();
+    eth_input_inner(frame, len);
+    net_unlock();
+}
+
+bool eth_output_frame(struct net_frame *f, const struct mac_addr *dst,
+                      u16 ethertype)
+{
+    net_lock();
+    bool ret = eth_output_frame_inner(f, dst, ethertype);
+
+    net_unlock();
+    return ret;
+}
+
+bool eth_output(const struct mac_addr *dst, u16 ethertype, const void *payload,
+                size_t len)
+{
+    net_lock();
+    bool ret = eth_output_inner(dst, ethertype, payload, len);
+
+    net_unlock();
+    return ret;
 }
