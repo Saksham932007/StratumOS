@@ -24,12 +24,12 @@
  * and must be below 1 MiB - which the PMM reserves in its entirety, so
  * nothing else will ever be handed this page. 0x8000 is the application
  * processor trampoline from the SMP work; this is the next page up. */
-#define LM_TRAMPOLINE_PHYS 0x9000u
+#define LM_TRAMPOLINE_PHYS  0x9000u
 
 /* The trampoline's own stack grows down from the top of that page, so the
  * code and the block have to leave room. 608 bytes at the time of writing;
  * the check below is what makes that a fact rather than a hope. */
-#define LM_TRAMPOLINE_MAX  2048u
+#define LM_TRAMPOLINE_MAX   2048u
 
 /* --- the four-level page table ---------------------------------------------
  *
@@ -49,9 +49,9 @@
  * kernel's 32-bit tables, and the reason CR4.PAE has to be set first: PAE
  * introduced this entry format, and long mode is PAE with a fourth level.
  */
-#define PTE64_PRESENT      0x001ull
-#define PTE64_WRITE        0x002ull
-#define PTE64_PS 0x080ull /* at the PD, "this is a 2 MiB page"        */
+#define PTE64_PRESENT       0x001ull
+#define PTE64_WRITE         0x002ull
+#define PTE64_PS            0x080ull /* at the PD, "this is a 2 MiB page"        */
 
 #define LM_IDENTITY_ENTRIES 512u /* 512 x 2 MiB = 1 GiB                   */
 #define LM_IDENTITY_MIB     (LM_IDENTITY_ENTRIES * 2u)

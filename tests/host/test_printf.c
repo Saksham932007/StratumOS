@@ -31,6 +31,19 @@ void console_putc(char c)
     capture[capture_len] = '\0';
 }
 
+/* And it brackets each format with the console lock. On the host there is no
+ * lock and one thread, so claiming ownership and dropping it are both no-ops;
+ * they exist so printf.c links. */
+bool console_begin(void)
+{
+    return true;
+}
+
+void console_end(bool owned)
+{
+    (void)owned;
+}
+
 static void fail(const char *what, const char *expect, const char *got)
 {
     failures++;

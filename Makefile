@@ -294,11 +294,19 @@ portability:
 SOURCES_TO_FORMAT := $(KSRC) $(USERSRC) tests
 FIND_SOURCES      := find $(SOURCES_TO_FORMAT) \( -name '*.c' -o -name '*.h' \)
 
+# Which clang-format. Overridable because the answer is version-sensitive:
+# macro alignment changed between 21 and 22, so two developers on two distro
+# versions reformat each other's files back and forth and the CI gate drifts
+# with whatever the runner image happens to ship. CI pins this to an exact
+# version (see .github/workflows/ci.yml); if your distro's binary disagrees,
+# `python3 -m pip install clang-format==21.1.2` and point this at it.
+CLANG_FORMAT      ?= clang-format
+
 .PHONY: format
 format:
-	@command -v clang-format >/dev/null 2>&1 || \
-		{ echo "clang-format is not installed"; exit 1; }
-	@$(FIND_SOURCES) | xargs clang-format -i
+	@command -v $(CLANG_FORMAT) >/dev/null 2>&1 || \
+		{ echo "$(CLANG_FORMAT) is not installed"; exit 1; }
+	@$(FIND_SOURCES) | xargs $(CLANG_FORMAT) -i
 	@echo "  formatted $$($(FIND_SOURCES) | wc -l) files"
 
 # One shell command, not two: `exit 0` on its own line ended only that line,
@@ -306,10 +314,11 @@ format:
 # and failed. The same bug as the ISO rules in arch/x86/arch.mk.
 .PHONY: format-check
 format-check:
-	@if ! command -v clang-format >/dev/null 2>&1; then \
-		echo "  SKIP    clang-format is not installed"; \
+	@if ! command -v $(CLANG_FORMAT) >/dev/null 2>&1; then \
+		echo "  SKIP    $(CLANG_FORMAT) is not installed"; \
 	else \
-		$(FIND_SOURCES) | xargs clang-format --dry-run --Werror; \
+		$(CLANG_FORMAT) --version; \
+		$(FIND_SOURCES) | xargs $(CLANG_FORMAT) --dry-run --Werror; \
 	fi
 
 .PHONY: lines

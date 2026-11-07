@@ -240,7 +240,18 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
             nasm gcc-multilib libc6-dev-i386 \
-            cppcheck clang-format clang-tools python3
+            cppcheck clang-tools python3 python3-pip
+
+      # Pinned, deliberately. `apt-get install clang-format` installs whatever
+      # the runner image ships, which moved from 19 to 21 under us and will
+      # move again - and clang-format's macro alignment is not stable across
+      # major versions, so an unpinned formatter is a gate that fails on code
+      # nobody touched. The pip wheel is the same binary at a fixed version on
+      # every machine, which is what a style gate has to be.
+      - name: Install clang-format (pinned)
+        run: |
+          python3 -m pip install --break-system-packages clang-format==21.1.2
+          clang-format --version
 
       - name: clang-format
         run: make format-check

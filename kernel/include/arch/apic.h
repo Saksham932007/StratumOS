@@ -21,32 +21,32 @@
 #include <kernel/types.h>
 
 /* Register offsets, in bytes from the APIC base. */
-#define APIC_ID              0x020 /* this CPU's APIC id, in bits 24-31      */
-#define APIC_VERSION         0x030
-#define APIC_TPR             0x080 /* task priority: 0 accepts everything    */
-#define APIC_EOI             0x0B0 /* write anything to acknowledge          */
-#define APIC_LDR             0x0D0
-#define APIC_DFR             0x0E0
-#define APIC_SPURIOUS        0x0F0 /* bit 8 is the software enable           */
-#define APIC_ESR             0x280 /* error status, write-to-clear           */
-#define APIC_ICR_LOW         0x300 /* writing this sends the IPI             */
-#define APIC_ICR_HIGH        0x310 /* destination APIC id, in bits 24-31     */
-#define APIC_LVT_TIMER       0x320
-#define APIC_LVT_THERMAL     0x330
-#define APIC_LVT_PERF        0x340
-#define APIC_LVT_LINT0       0x350
-#define APIC_LVT_LINT1       0x360
-#define APIC_LVT_ERROR       0x370
-#define APIC_TIMER_ICR       0x380 /* initial count                          */
-#define APIC_TIMER_CCR       0x390 /* current count                          */
-#define APIC_TIMER_DIV       0x3E0
+#define APIC_ID                 0x020 /* this CPU's APIC id, in bits 24-31      */
+#define APIC_VERSION            0x030
+#define APIC_TPR                0x080 /* task priority: 0 accepts everything    */
+#define APIC_EOI                0x0B0 /* write anything to acknowledge          */
+#define APIC_LDR                0x0D0
+#define APIC_DFR                0x0E0
+#define APIC_SPURIOUS           0x0F0 /* bit 8 is the software enable           */
+#define APIC_ESR                0x280 /* error status, write-to-clear           */
+#define APIC_ICR_LOW            0x300 /* writing this sends the IPI             */
+#define APIC_ICR_HIGH           0x310 /* destination APIC id, in bits 24-31     */
+#define APIC_LVT_TIMER          0x320
+#define APIC_LVT_THERMAL        0x330
+#define APIC_LVT_PERF           0x340
+#define APIC_LVT_LINT0          0x350
+#define APIC_LVT_LINT1          0x360
+#define APIC_LVT_ERROR          0x370
+#define APIC_TIMER_ICR          0x380 /* initial count                          */
+#define APIC_TIMER_CCR          0x390 /* current count                          */
+#define APIC_TIMER_DIV          0x3E0
 
 /* APIC_SPURIOUS */
-#define APIC_SW_ENABLE       0x100
+#define APIC_SW_ENABLE          0x100
 
 /* Local vector table entries */
-#define APIC_LVT_MASKED      0x10000
-#define APIC_LVT_PERIODIC    0x20000
+#define APIC_LVT_MASKED         0x10000
+#define APIC_LVT_PERIODIC       0x20000
 
 /* LVT delivery modes, in bits 8-10. Two of them matter for LINT0/LINT1:
  *
@@ -59,29 +59,29 @@
  *
  *   NMI     what LINT1 is wired to on every PC.
  */
-#define APIC_LVT_EXTINT      0x700
-#define APIC_LVT_NMI         0x400
+#define APIC_LVT_EXTINT         0x700
+#define APIC_LVT_NMI            0x400
 
 /* APIC_ICR_LOW: delivery modes */
-#define APIC_ICR_FIXED       0x00000
-#define APIC_ICR_INIT        0x00500
-#define APIC_ICR_STARTUP     0x00600
+#define APIC_ICR_FIXED          0x00000
+#define APIC_ICR_INIT           0x00500
+#define APIC_ICR_STARTUP        0x00600
 /* ...and the rest of the command word */
-#define APIC_ICR_PHYSICAL    0x00000
-#define APIC_ICR_ASSERT      0x04000
-#define APIC_ICR_DEASSERT    0x00000
-#define APIC_ICR_LEVEL       0x08000
-#define APIC_ICR_EDGE        0x00000
-#define APIC_ICR_PENDING     0x01000 /* read-only: delivery in progress   */
-#define APIC_ICR_ALL_BUT_ME  0xC0000
+#define APIC_ICR_PHYSICAL       0x00000
+#define APIC_ICR_ASSERT         0x04000
+#define APIC_ICR_DEASSERT       0x00000
+#define APIC_ICR_LEVEL          0x08000
+#define APIC_ICR_EDGE           0x00000
+#define APIC_ICR_PENDING        0x01000 /* read-only: delivery in progress   */
+#define APIC_ICR_ALL_BUT_ME     0xC0000
 
 /* Vectors this kernel uses above the 8259 range (32-47). */
-#define APIC_VECTOR_SPURIOUS 0xFF
-#define APIC_VECTOR_ERROR    0xFE
-#define APIC_VECTOR_IPI_PING 0xF0    /* "are you there", for the tests      */
-#define APIC_VECTOR_IPI_TLB  0xF1    /* TLB shootdown                       */
-#define APIC_VECTOR_IPI_HALT 0xF2    /* stop, for panic                     */
-#define APIC_VECTOR_TIMER    0xF3    /* this CPU's own periodic tick         */
+#define APIC_VECTOR_SPURIOUS    0xFF
+#define APIC_VECTOR_ERROR       0xFE
+#define APIC_VECTOR_IPI_PING    0xF0 /* "are you there", for the tests      */
+#define APIC_VECTOR_IPI_TLB     0xF1 /* TLB shootdown                       */
+#define APIC_VECTOR_IPI_HALT    0xF2 /* stop, for panic                     */
+#define APIC_VECTOR_TIMER       0xF3 /* this CPU's own periodic tick         */
 #define APIC_VECTOR_IPI_RESCHED 0xF4 /* "something is runnable, look again"  */
 
 /* Map and enable this CPU's local APIC. Called once on the boot processor,
