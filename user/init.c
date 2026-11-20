@@ -227,6 +227,40 @@ static void demo_exec(void)
     u_puts("\n");
 }
 
+/* ---- network communication from ring 3 --------------------------------- */
+
+static void demo_net(void)
+{
+    unsigned int local = 0;
+    if (sys_resolve("10.0.2.15", &local) < 0 || local == 0)
+        return;
+
+    i32 fd = sys_socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
+        return;
+
+    struct sys_sockaddr to, from;
+    u_sockaddr(&to, local, 7); /* port 7: UDP echo service */
+    static const char msg[] = "hello from user mode";
+    char buf[64];
+
+    u_puts("  [ring3] network: opening a BSD socket from ring 3\n");
+    u_puts("  [ring3] network: sending UDP datagram to echo port (10.0.2.15:7)\n");
+
+    i32 sent = sys_sendto(fd, msg, sizeof(msg) - 1, &to);
+    if (sent > 0) {
+        i32 n = sys_recvfrom(fd, buf, sizeof(buf) - 1, &from);
+        if (n > 0) {
+            buf[n] = '\0';
+            u_puts("  [ring3] network: echo reply received successfully: \"");
+            u_puts(buf);
+            u_puts("\"\n");
+        }
+    }
+
+    sys_close(fd);
+}
+
 void _start(void)
 {
     u_puts("  [ring3] hello from user mode - privilege level 3\n");
@@ -259,6 +293,7 @@ void _start(void)
 
     demo_fork_cow();
     demo_exec();
+    demo_net();
 
     u_puts("  [ring3] calling exit(0)\n");
     sys_exit(0);
