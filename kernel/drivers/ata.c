@@ -13,6 +13,7 @@
 #include <arch/io.h>
 
 #include <drivers/ata.h>
+#include <drivers/timer.h>
 
 #include <kernel/kernel.h>
 #include <kernel/log.h>
@@ -117,7 +118,15 @@ static void select_delay(u8 channel)
  * is also what a floating bus reads as, and both mean "no usable drive". */
 static u8 wait_not_busy(u8 channel)
 {
-    for (u32 spin = 0; spin < ATA_SPIN_LIMIT; spin++) {
+    /* A fixed spin count can be exhausted in milliseconds under QEMU TCG
+     * if the host runner VM is under I/O pressure. If the timer is
+     * running, wait up to 3000 ms wall clock. If early boot before
+     * timer_init(), fall back to ATA_SPIN_LIMIT. */
+    u64 start_ms = timer_ms();
+
+    for (u32 spin = 0;
+         spin < ATA_SPIN_LIMIT || (start_ms && (timer_ms() - start_ms) < 3000);
+         spin++) {
         u8 status = status_of(channel);
 
         if (!(status & ATA_SR_BSY))

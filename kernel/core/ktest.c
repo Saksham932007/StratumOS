@@ -1975,11 +1975,12 @@ static void test_smp(struct ktest_result *r)
      * share of it. */
     if (apic_timer_running()) {
         struct apic_stats as;
+        u32 this_ticks = smp_this_cpu()->timer_ticks;
 
         apic_get_stats(&as);
         KT_ASSERT(r, apic_timer_hz_measured() >= 1000000u);
-        KT_ASSERT(r, as.timer_ticks >= smp_this_cpu()->timer_ticks);
-        KT_ASSERT(r, smp_this_cpu()->timer_ticks > 0);
+        KT_ASSERT(r, as.timer_ticks >= this_ticks);
+        KT_ASSERT(r, this_ticks > 0);
     }
 
     /* --- locks ----------------------------------------------------------- */
