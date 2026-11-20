@@ -245,7 +245,8 @@ static void demo_net(void)
     char buf[64];
 
     u_puts("  [ring3] network: opening a BSD socket from ring 3\n");
-    u_puts("  [ring3] network: sending UDP datagram to echo port (10.0.2.15:7)\n");
+    u_puts(
+        "  [ring3] network: sending UDP datagram to echo port (10.0.2.15:7)\n");
 
     i32 sent = sys_sendto(fd, msg, sizeof(msg) - 1, &to);
     if (sent > 0) {
